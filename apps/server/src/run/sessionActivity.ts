@@ -283,9 +283,8 @@ export class SessionActivities {
    * The questions each subject's agent is waiting on the operator for (A7-Q), by question
    * id, in the order asked: a `question` entry adds one, a `questionSettled` takes it away,
    * and the narration's `closed` — the surface let the session go, and a request it held
-   * went with it — `lost` or `restored` takes them all (see {@link #question}). Bounded with
-   * the summaries: a subject dropped from
-   * {@link #kept} is dropped here too.
+   * went with it — or `lost` takes them all (see {@link #question}). Bounded with the
+   * summaries: a subject dropped from {@link #kept} is dropped here too.
    */
   readonly #waiting = new Map<string, Map<string, HarnessQuestion>>();
 
@@ -318,18 +317,19 @@ export class SessionActivities {
       if (held?.size === 0) this.#waiting.delete(key);
     } else if (
       detail._tag === "connection" &&
-      (detail.state === "closed" ||
-        detail.state === "restored" ||
-        detail.state === "lost")
+      (detail.state === "closed" || detail.state === "lost")
     ) {
-      // `closed`: the session's requests went with it. `restored`: what was settled while
-      // the connection was down was never narrated, and the driver lists what is still
-      // pending straight after (OpenCode's `form.list` on every connection), so the set is
-      // started again from that list. `lost`: the harness has been unreachable long enough
-      // that nothing waiting on it can be answered through it — an OpenCode process killed
-      // for good never comes back, and its question would count in Needs you until bit
-      // restarted (A7-Q review 1). Should it come back after all, `restored` re-lists what
-      // is still real.
+      // `closed`: the session's requests went with it. `lost`: the harness has been
+      // unreachable long enough that nothing waiting on it can be answered through it — an
+      // OpenCode process killed for good never comes back, and its question would count in
+      // Needs you until bit restarted (A7-Q review 1). Should it come back after all, the
+      // driver's re-listing on `restored` brings back what is still real.
+      //
+      // **Not `restored`** (A7-Q review 2): the set is the driver's to correct then. It
+      // re-lists what is pending straight after (OpenCode's `form.list` on every
+      // connection) and narrates a `questionSettled` for each it knew of that the list no
+      // longer holds — and when that list fails, nothing, so a question still real is not
+      // dropped from Needs you by a list that could not be read.
       //
       // V2(chat): between a break and its `lost` (about half a minute) a question settled
       // in the gap still counts in Needs you.

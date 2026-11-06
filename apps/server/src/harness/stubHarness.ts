@@ -200,9 +200,15 @@ export type ScriptedQuestionCall =
  */
 export const scriptedQuestions = (): {
   readonly ask: (sessionId: string, question: HarnessQuestion) => void;
+  /** Takes a question off as the harness settling it by itself would, recording no call. */
+  readonly forget: (sessionId: string, questionId: string) => void;
   readonly calls: readonly ScriptedQuestionCall[];
   /** When set, an answer and a dismissal fail with it, as an unreachable harness does. */
   fail: HarnessTransportError | undefined;
+  /** When set, listing what is pending fails with it too (a harness paused or down). */
+  listFail: HarnessTransportError | undefined;
+  /** How many times what is pending was listed. */
+  readonly listReads: () => number;
   readonly members: Pick<
     StubHarness,
     "pendingQuestions" | "answerQuestion" | "dismissQuestion"
@@ -210,6 +216,7 @@ export const scriptedQuestions = (): {
 } => {
   const pending = new Map<string, HarnessQuestion[]>();
   const calls: ScriptedQuestionCall[] = [];
+  let reads = 0;
   const take = (
     sessionId: string,
     questionId: string,
@@ -228,11 +235,26 @@ export const scriptedQuestions = (): {
     ask: (sessionId, question) => {
       pending.set(sessionId, [...(pending.get(sessionId) ?? []), question]);
     },
+    forget: (sessionId, questionId) => {
+      pending.set(
+        sessionId,
+        (pending.get(sessionId) ?? []).filter(
+          (question) => question.questionId !== questionId,
+        ),
+      );
+    },
     calls,
     fail: undefined,
+    listFail: undefined,
+    listReads: () => reads,
     members: {
       pendingQuestions: (sessionId) =>
-        Effect.sync(() => [...(pending.get(sessionId) ?? [])]),
+        Effect.suspend(() => {
+          reads += 1;
+          return scripted.listFail !== undefined
+            ? Effect.fail(scripted.listFail)
+            : Effect.succeed([...(pending.get(sessionId) ?? [])]);
+        }),
       answerQuestion: (sessionId, questionId, answers) =>
         scripted.fail !== undefined
           ? Effect.fail(scripted.fail)

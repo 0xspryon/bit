@@ -20,6 +20,7 @@ import {
   type Resubscribed,
 } from "./openCodeEvents";
 import { OpenCodeServer } from "./openCodeServer";
+import { SessionActivities } from "../run/sessionActivity";
 
 /** What one item of {@link resubscribing} reads as, for comparing whole sequences. */
 const said = (item: Resubscribed): string =>
@@ -221,18 +222,23 @@ describe("the subscription the driver makes", () => {
       { headers: { "content-type": "text/event-stream" } },
     );
 
-  const harnessOver = (answer: (url: string, call: number) => Response) => {
+  const harnessOver = (
+    answer: (url: string, call: number) => Response,
+    /** The session's pending forms on the `call`th read (A7-Q): none unless a test says. */
+    forms: (call: number) => Response = () =>
+      new Response(JSON.stringify({ data: [] }), {
+        headers: { "content-type": "application/json" },
+      }),
+  ) => {
     const urls: string[] = [];
+    let formReads = 0;
     const fetchStub = Object.assign(
       (input: URL | RequestInfo) => {
         const url = String(input instanceof Request ? input.url : input);
-        // A session's pending forms, read as each connection opens (A7-Q): none here.
+        // A session's pending forms, read as each connection opens (A7-Q).
         if (/\/api\/session\/[^/]+\/form/u.test(url)) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ data: [] }), {
-              headers: { "content-type": "application/json" },
-            }),
-          );
+          formReads += 1;
+          return Promise.resolve(forms(formReads));
         }
         if (url.includes("/api/model")) {
           return Promise.resolve(
@@ -324,6 +330,135 @@ describe("the subscription the driver makes", () => {
         ...NARRATED_EVENT_TYPES,
       ]);
     }
+  });
+
+  /** A form the 2.2.5 `question` tool opens, as `session.form.list` lists it. */
+  const questionForm = {
+    id: "frm_1",
+    sessionID: "ses_1",
+    title: "Questions",
+    metadata: { kind: "question", tool: { messageID: "msg_1", id: "call_1" } },
+    fields: [
+      {
+        key: "q0",
+        type: "string",
+        title: "Colour",
+        description: "Which colour?",
+        options: [{ value: "Red", label: "Red", description: "warm" }],
+        custom: true,
+      },
+    ],
+  };
+  const formsAnswer = (data: readonly unknown[] | undefined) =>
+    data === undefined
+      ? new Response(JSON.stringify({ message: "boom" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        })
+      : new Response(JSON.stringify({ data }), {
+          headers: { "content-type": "application/json" },
+        });
+
+  /** The narration of one break and its return, with the forms answered per read. */
+  const acrossABreak = async (second: readonly unknown[] | undefined) => {
+    const { layer } = harnessOver(
+      (_url, call) =>
+        call === 1
+          ? sse([connected], new Error("socket closed"))
+          : sse([connected, textEnded("ses_1", "after", 3)]),
+      (read) => formsAnswer(read === 1 ? [questionForm] : second),
+    );
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness
+              .sessionEvents("ses_1")
+              .pipe(
+                Stream.takeUntil(
+                  (entry) =>
+                    entry.detail._tag === "reply" &&
+                    entry.detail.text === "after",
+                ),
+                Stream.runCollect,
+                Effect.timeout("10 seconds"),
+              ),
+          ),
+          layer,
+        ),
+      ),
+    );
+    return [...entries].map((entry: HarnessNarration) =>
+      entry.detail._tag === "connection"
+        ? entry.detail.state
+        : entry.detail._tag === "question"
+          ? `question ${entry.detail.question.questionId}`
+          : entry.detail._tag === "questionSettled"
+            ? `settled ${entry.detail.questionId} ${entry.detail.settled}`
+            : entry.detail._tag === "reply"
+              ? `reply ${entry.detail.text}`
+              : entry.detail._tag,
+    );
+  };
+
+  test("a connection back re-lists the forms: one gone is narrated withdrawn, one still there asked again (A7-Q)", async () => {
+    expect(await acrossABreak([])).toEqual([
+      "question frm_1",
+      "reconnecting",
+      "restored",
+      "settled frm_1 withdrawn",
+      "reply after",
+    ]);
+    expect(await acrossABreak([questionForm])).toEqual([
+      "question frm_1",
+      "reconnecting",
+      "restored",
+      "question frm_1",
+      "reply after",
+    ]);
+  });
+
+  test("a re-list that fails says nothing, so a question still real is not dropped from Needs you (A7-Q review 2)", async () => {
+    const read = await acrossABreak(undefined);
+    expect(read).toEqual([
+      "question frm_1",
+      "reconnecting",
+      "restored",
+      "reply after",
+    ]);
+    // What a reader of that narration counts as waiting: still the question.
+    const store = new SessionActivities();
+    const subject = { _tag: "import" as const, importId: "imp_1" };
+    const { layer } = harnessOver(
+      (_url, call) =>
+        call === 1
+          ? sse([connected], new Error("socket closed"))
+          : sse([connected, textEnded("ses_1", "after", 3)]),
+      (formRead) => formsAnswer(formRead === 1 ? [questionForm] : undefined),
+    );
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            harness.sessionEvents("ses_1").pipe(
+              Stream.takeUntil(
+                (entry) =>
+                  entry.detail._tag === "reply" &&
+                  entry.detail.text === "after",
+              ),
+              Stream.runForEach((entry) =>
+                Effect.sync(() => {
+                  store.record(subject, entry);
+                }),
+              ),
+              Effect.timeout("10 seconds"),
+            ),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(store.waiting(subject)?.questionId).toBe("frm_1");
   });
 
   test("an event over Effect's 10 Mi default and under the driver's bound is read, not fatal", async () => {

@@ -2922,22 +2922,68 @@ export const openCodeHarness = (
         /** The sub-agents this stream saw started. See {@link openCodeNarration}. */
         const subagents = openCodeSubagents();
         /**
-         * The questions the session waits on, as `question` entries, read each time a
-         * connection opens (A7-Q): on the first, for a form made before this stream was
-         * asked for; after a break, for one made while it was down. A form settled in the gap
-         * is not narrated settled: the chat reads the replay on `restored`, which re-reads
-         * what is pending.
+         * The question ids this stream has narrated as waiting and not yet as settled: what
+         * a re-list after a break is compared with (A7-Q review 2).
          */
-        const pendingNow = Effect.map(
+        const waitingHere = new Set<string>();
+        const asked = (question: HarnessQuestion): HarnessNarration => ({
+          type: "form.created",
+          sequence: undefined,
+          at: Date.now(),
+          outcome: undefined,
+          detail: { _tag: "question", question },
+        });
+        /**
+         * The questions the session waits on, as `question` entries, read when the stream
+         * is first asked for: a form made before it was. A list that fails here says
+         * nothing — this stream knows of nothing yet to keep or drop.
+         */
+        const pendingFirst = Effect.map(
           Effect.orElseSucceed(pendingQuestions(sessionId), () => []),
-          (questions): HarnessNarration[] =>
-            questions.map((question) => ({
-              type: "form.created",
-              sequence: undefined,
-              at: Date.now(),
-              outcome: undefined,
-              detail: { _tag: "question", question },
-            })),
+          (questions): HarnessNarration[] => questions.map(asked),
+        );
+        /**
+         * The same list read again when a connection comes back (`restored`), for a form
+         * made while it was down, **and** a `questionSettled` (`withdrawn`) for each this
+         * stream knew waiting that the list no longer holds: settled in the gap, whose own
+         * event was never seen. The chat reads the replay on `restored` as well.
+         *
+         * **A list that fails says nothing** (A7-Q review 2): readers keep what they had,
+         * since a list that could not be read is no evidence the agent stopped waiting —
+         * Needs you used to restart from it and lose a question still real.
+         */
+        const pendingAgain = Effect.flatMap(
+          Effect.result(pendingQuestions(sessionId)),
+          (listed): Effect.Effect<HarnessNarration[]> => {
+            if (listed._tag === "Failure") {
+              return Effect.as(
+                Effect.logWarning(
+                  "an OpenCode session's narration is back but its pending questions could not be re-read; what was waiting is kept",
+                  { sessionId, detail: listed.failure.message },
+                ),
+                [],
+              );
+            }
+            const now = new Set(
+              listed.success.map((question) => question.questionId),
+            );
+            const gone = [...waitingHere]
+              .filter((id) => !now.has(id))
+              .map(
+                (questionId): HarnessNarration => ({
+                  type: "form.relisted",
+                  sequence: undefined,
+                  at: Date.now(),
+                  outcome: undefined,
+                  detail: {
+                    _tag: "questionSettled",
+                    questionId,
+                    settled: "withdrawn",
+                  },
+                }),
+              );
+            return Effect.succeed([...gone, ...listed.success.map(asked)]);
+          },
         );
         return resubscribing(() =>
           subscribeOpenCodeEvents(http, server.baseUrl),
@@ -2989,13 +3035,23 @@ export const openCodeHarness = (
               entry.detail.state === "restored"
                 ? Stream.concat(
                     Stream.make(entry),
-                    Stream.fromIterableEffect(pendingNow),
+                    Stream.fromIterableEffect(pendingAgain),
                   )
                 : Stream.make(entry),
             { concurrency: 1 },
           ),
           (narrated) =>
-            Stream.concat(Stream.fromIterableEffect(pendingNow), narrated),
+            Stream.concat(Stream.fromIterableEffect(pendingFirst), narrated),
+          // Last, so it sees every entry as a reader does, the listed ones included.
+          Stream.tap((entry) =>
+            Effect.sync(() => {
+              if (entry.detail._tag === "question") {
+                waitingHere.add(entry.detail.question.questionId);
+              } else if (entry.detail._tag === "questionSettled") {
+                waitingHere.delete(entry.detail.questionId);
+              }
+            }),
+          ),
         );
       };
 

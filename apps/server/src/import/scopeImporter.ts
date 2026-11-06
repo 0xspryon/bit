@@ -118,6 +118,7 @@ import {
   ConversationModelRefused,
   ConversationStopRefused,
   ImporterConversationRefused,
+  QUESTION_RECHECK_MS,
   QuestionRefused,
   questionAnswersProblem,
   SCOPE_IMPORT_MAX_LINKS,
@@ -146,6 +147,7 @@ import {
   Exit,
   Fiber,
   Layer,
+  Schedule,
   Semaphore,
   type Duration,
 } from "effect";
@@ -168,6 +170,8 @@ import {
   truncateNarration,
   type AgentHarness,
   type HarnessFailure,
+  type HarnessNarration,
+  type HarnessQuestion,
 } from "../harness/agentHarness";
 import type { QuestionNotPending } from "../harness/errors";
 import {
@@ -439,6 +443,24 @@ export interface ScopeImportRequest {
  */
 const everyFieldRead = (_rest: Record<string, never>): void => {};
 
+/**
+ * How a dismissal the harness did not answer is followed up (A7-Q review 2): the harness is
+ * asked again whether the question still waits, first after `first`, then backing off by
+ * doubling to at most `most` between asks, for `window` in all. A reference so a test can
+ * make it short; the server never changes it.
+ */
+export const QuestionRecheck = Context.Reference<{
+  readonly first: Duration.Input;
+  readonly most: Duration.Input;
+  readonly window: Duration.Input;
+}>("bit/import/QuestionRecheck", {
+  defaultValue: () => ({
+    first: "1 second",
+    most: "15 seconds",
+    window: QUESTION_RECHECK_MS,
+  }),
+});
+
 export class ScopeImporter extends Context.Service<
   ScopeImporter,
   {
@@ -673,6 +695,7 @@ export class ScopeImporter extends Context.Service<
       const progress = yield* ScopeImportProgress;
       const stores = yield* TargetStores;
       const narrations = yield* RunNarrations;
+      const recheck = yield* QuestionRecheck;
       // This layer's own scope, which every import's first turn is forked into. Shutting
       // the server down closes it, which interrupts any turn still reading; the session
       // registry's finalizer then revokes each credential and takes back each MCP
@@ -2777,6 +2800,97 @@ export class ScopeImporter extends Context.Service<
           return { questionId: input.questionId, settled: "answered" as const };
         });
 
+      /** The questions being asked after now (`recheckQuestion`), by session and id. */
+      const rechecking = new Set<string>();
+
+      /**
+       * Asks the harness again, in the background, whether a question whose dismissal it
+       * did not answer still waits, and says what it finds on the session's live stream
+       * (A7-Q review 2).
+       *
+       * **Why it is needed.** The page puts such a question away, since the operator has
+       * declined and a dock that cannot be put away would hold the box hostage. Whether the
+       * harness heard is not known, and a harness that comes back without breaking its
+       * connection says nothing: a paused `opencode serve` (SIGSTOP) keeps the event socket
+       * open, so no `restored` ever comes and nothing re-lists its forms, while the form it
+       * still waits on holds every later message unprocessed. Measured on 2.2.5.
+       *
+       * So the harness's own list is read again, backing off ({@link QuestionRecheck}) and
+       * for a bounded time: the question still listed is published again as a `question`,
+       * which the page docks; not listed, a `questionSettled` (`withdrawn`), which takes it
+       * out of Needs you. A list that keeps failing for the whole window says nothing, and
+       * the page's words for the dismissal tell the operator to reload to check.
+       *
+       * **Forked into the session's scope**, so the session ending — its close, a Stop of
+       * the import, this server going down — interrupts it. One per question at a time: a
+       * second refused dismissal of the same question while one is asking adds nothing.
+       *
+       * V2(chat): the window is fixed. A harness paused for longer is found again only by a
+       * reload's replay (or the operator writing, which the form then holds).
+       */
+      const recheckQuestion = (
+        held: LiveAgentSession<ImportSessionMeta>,
+        targetId: string,
+        questionId: string,
+      ) => {
+        const key = `${held.sessionId}\u0000${questionId}`;
+        const say = (detail: HarnessNarration["detail"]) =>
+          narrations.publish({
+            targetId,
+            subject: { _tag: "import", importId: held.id },
+            harnessSessionId: held.sessionId,
+            entry: {
+              type: "bit.question.rechecked",
+              sequence: undefined,
+              at: Date.now(),
+              outcome: undefined,
+              detail,
+            },
+          });
+        const found = (asked: readonly HarnessQuestion[]) => {
+          const question = asked.find(
+            (candidate) => candidate.questionId === questionId,
+          );
+          return question !== undefined
+            ? say({ _tag: "question", question })
+            : say({
+                _tag: "questionSettled",
+                questionId,
+                settled: "withdrawn",
+              });
+        };
+        const asking = Effect.suspend(() => {
+          if (rechecking.has(key)) return Effect.void;
+          rechecking.add(key);
+          return Effect.sleep(recheck.first).pipe(
+            Effect.andThen(held.harness.pendingQuestions(held.sessionId)),
+            Effect.retry(
+              Schedule.min([
+                Schedule.exponential(recheck.first, 2),
+                Schedule.spaced(recheck.most),
+              ]).pipe(Schedule.upTo({ duration: recheck.window })),
+            ),
+            Effect.flatMap(found),
+            Effect.catch((failure) =>
+              Effect.logWarning(
+                "a question whose dismissal the harness did not answer could not be read back; the page says to reload to check",
+                {
+                  importId: held.id,
+                  questionId,
+                  detail: failure.message,
+                },
+              ),
+            ),
+            Effect.ensuring(
+              Effect.sync(() => {
+                rechecking.delete(key);
+              }),
+            ),
+          );
+        });
+        return Effect.asVoid(Effect.forkIn(asking, held.scope));
+      };
+
       const dismissQuestion: ScopeImporter["Service"]["dismissQuestion"] =
         Effect.fn("ScopeImporter.dismissQuestion")(function* (input) {
           const { harnessSessionId, held } = yield* questionSession(
@@ -2800,6 +2914,12 @@ export class ScopeImporter extends Context.Service<
             .dismissQuestion(held.sessionId, input.questionId)
             .pipe(
               Effect.mapError(questionRefusal(input.questionId, "dismiss")),
+              // Not told, perhaps: asked again until it is known (`recheckQuestion`).
+              Effect.tapError((refusal) =>
+                refusal.reason === "harness_unreachable"
+                  ? recheckQuestion(held, input.targetId, input.questionId)
+                  : Effect.void,
+              ),
             );
           return {
             questionId: input.questionId,

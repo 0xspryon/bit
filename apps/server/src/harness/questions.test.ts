@@ -301,10 +301,12 @@ describe("a narrated question on the live stream and the sessions list", () => {
     record({ _tag: "question", question });
     record({ _tag: "connection", state: "closed", reason: "" });
     expect(store.waiting(subject)).toBeUndefined();
-    // A connection back: started again from the driver's list, which follows it.
+    // A connection back keeps it (A7-Q review 2): the driver's re-list corrects the set,
+    // with a `questionSettled` for each the list no longer holds and nothing when the list
+    // could not be read, so a list that failed does not drop a real question.
     record({ _tag: "question", question });
     record({ _tag: "connection", state: "restored", reason: "" });
-    expect(store.waiting(subject)).toBeUndefined();
+    expect(store.waiting(subject)?.questionId).toBe("toolu_9");
     record({ _tag: "question", question });
     expect(store.waiting(subject)?.questionId).toBe("toolu_9");
     // A break alone keeps it: the stream may be back in a moment.

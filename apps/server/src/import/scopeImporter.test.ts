@@ -69,7 +69,11 @@ import { agentUnavailableDetail } from "./importerHistory";
 import { operatorTextOf, type ImporterPromptInput } from "./importerPrompt";
 import { ScopeImportProgress } from "./progress";
 import { continuationMessage } from "../recovery/continuation";
-import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
+import {
+  QuestionRecheck,
+  ScopeImporter,
+  type ScopeImportRequest,
+} from "./scopeImporter";
 import type {
   AgentHarness,
   HarnessNarration,
@@ -780,6 +784,14 @@ const world = (readable: readonly string[]) => {
   ).pipe(Layer.provideMerge(withStores));
 
   const layer = ScopeImporter.layer.pipe(
+    // A refused dismissal's follow-up, in milliseconds rather than minutes (A7-Q review 2).
+    Layer.provide(
+      Layer.succeed(QuestionRecheck, {
+        first: "5 millis",
+        most: "20 millis",
+        window: "3 seconds",
+      }),
+    ),
     Layer.provide(
       Layer.succeed(
         HarnessResolver,
@@ -4779,6 +4791,160 @@ describe("a question the importer's agent waits on (A7-Q)", () => {
     expect(answerDetail).toContain("Your answers are kept");
     await runtime.dispose();
   });
+
+  /*
+   * A dismissal the harness did not answer is followed up (A7-Q review 2): a paused
+   * `opencode serve` keeps its event socket, so nothing else would ever re-offer a question
+   * it still waits on once it is back.
+   */
+  const unreachable = new HarnessTransportError({
+    operation: "session.form.cancel",
+    status: undefined,
+    tag: "TimeoutError",
+    detail: "the server did not answer",
+    cause: undefined,
+  });
+
+  /** The next question frame this target's importer publishes, from now on. */
+  const nextQuestionEntry = async (
+    runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+  ) => {
+    const asRuntime = runtime as unknown as ManagedRuntime.ManagedRuntime<
+      RunNarrations,
+      unknown
+    >;
+    const before = await asRuntime.runPromise(
+      Effect.flatMap(RunNarrations, (bus) => bus.subscriberCount),
+    );
+    const taken = asRuntime.runPromise(
+      Effect.flatMap(RunNarrations, (bus) =>
+        bus.subscribe({ targetId: TARGET }).pipe(
+          Stream.filter(
+            (item) =>
+              item.entry.detail._tag === "question" ||
+              item.entry.detail._tag === "questionSettled",
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.timeout("2 seconds"),
+          Effect.map((items) => items[0]),
+          Effect.orElseSucceed(() => undefined),
+        ),
+      ),
+    );
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const now = await asRuntime.runPromise(
+        Effect.flatMap(RunNarrations, (bus) => bus.subscriberCount),
+      );
+      if (now > before) break;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    return taken;
+  };
+
+  const readsReach = async (
+    built: { readonly script: Script },
+    count: number,
+  ) => {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      if (built.script.questions.listReads() >= count) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`the harness was listed ${String(built.script.questions.listReads())} times, not ${String(count)}`);
+  };
+
+  test("a dismissal the harness did not answer is asked after; still waiting once it is back, it is offered again", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    built.script.questions.fail = unreachable;
+    built.script.questions.listFail = unreachable;
+    const offered = nextQuestionEntry(runtime);
+    const dismissed = await questionCall(runtime, importId, "toolu_q1");
+    expect(dismissed).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "harness_unreachable" },
+    });
+    // Still unreachable for a few asks, then back, with the form still pending.
+    const before = built.script.questions.listReads();
+    await readsReach(built, before + 2);
+    built.script.questions.listFail = undefined;
+    const entry = await offered;
+    expect(entry?.subject).toEqual({ _tag: "import", importId });
+    expect(entry?.harnessSessionId).toBe("ses_import");
+    expect(entry?.entry.detail).toMatchObject({
+      _tag: "question",
+      question: { questionId: "toolu_q1" },
+    });
+    // Back on the bus's Needs you, so the rail and the agent sessions page count it.
+    const waiting = await runtime.runPromise(
+      Effect.flatMap(RunNarrations, (bus) =>
+        bus.waiting({ _tag: "import", importId }),
+      ),
+    );
+    expect(waiting?.questionId).toBe("toolu_q1");
+    // Found: asked no more.
+    const settledReads = built.script.questions.listReads();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(built.script.questions.listReads()).toBe(settledReads);
+    await runtime.dispose();
+  });
+
+  test("a dismissal the harness did not answer, settled by the time it is back, is taken off as withdrawn", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    built.script.questions.fail = unreachable;
+    built.script.questions.listFail = unreachable;
+    const said = nextQuestionEntry(runtime);
+    await questionCall(runtime, importId, "toolu_q1");
+    await readsReach(built, built.script.questions.listReads() + 1);
+    // The cancel did land after all, or the harness forgot the form.
+    built.script.questions.forget("ses_import", "toolu_q1");
+    built.script.questions.listFail = undefined;
+    const entry = await said;
+    expect(entry?.entry.detail).toEqual({
+      _tag: "questionSettled",
+      questionId: "toolu_q1",
+      settled: "withdrawn",
+    });
+    await runtime.dispose();
+  });
+
+  test("a session that ends while its refused dismissal is being asked after stops the asking, and says nothing of the question", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    built.script.questions.fail = unreachable;
+    built.script.questions.listFail = unreachable;
+    const said = nextQuestionEntry(runtime);
+    await questionCall(runtime, importId, "toolu_q1");
+    await readsReach(built, built.script.questions.listReads() + 2);
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) => importer.stop(importId)),
+    );
+    const stopped = built.script.questions.listReads();
+    // Back now, still waiting: but nothing holds the session to offer it for.
+    built.script.questions.listFail = undefined;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(built.script.questions.listReads()).toBe(stopped);
+    expect(await said).toBeUndefined();
+    await runtime.dispose();
+  });
+
+  test("a harness that stays unreachable is asked for a bounded time only", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    built.script.questions.fail = unreachable;
+    built.script.questions.listFail = unreachable;
+    await questionCall(runtime, importId, "toolu_q1");
+    // A second refusal while the first is asking adds no second asker.
+    await questionCall(runtime, importId, "toolu_q1");
+    // `window` is 3 s at 20 ms at most between asks: about 150 asks, then none.
+    await new Promise((resolve) => setTimeout(resolve, 3_300));
+    const after = built.script.questions.listReads();
+    expect(after).toBeLessThan(200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(built.script.questions.listReads()).toBe(after);
+    await runtime.dispose();
+  }, 10_000);
 
   test("a replay offers what the harness is waiting on as live, and nothing once it is answered", async () => {
     const { built, runtime, importId } = await liveOne();

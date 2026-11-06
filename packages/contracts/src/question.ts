@@ -198,6 +198,14 @@ export class QuestionRefused extends Schema.TaggedError<QuestionRefused>()(
   }
 }
 
+/**
+ * How long, after a dismissal refused as `harness_unreachable`, the server keeps asking the
+ * harness whether the question still waits (A7-Q review 2): asked again, it is offered
+ * again on the session's live stream; settled, it is taken off. The page's words for such
+ * a dismissal name this window, after which only a reload checks.
+ */
+export const QUESTION_RECHECK_MS = 5 * 60_000;
+
 /** The most characters one written answer may carry. */
 export const QUESTION_ANSWER_MAX_CHARS = 4_000;
 
