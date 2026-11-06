@@ -3735,6 +3735,12 @@ export const claudeCodeHarness = (
         if (Date.now() >= record.quellUntil) return;
         record.interrupted = true;
         record.interruptMoved = false;
+        void Effect.runPromise(
+          Effect.logInfo(
+            "a turn Claude Code opened on its own after a Stop all, about a sub-agent a card's Stop had stopped, is stopped as it opens",
+            { sessionId: record.sessionId },
+          ),
+        ).catch(() => undefined);
         live.interrupt().catch((cause: unknown) => {
           void Effect.runPromise(
             Effect.logWarning(
