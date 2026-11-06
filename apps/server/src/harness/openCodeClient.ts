@@ -2571,6 +2571,23 @@ export const openCodeHarness = (
        * per such session, each bounded by the sub-agent calls that session made.
        */
       const replayedSubagents = new Map<string, OpenCodeSubagents>();
+      /**
+       * A session's last stream's sub-agents, once that stream has ended, until the session is
+       * ended (A7-S review 2): what tells the end a foreground child from a background one.
+       *
+       * The importer closes a session's narrator before it ends the session
+       * (`liveAgentSessions`' `closeSession`), and the stream's end drops
+       * {@link streamedSubagents}, so without this the end knew no child as foreground: it
+       * interrupted a foreground child directly, which let the parent open a model step on
+       * the `Subagent cancelled` failure, and then waited the whole of
+       * {@link CHILD_NOTICE_SETTLE} for a notice a foreground child never sends. Never read
+       * for a replay or a Stop — those must not see an ended stream's state as live.
+       *
+       * V2(chat): an entry outlives its stream until the session is ended; a session whose
+       * stream ended for another reason and is never ended here keeps one, bounded by its
+       * sub-agent calls.
+       */
+      const endedStreams = new Map<string, OpenCodeSubagents>();
 
       /**
        * The latest {@link SessionRef} this process handed out for each session id.
@@ -3521,6 +3538,19 @@ export const openCodeHarness = (
        * list or a child's interrupt that fails is logged and the end goes on: the parent
        * still has to be stopped.
        *
+       * **A known foreground child is left to the parent's interrupt** (A7-S review 2). Its
+       * stop sends no notice, and interrupted on its own it fails the parent's call while the
+       * parent still runs, which then opened a model step on that failure — live, for the
+       * 1.5 s the end then waited for a notice that never comes. Which children run a
+       * foreground call is what the session's stream saw ({@link endedStreams}: the importer
+       * closes the stream before it ends the session) or a replay read; one bit never saw
+       * is taken for a background one.
+       *
+       * **Then the children are listed once more**, after the parent's interrupt, and any
+       * still running is stopped, its notice let in, and the parent emptied and interrupted
+       * again: a child launched between the first list and the parent's interrupt, or a
+       * foreground one the parent's interrupt did not reach.
+       *
        * V2(chat): the notice cannot be held back, so it wakes the parent for a turn the
        * parent's interrupt then stops. Measured live (A7-S fix round 1, 2.2.5, GLM 5.3
        * Flash): aborted 20 ms after it began, with no output, but stored, so the ended
@@ -3545,64 +3575,135 @@ export const openCodeHarness = (
           if (first.failure.status === 404) return;
           return yield* Effect.fail(first.failure);
         }
+        const foreground = foregroundChildren(session.id);
+        // Background children first: the parent's interrupt does not reach them.
         const since = Date.now();
-        const stopped = yield* stopRunningChildren(session.id);
-        const missing =
-          stopped.length === 0
-            ? []
-            : yield* awaitChildNotices(session.id, stopped, since);
-        if (missing.length > 0) {
-          yield* Effect.logWarning(
-            "a background sub-agent stopped at the end of its session had not told its parent yet; the parent is interrupted anyway, and may wake once more for that notice",
-            { sessionId: session.id, children: missing },
+        const stopped = yield* stopRunningChildren(
+          session.id,
+          foreground,
+          true,
+        );
+        yield* settleChildNotices(session.id, stopped.notifying, since);
+        yield* emptyAndInterrupt(
+          sessionID,
+          stopped.interrupted.length === 0 ? first.success : undefined,
+        );
+        /*
+         * Then once more, after the parent's interrupt: a child launched between the first
+         * list and the parent's interrupt, or a foreground one the parent's interrupt did
+         * not reach, is still running. Each is stopped, and a background one's notice is let
+         * in and the parent emptied and interrupted again, as above.
+         */
+        const again = Date.now();
+        const late = yield* stopRunningChildren(session.id, foreground, false);
+        if (late.interrupted.length > 0) {
+          yield* Effect.logInfo(
+            "a sub-agent of an ending session was still running after its parent was stopped, and is stopped now",
+            { sessionId: session.id, children: late.interrupted },
           );
+          yield* settleChildNotices(session.id, late.notifying, again);
+          yield* emptyAndInterrupt(sessionID, undefined);
         }
-        const waiting =
-          stopped.length === 0
-            ? first.success
-            : yield* bounded(
-                "session.inbox.list",
-                timeouts.control,
-                api.session.inbox.list({ sessionID }),
-              );
-        yield* Effect.forEach(
-          waiting,
-          (item) =>
-            bounded(
-              "session.inbox.cancel",
-              timeouts.control,
-              api.session.inbox.cancel({ sessionID, inboxID: item.id }),
-            ),
-          { discard: true },
-        );
-        yield* bounded(
-          "session.interrupt",
-          timeouts.control,
-          api.session.interrupt({ sessionID }),
-        );
         // Nothing of this session runs here now, so nothing of its sub-agents is live.
         streamedSubagents.delete(session.id);
         replayedSubagents.delete(session.id);
+        endedStreams.delete(session.id);
       });
 
       /**
-       * Interrupts every child session of `sessionId` that is running now, and answers the
-       * ones that were, less those known to be foreground (whose end tells no one: the
-       * parent's call fails instead). See {@link endSession}.
+       * The child sessions known to run a **foreground** call of `sessionId`'s: the stream's,
+       * its ended stream's ({@link endedStreams}), or the newest replay's. A foreground
+       * child is stopped by its parent's interrupt (the tool's `onInterrupt`), and its end
+       * tells no one, the parent's call failing instead.
+       */
+      const foregroundChildren = (sessionId: string): ReadonlySet<string> =>
+        new Set(
+          [
+            streamedSubagents.get(sessionId),
+            endedStreams.get(sessionId),
+            replayedSubagents.get(sessionId),
+          ].flatMap((subagents) =>
+            [...(subagents?.calls.values() ?? [])].flatMap((call) =>
+              call.child !== undefined && !call.background ? [call.child] : [],
+            ),
+          ),
+        );
+
+      /**
+       * Waits for the notices of the background children just stopped ({@link
+       * awaitChildNotices}), and logs the ones that never came.
+       */
+      const settleChildNotices = (
+        sessionId: string,
+        children: readonly string[],
+        since: number,
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          if (children.length === 0) return;
+          const missing = yield* awaitChildNotices(sessionId, children, since);
+          if (missing.length > 0) {
+            yield* Effect.logWarning(
+              "a background sub-agent stopped at the end of its session had not told its parent yet; the parent is interrupted anyway, and may wake once more for that notice",
+              { sessionId, children: missing },
+            );
+          }
+        });
+
+      /**
+       * Cancels every inbox item of the session still waiting, then interrupts its execution
+       * in flight. `listed` is an inbox read already made, when nothing can have joined it
+       * since; otherwise the inbox is read again.
+       */
+      const emptyAndInterrupt = (
+        sessionID: Session.ID,
+        listed: readonly { readonly id: string }[] | undefined,
+      ) =>
+        Effect.gen(function* () {
+          const waiting =
+            listed ??
+            (yield* bounded(
+              "session.inbox.list",
+              timeouts.control,
+              api.session.inbox.list({ sessionID }),
+            ));
+          yield* Effect.forEach(
+            waiting,
+            (item) =>
+              bounded(
+                "session.inbox.cancel",
+                timeouts.control,
+                api.session.inbox.cancel({ sessionID, inboxID: item.id }),
+              ),
+            { discard: true },
+          );
+          yield* bounded(
+            "session.interrupt",
+            timeouts.control,
+            api.session.interrupt({ sessionID }),
+          );
+        });
+
+      /**
+       * Interrupts every child session of `sessionId` that is running now — less the
+       * `foreground` ones when `sparingForeground`, which the parent's interrupt stops — and
+       * answers the ones it interrupted, and of those the ones whose stop sends the parent a
+       * notice (all but the foreground ones). A child the server lists that bit never saw is
+       * taken for a background one. See {@link endSession}.
        */
       const stopRunningChildren = (
         sessionId: string,
-      ): Effect.Effect<string[]> =>
+        foreground: ReadonlySet<string>,
+        sparingForeground: boolean,
+      ): Effect.Effect<{
+        readonly interrupted: readonly string[];
+        readonly notifying: readonly string[];
+      }> =>
         Effect.gen(function* () {
           const known = [
             streamedSubagents.get(sessionId),
+            endedStreams.get(sessionId),
             replayedSubagents.get(sessionId),
           ].flatMap((subagents) => [...(subagents?.calls.values() ?? [])]);
-          const foreground = new Set(
-            known.flatMap((call) =>
-              call.child !== undefined && !call.background ? [call.child] : [],
-            ),
-          );
           const children = new Set(
             known.flatMap((call) =>
               call.child === undefined ? [] : [call.child],
@@ -3626,14 +3727,16 @@ export const openCodeHarness = (
               { sessionId, detail: listed.failure.message },
             );
           }
-          if (children.size === 0) return [];
+          if (children.size === 0) return { interrupted: [], notifying: [] };
           const active = yield* Effect.result(
             bounded("session.active", timeouts.control, api.session.active()),
           );
           // Not knowing which run, each is asked: an interrupt of an idle session is a no-op.
           const running = [...children].filter(
             (child) =>
-              active._tag === "Failure" || Object.hasOwn(active.success, child),
+              !(sparingForeground && foreground.has(child)) &&
+              (active._tag === "Failure" ||
+                Object.hasOwn(active.success, child)),
           );
           const answered = yield* Effect.forEach(
             running,
@@ -3643,9 +3746,7 @@ export const openCodeHarness = (
                 timeouts.control,
                 api.session.interrupt({ sessionID: child as Session.ID }),
               ).pipe(
-                Effect.map((result) =>
-                  result.interrupted && !foreground.has(child) ? [child] : [],
-                ),
+                Effect.map((result) => (result.interrupted ? [child] : [])),
                 Effect.catch((failure) =>
                   Effect.as(
                     Effect.logWarning(
@@ -3658,7 +3759,11 @@ export const openCodeHarness = (
               ),
             { concurrency: "unbounded" },
           );
-          return answered.flat();
+          const interrupted = answered.flat();
+          return {
+            interrupted,
+            notifying: interrupted.filter((child) => !foreground.has(child)),
+          };
         });
 
       /**
@@ -3937,12 +4042,14 @@ export const openCodeHarness = (
           Stream.onStart(
             Effect.sync(() => {
               streamedSubagents.set(sessionId, subagents);
+              endedStreams.delete(sessionId);
             }),
           ),
           Stream.ensuring(
             Effect.sync(() => {
               if (streamedSubagents.get(sessionId) === subagents) {
                 streamedSubagents.delete(sessionId);
+                endedStreams.set(sessionId, subagents);
               }
             }),
           ),
