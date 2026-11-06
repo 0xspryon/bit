@@ -75,8 +75,8 @@ installIcons("client");
 
 /*
  * One window for the whole run, so one `localStorage` and one `sessionStorage`: what a test
- * leaves there — the importer's remembered model (`importerModelMemory.ts`), its parked
- * words (`importerParked.ts`) — would be the next test's starting state. Each test starts
+ * leaves there — the importer's remembered model (`modelMemory.ts`), its parked
+ * words (`conversationParked.ts`) — would be the next test's starting state. Each test starts
  * with none, as a first visit does.
  */
 beforeEach(() => {

@@ -35,13 +35,9 @@
   import { countsLine, goalTitle, statusLabel, whenText } from "../goalFormat";
   import { navGlyphs } from "../navGlyphs";
   import { crumbMeter } from "../crumbMeter";
-  import {
-    sessionHover,
-    sessionLabel,
-    sessionWhen,
-    tallyLine,
-  } from "../importerChat";
-  import { parkedMark, parkedStart } from "../importerParked";
+  import { sessionHover, sessionLabel, sessionWhen } from "../conversationChat";
+  import { tallyLine } from "../importerChat";
+  import { parkedMark, parkedStart } from "../conversationParked";
   import { navItems } from "../mock";
   import type { App } from "../app.svelte";
 

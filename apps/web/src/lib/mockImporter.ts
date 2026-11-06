@@ -42,7 +42,8 @@ import {
 } from "@bit/contracts";
 
 import { operatorTurn } from "./chat";
-import { NO_HISTORY, type ImporterSession } from "./importerChat";
+import { NO_HISTORY } from "./conversationChat";
+import type { ImporterSession } from "./importerChat";
 
 /**
  * The model every new importer session shows.

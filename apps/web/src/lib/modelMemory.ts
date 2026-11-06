@@ -1,6 +1,6 @@
 /**
- * The harness and model the operator last picked for a new importer session, per target
- * (U8 review).
+ * The harness and model the operator last picked for a new session, per owner (U8 review):
+ * the importer's per target since U8, any chat's since the chat generalisation (slice 2).
  *
  * Every opening of the importer — "Auto-load…", a reload of `/assets/chat`, a deep link —
  * starts a fresh page, and a fresh page used to take D15's rule (`importerModel` on the
@@ -25,10 +25,16 @@ export interface RememberedModel {
   readonly model: string;
 }
 
-/** Where picks are kept. The browser's {@link browserModelMemory}, or a test's own. */
+/**
+ * Where picks are kept. The browser's {@link browserModelMemory}, or a test's own.
+ *
+ * `owner` names whose pick it is: the importer's is its **target id**, as it has been since
+ * U8, so its stored key is unchanged. Another owner names itself so no target id can collide
+ * with it, as `goal/<goalId>` would.
+ */
 export interface ModelMemory {
-  read(serverUrl: string, targetId: string): RememberedModel | undefined;
-  write(serverUrl: string, targetId: string, pick: RememberedModel): void;
+  read(serverUrl: string, owner: string): RememberedModel | undefined;
+  write(serverUrl: string, owner: string, pick: RememberedModel): void;
 }
 
 const Remembered = Schema.Struct({
@@ -39,9 +45,12 @@ const decodeRemembered = Schema.decodeUnknownOption(
   Schema.fromJsonString(Remembered),
 );
 
-/** One key per server and target: a target id names a target on one server only. */
-const keyOf = (serverUrl: string, targetId: string): string =>
-  `bit.importerModel:${JSON.stringify([serverUrl, targetId])}`;
+/**
+ * One key per server and owner: an owner names one chat on one server only. The prefix is the
+ * importer's from before the generalisation, kept so a pick remembered then is read back.
+ */
+const keyOf = (serverUrl: string, owner: string): string =>
+  `bit.importerModel:${JSON.stringify([serverUrl, owner])}`;
 
 // V2(chat): V1 keeps the harness and model only. The reasoning and other options picked
 // with them (`importModelOptionsByModel`) are not kept across a reload, so a remembered
@@ -49,21 +58,19 @@ const keyOf = (serverUrl: string, targetId: string): string =>
 // model's descriptors as `explicitModelOptionSelections` checks a send.
 /** {@link ModelMemory} over `localStorage`. Every failure to read or write is a no-op. */
 export const browserModelMemory: ModelMemory = {
-  read(serverUrl, targetId) {
+  read(serverUrl, owner) {
     try {
-      const stored = globalThis.localStorage?.getItem(
-        keyOf(serverUrl, targetId),
-      );
+      const stored = globalThis.localStorage?.getItem(keyOf(serverUrl, owner));
       if (stored === null || stored === undefined) return undefined;
       return Option.getOrUndefined(decodeRemembered(stored));
     } catch {
       return undefined;
     }
   },
-  write(serverUrl, targetId, pick) {
+  write(serverUrl, owner, pick) {
     try {
       globalThis.localStorage?.setItem(
-        keyOf(serverUrl, targetId),
+        keyOf(serverUrl, owner),
         JSON.stringify({ instanceId: pick.instanceId, model: pick.model }),
       );
     } catch {

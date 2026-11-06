@@ -48,7 +48,8 @@
   import Button from "../components/Button.svelte";
   import ConfirmAction from "../components/ConfirmAction.svelte";
   import PageFrame from "../components/PageFrame.svelte";
-  import { lastSessionSentence, sessionWhen } from "../importerChat";
+  import { sessionWhen } from "../conversationChat";
+  import { lastSessionSentence } from "../importerChat";
   import {
     IconClose,
     IconCube,

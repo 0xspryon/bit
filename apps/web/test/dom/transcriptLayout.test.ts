@@ -24,11 +24,8 @@ import {
 
 import { App, IMPORT_POLL_MS } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import {
-  CARRIED_NOTE,
-  QUEUED_NOTE,
-  STOPPED_NOTE,
-} from "../../src/lib/importerChat";
+import { CARRIED_NOTE } from "../../src/lib/conversationChat";
+import { QUEUED_NOTE, STOPPED_NOTE } from "../../src/lib/importerChat";
 import { mockHarnesses } from "../../src/lib/mockImporter";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";

@@ -64,7 +64,7 @@ import { Effect, Fiber, Layer, Result, Schema, Stream } from "effect";
 import { FetchHttpClient, HttpClientRequest } from "effect/http";
 import { HttpApiClient, HttpApiMiddleware } from "effect/http-api";
 
-import { messageTooLong } from "./importerChat";
+import { messageTooLong } from "./conversationChat";
 
 /** Where the token is parked so a reload can find it. */
 const TOKEN_KEY = "bit.session.token";

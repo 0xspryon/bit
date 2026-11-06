@@ -39,6 +39,7 @@ import {
   type GoalNarrationView,
   type GoalObservationView,
   type GoalView,
+  type ImporterTurnAccepted,
   type AgentSessionView,
   type AgentSessionsView,
   type AgentSessionKind,
@@ -90,21 +91,23 @@ import {
 import { server, type ServerClient } from "./client";
 import type { LoadedFile } from "./attachmentFiles";
 import { ComposerFiles, FILES_WITHOUT_WORDS } from "./composerFiles.svelte";
-import { indexedSession } from "./importerChat";
+import { importerTurnAccepted, indexedSession } from "./importerChat";
 import {
   browserModelMemory,
   usableRemembered,
   type ModelMemory,
-} from "./importerModelMemory";
-import { browserParkedStore, type ParkedStore } from "./importerParked";
+} from "./modelMemory";
+import { browserParkedStore, type ParkedStore } from "./conversationParked";
 import {
   ImporterSessions,
   type ImporterScenario,
-  type ImporterSent,
-  type ImporterActivity,
-  type ImporterQuestionAnswer,
   type ImporterServer,
 } from "./importerSessions.svelte";
+import {
+  conversationServer,
+  isFilesRefusal,
+  type ConversationEndpoints,
+} from "./conversationServer";
 import {
   mockHarnesses,
   mockImporterIndex,
@@ -376,16 +379,6 @@ const targetGoneNote = (targetId: string): string =>
  * *different* target — so "wrong target" is the likeliest reason an operator is reading
  * this, and a sentence that only said "no such goal" would leave them hunting for it.
  */
-/**
- * Whether a refusal of a message is about its files (A6 U13): one over a cap, a HEIC, too
- * many or too much, a request over what the listener takes, files the server could not
- * store. Said in the F2 dialog, with the words and the files left in the composer.
- */
-const isFilesRefusal = (error: object): boolean =>
-  "_tag" in error &&
-  (error._tag === "MessageUploadRefused" ||
-    error._tag === "RequestTooLarge" ||
-    (("reason" in error && error.reason === "upload_unwritable") as boolean));
 
 const goalGoneNote = (goalId: string): string =>
   `This target has no goal under the id "${goalId}". A goal id belongs to one target, so it may be another target's — these are this target's goals.`;
@@ -444,14 +437,14 @@ export class App {
 
   /**
    * Where the harness and model last picked for a new importer session are kept, per target
-   * (`importerModelMemory.ts`). Handed in once, like {@link countdown}; the tests hand in
+   * (`modelMemory.ts`). Handed in once, like {@link countdown}; the tests hand in
    * their own so one test's pick is not the next one's default.
    */
   readonly modelMemory: ModelMemory;
 
   /**
    * Where the importer keeps the words of messages that did not land, per target, in this
-   * tab (`importerParked.ts`). Handed in once, like {@link modelMemory}.
+   * tab (`conversationParked.ts`). Handed in once, like {@link modelMemory}.
    */
   readonly parkedStore: ParkedStore;
 
@@ -2839,61 +2832,47 @@ export class App {
    * keeps the model it was opened on.
    */
   #importerServer(targetId: string): ImporterServer {
-    const answer = (
-      call: Awaited<ReturnType<ServerClient["sendImporterMessage"]>>,
-      /** The import the message was addressed to, for a follow-up; absent for an opening. */
-      addressed?: string,
-    ): ImporterSent => {
-      // A message opens a session, or reopens one this server had let go (A7 U8b review).
-      this.#agentSessionsMoved(targetId);
-      if (call._tag === "Ok") {
-        // Opened or resumed: a new narration stream, which has not broken (U13 review 6).
-        // The notice standing is the one about the import the message was sent to: a resume
-        // or a reopen answers with a **new** import id (one id per authority period), so
-        // forgetting only the answer's id left the old one's "could not be reconnected"
-        // over the thread (chat shell review 2).
-        if (call.value.conversation !== "continued") {
-          if (addressed !== undefined) this.#forgetConnection(addressed);
-          this.#forgetConnection(call.value.importId);
-        }
-        return { _tag: "accepted", turn: call.value };
-      }
-      if (call._tag === "Refused") {
-        if (call.error._tag === "Unauthenticated") this.signOut("expired");
-        return {
-          _tag: "refused",
-          detail: this.#refusalText(
-            call.error,
-            "That message was not delivered.",
-          ),
-          ...(call.error._tag === "ImporterConversationRefused" &&
-          call.error.reason === "import_ended"
-            ? { ended: true }
-            : {}),
-          ...(isFilesRefusal(call.error) ? { files: true } : {}),
-        };
-      }
-      // Not a refusal: the server may have taken it before the answer was lost (U8 review 4).
-      return { _tag: "unanswered" };
-    };
-    /** An answer or a dismissal's call, as the importer's state reads it (A7-Q). */
-    const questionAnswer = (
-      call: Awaited<ReturnType<ServerClient["answerImporterQuestion"]>>,
-      fallback: string,
-    ): ImporterQuestionAnswer => {
-      this.#agentSessionsMoved(targetId);
-      if (call._tag === "Ok") return { _tag: "settled" };
-      if (call._tag === "Refused") {
-        if (call.error._tag === "Unauthenticated") this.signOut("expired");
-        return {
-          _tag: "refused",
-          reason:
-            call.error._tag === "QuestionRefused" ? call.error.reason : "other",
-          detail: this.#refusalText(call.error, fallback),
-        };
-      }
-      return { _tag: "unanswered" };
-    };
+    return conversationServer(
+      {
+        signOut: () => this.signOut("expired"),
+        refusalText: (error, fallback) => this.#refusalText(error, fallback),
+        moved: () => this.#agentSessionsMoved(targetId),
+        forgetConnection: (importId) => this.#forgetConnection(importId),
+        highWater: () => this.#activityHighWater() ?? 0,
+        reread: () => this.loadImporterSessions(targetId),
+        wait: (ms) =>
+          new Promise<void>((resolve) => {
+            this.countdown.after(ms, resolve);
+          }),
+        after: (ms, then) => this.countdown.after(ms, then),
+        parked: {
+          read: () => this.parkedStore.read(this.serverUrl, targetId),
+          write: (parked) =>
+            this.parkedStore.write(this.serverUrl, targetId, parked),
+        },
+        harnessName: (instanceId) =>
+          this.harnesses.find((entry) => entry.instanceId === instanceId)
+            ?.displayName ?? instanceId,
+        harnessDriver: (instanceId) =>
+          this.harnesses.find((entry) => entry.instanceId === instanceId)
+            ?.driver,
+      },
+      this.#importerEndpoints(targetId),
+    );
+  }
+
+  /**
+   * The importer's routes for one target, as the generic chat server takes them: thin
+   * calls to the client, keyed by import id.
+   *
+   * The model pick goes with an *opening* message exactly as `startScopeImport` sends it —
+   * absent unless the operator overrode something — and never with a later one: a session
+   * keeps the model it was opened on.
+   */
+  #importerEndpoints(
+    targetId: string,
+  ): ConversationEndpoints<ImporterTurnAccepted> {
+    const url = () => this.serverUrl;
     return {
       open: async (text, agentId, files) => {
         // The Reasoning column's choices go with the opening message, normalised against
@@ -2903,306 +2882,74 @@ export class App {
           this.importModelDescriptors,
           this.pickedImportModelOptions,
         );
-        const sent = answer(
-          await this.client.openImporterConversation(
-            this.serverUrl,
-            targetId,
-            {
-              text,
-              ...(agentId === undefined ? {} : { agentId }),
-              ...(this.pickedImportInstanceId !== "" ||
-              this.pickedImportModel !== "" ||
-              importOptions !== undefined
-                ? {
-                    importModel: {
-                      ...(this.pickedImportInstanceId === ""
-                        ? {}
-                        : { instanceId: this.pickedImportInstanceId }),
-                      ...(this.pickedImportModel === ""
-                        ? {}
-                        : { model: this.pickedImportModel }),
-                      ...(importOptions === undefined
-                        ? {}
-                        : { modelOptions: importOptions }),
-                    },
-                  }
-                : {}),
-            },
-            files,
-          ),
-        );
-        return sent._tag === "accepted"
-          ? { ...sent, modelOptions: importOptions ?? [] }
-          : sent;
-      },
-      answerQuestion: async (importId, questionId, answers) =>
-        questionAnswer(
-          await this.client.answerImporterQuestion(
-            this.serverUrl,
-            targetId,
-            importId,
-            questionId,
-            answers,
-          ),
-          "The answers were not sent.",
-        ),
-      dismissQuestion: async (importId, questionId) =>
-        questionAnswer(
-          await this.client.dismissImporterQuestion(
-            this.serverUrl,
-            targetId,
-            importId,
-            questionId,
-          ),
-          "The questions were not dismissed.",
-        ),
-      /**
-       * Moves one import onto another model of its harness (A6 F4). An expired session signs
-       * out; any other refusal, or no server answering, is a sentence for the error dialog.
-       */
-      switchModel: async (importId, draft) => {
-        const call = await this.client.switchImporterModel(
-          this.serverUrl,
+        const call = await this.client.openImporterConversation(
+          url(),
           targetId,
-          importId,
-          draft,
-        );
-        if (call._tag === "Ok")
-          return { _tag: "switched", switched: call.value };
-        if (call._tag === "Refused") {
-          if (call.error._tag === "Unauthenticated") this.signOut("expired");
-          return {
-            _tag: "refused",
-            detail: this.#refusalText(
-              call.error,
-              "The model was not switched.",
-            ),
-          };
-        }
-        return {
-          _tag: "refused",
-          detail:
-            "No server answered at this address, so whether the model was switched is not known. Pick it again once the server is back.",
-        };
-      },
-      send: async (importId, text, urgency, files) =>
-        answer(
-          await this.client.sendImporterMessage(
-            this.serverUrl,
-            targetId,
-            importId,
+          {
             text,
-            urgency,
-            files,
-          ),
+            ...(agentId === undefined ? {} : { agentId }),
+            ...(this.pickedImportInstanceId !== "" ||
+            this.pickedImportModel !== "" ||
+            importOptions !== undefined
+              ? {
+                  importModel: {
+                    ...(this.pickedImportInstanceId === ""
+                      ? {}
+                      : { instanceId: this.pickedImportInstanceId }),
+                    ...(this.pickedImportModel === ""
+                      ? {}
+                      : { model: this.pickedImportModel }),
+                    ...(importOptions === undefined
+                      ? {}
+                      : { modelOptions: importOptions }),
+                  },
+                }
+              : {}),
+          },
+          files,
+        );
+        return { call, modelOptions: importOptions ?? [] };
+      },
+      send: (importId, text, urgency, files) =>
+        this.client.sendImporterMessage(
+          url(),
+          targetId,
           importId,
+          text,
+          urgency,
+          files,
         ),
-      /**
-       * Stops one import's turn and keeps the conversation (A6 F5). An expired session signs
-       * out, as every call here does; anything else refused, or no server answering, is a
-       * sentence for the error dialog.
-       */
-      stop: async (importId) => {
-        const call = await this.client.stopImporterTurn(
-          this.serverUrl,
+      history: (importId) =>
+        this.client.importerMessages(url(), targetId, importId),
+      stop: (importId) =>
+        this.client.stopImporterTurn(url(), targetId, importId),
+      stopAll: (importId) =>
+        this.client.stopImporterAll(url(), targetId, importId),
+      stopSubagent: (importId, callId) =>
+        this.client.stopImporterSubagent(url(), targetId, importId, callId),
+      answerQuestion: (importId, questionId, answers) =>
+        this.client.answerImporterQuestion(
+          url(),
           targetId,
           importId,
-        );
-        this.#agentSessionsMoved(targetId);
-        if (call._tag === "Ok") return { _tag: "stopped", stopped: call.value };
-        if (call._tag === "Refused") {
-          if (call.error._tag === "Unauthenticated") this.signOut("expired");
-          return {
-            _tag: "refused",
-            detail: this.#refusalText(call.error, "The turn was not stopped."),
-          };
-        }
-        return {
-          _tag: "refused",
-          detail:
-            "No server answered at this address, so the turn may still be running.",
-        };
-      },
-      /** E7's Stop all (A7-S): the sub-agents, then the turn, answered as a Stop is. */
-      stopAll: async (importId) => {
-        const call = await this.client.stopImporterAll(
-          this.serverUrl,
+          questionId,
+          answers,
+        ),
+      dismissQuestion: (importId, questionId) =>
+        this.client.dismissImporterQuestion(
+          url(),
           targetId,
           importId,
-        );
-        this.#agentSessionsMoved(targetId);
-        if (call._tag === "Ok") return { _tag: "stopped", stopped: call.value };
-        if (call._tag === "Refused") {
-          if (call.error._tag === "Unauthenticated") this.signOut("expired");
-          return {
-            _tag: "refused",
-            detail: this.#refusalText(
-              call.error,
-              "The turn and its sub-agents were not stopped.",
-            ),
-          };
-        }
-        return {
-          _tag: "refused",
-          detail:
-            "No server answered at this address, so the turn and its sub-agents may still be running.",
-        };
-      },
-      /** One sub-agent's Stop (A7-S), by its calling tool call's id. */
-      stopSubagent: async (importId, callId) => {
-        const call = await this.client.stopImporterSubagent(
-          this.serverUrl,
-          targetId,
-          importId,
-          callId,
-        );
-        if (call._tag === "Ok") {
-          return { _tag: "stopped", detail: call.value.detail };
-        }
-        if (call._tag === "Refused") {
-          if (call.error._tag === "Unauthenticated") this.signOut("expired");
-          return {
-            _tag: "refused",
-            detail: this.#refusalText(
-              call.error,
-              "The sub-agent was not stopped.",
-            ),
-          };
-        }
-        return {
-          _tag: "refused",
-          detail:
-            "No server answered at this address, so the sub-agent may still be running.",
-        };
-      },
-      /**
-       * One session's conversation, with the floor the live tail is joined at (S6).
-       *
-       * **The floor is taken before the request leaves**, like every other join on this
-       * page and for its reason: what an answer can possibly contain is decided at the
-       * moment it is asked for, so narration published during the round trip is the live
-       * tail and must not be dropped against it.
-       *
-       * A refusal or an unreachable server answers `undefined`, which leaves the session's
-       * thread as it was rather than claiming the harness said nothing. The one thing it
-       * acts on is an expired session, like every other call here.
-       */
-      history: async (importId) => {
-        const floor = this.#activityHighWater() ?? 0;
-        const call = await this.client.importerMessages(
-          this.serverUrl,
-          targetId,
-          importId,
-        );
-        if (call._tag === "Ok") {
-          // Ended, by the replay's word: its stream is gone with it (U13 review 6).
-          if (
-            call.value.continuation === "refused" &&
-            call.value.refusal.reason === "import_ended"
-          ) {
-            this.#forgetConnection(importId);
-          }
-          return { view: call.value, floor };
-        }
-        if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
-          this.signOut("expired");
-        }
-        return undefined;
-      },
-      reread: () => this.loadImporterSessions(targetId),
-      wait: (ms) =>
-        new Promise<void>((resolve) => {
-          this.countdown.after(ms, resolve);
-        }),
-      parked: {
-        read: () => this.parkedStore.read(this.serverUrl, targetId),
-        write: (parked) =>
-          this.parkedStore.write(this.serverUrl, targetId, parked),
-      },
-      harnessName: (instanceId) =>
-        this.harnesses.find((entry) => entry.instanceId === instanceId)
-          ?.displayName ?? instanceId,
-      harnessDriver: (instanceId) =>
-        this.harnesses.find((entry) => entry.instanceId === instanceId)?.driver,
-      highWater: () => this.#activityHighWater() ?? 0,
-      watchTurn: (importId, update) =>
-        this.#watchImporterTurn(targetId, importId, update),
-      /**
-       * One import's context reading (A6 U9). An expired session signs out, as every call
-       * here does; anything else unanswered leaves the meter as it was.
-       */
-      context: async (importId, breakdown) => {
-        const call = await this.client.importerContext(
-          this.serverUrl,
-          targetId,
-          importId,
-          breakdown,
-        );
-        if (call._tag === "Ok") return call.value;
-        if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
-          this.signOut("expired");
-        }
-        return undefined;
-      },
-    };
-  }
-
-  /**
-   * Polls what is running in one import's session (A6 U6), handing each answer to `update`,
-   * until nothing is: no turn and no background work.
-   *
-   * {@link watchImport}'s loop — rescheduled after each answer, one request in flight — and
-   * separate from it because it watches a different thing for a different reader: that one
-   * settles the progress panel, this one draws a chat's cursor and its Stop, and the two must
-   * not stop each other.
-   *
-   * **The harness's account, not the import's** (`importerActivity`): a turn the harness
-   * opened by itself — Claude Code's, on a background task's notification — runs with the
-   * import `finished`, and background work runs outside any turn. **Anything that is not an
-   * answer is the end**: a refusal, or no server answering, means nothing more is coming that
-   * this tab could see, and a cursor left blinking over a conversation that has stopped
-   * would be a claim the chat cannot back.
-   */
-  #watchImporterTurn(
-    targetId: string,
-    importId: string,
-    update: (activity: ImporterActivity) => void,
-  ): () => void {
-    let stopped = false;
-    let cancelNext: (() => void) | undefined;
-    const loop = async (): Promise<void> => {
-      if (stopped) return;
-      const call = await this.client.importerActivity(
-        this.serverUrl,
-        targetId,
-        importId,
-      );
-      if (stopped) return;
-      if (call._tag === "Ok") {
-        const activity = {
-          running: call.value.turn === "running",
-          background: call.value.background,
-        };
-        const going = activity.running || activity.background;
-        if (going) {
-          cancelNext = this.countdown.after(IMPORT_POLL_MS, () => void loop());
-        } else {
-          stopped = true;
-        }
-        update(activity);
-        return;
-      }
-      if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
-        this.signOut("expired");
-      }
-      stopped = true;
-      update({ running: false, background: false });
-    };
-    void loop();
-    return () => {
-      stopped = true;
-      cancelNext?.();
-      cancelNext = undefined;
+          questionId,
+        ),
+      switchModel: (importId, draft) =>
+        this.client.switchImporterModel(url(), targetId, importId, draft),
+      activity: (importId) =>
+        this.client.importerActivity(url(), targetId, importId),
+      context: (importId, breakdown) =>
+        this.client.importerContext(url(), targetId, importId, breakdown),
+      accepted: importerTurnAccepted,
+      ended: "import_ended",
     };
   }
 

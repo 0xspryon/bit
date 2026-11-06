@@ -31,13 +31,15 @@ import { App, IMPORT_POLL_MS, scenarios } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
 import { PARTIAL_BODY_MAX, REPLY_PAST_CAP_LABEL } from "../../src/lib/chat";
 import {
-  ENDED_NOTE,
   MID_BLOCK_NOTE,
+  sessionStarted,
+  sessionWhen,
+} from "../../src/lib/conversationChat";
+import {
+  ENDED_NOTE,
   sendNowButtonTitle,
   sendingNowNote,
   sentNowTitle,
-  sessionStarted,
-  sessionWhen,
 } from "../../src/lib/importerChat";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";

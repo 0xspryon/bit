@@ -1,6 +1,7 @@
 /**
- * The words of importer messages that did not land where the operator sent them, kept per
- * session (U8 review 3 and 4).
+ * The words of a chat's messages that did not land where the operator sent them, kept per
+ * session (U8 review 3 and 4). The importer's since U8; any owner's since the chat
+ * generalisation (slice 2), keyed by owner.
  *
  * The composer's draft is the page's, not a session's, so a message whose answer comes back
  * after the operator has left its session has nowhere to go: the box on screen holds other
@@ -13,13 +14,13 @@
  *   session for it, even — before the connection failed, so sending the words again may
  *   send them twice ("Not confirmed"). The page reads the list once more to find out.
  *
- * **Kept in this tab.** Every return to the importer page starts it afresh (`begin`), which
- * used to drop them; so they are mirrored into `sessionStorage`, per server and target, and
+ * **Kept in this tab.** Every return to a chat's page starts it afresh (`begin`), which
+ * used to drop them; so they are mirrored into `sessionStorage`, per server and owner, and
  * read back there. A reload and in-app navigation keep them; another tab, or closing this
  * one, does not. A store that throws (blocked site data) keeps them as long as the page.
  */
 // V2(chat): parked words live in this tab's `sessionStorage` only, because the draft is the
-// page's (`ImporterSessions.draft`) and a session has none of its own. V2 keeps a draft per
+// page's (`ConversationSessions.draft`) and a session has none of its own. V2 keeps a draft per
 // session on the server, which makes parked words an ordinary draft: they would follow the
 // operator to another tab or browser, and "Not sent" would be a draft's state, not a copy.
 import { Option, Schema } from "effect";
@@ -44,10 +45,16 @@ export interface ParkedMessage {
 /** Parked words by the id of the session they wait on. */
 export type ParkedMessages = Readonly<Record<string, ParkedMessage>>;
 
-/** Where parked words are kept. The browser's {@link browserParkedStore}, or a test's own. */
+/**
+ * Where parked words are kept. The browser's {@link browserParkedStore}, or a test's own.
+ *
+ * `owner` names whose chat they are: the importer's is its **target id**, as it has been
+ * since U8, so its stored key is unchanged. Another owner names itself so no target id can
+ * collide with it, as `goal/<goalId>` would.
+ */
 export interface ParkedStore {
-  read(serverUrl: string, targetId: string): ParkedMessages;
-  write(serverUrl: string, targetId: string, parked: ParkedMessages): void;
+  read(serverUrl: string, owner: string): ParkedMessages;
+  write(serverUrl: string, owner: string, parked: ParkedMessages): void;
 }
 
 const Parked = Schema.Record(
@@ -66,16 +73,19 @@ const Parked = Schema.Record(
 );
 const decodeParked = Schema.decodeUnknownOption(Schema.fromJsonString(Parked));
 
-/** One key per server and target, as `importerModelMemory.ts` keys a remembered pick. */
-const keyOf = (serverUrl: string, targetId: string): string =>
-  `bit.importerParked:${JSON.stringify([serverUrl, targetId])}`;
+/**
+ * One key per server and owner, as `modelMemory.ts` keys a remembered pick. The prefix is
+ * the importer's from before the generalisation, kept so words parked then are read back.
+ */
+const keyOf = (serverUrl: string, owner: string): string =>
+  `bit.importerParked:${JSON.stringify([serverUrl, owner])}`;
 
 /** {@link ParkedStore} over `sessionStorage`. Every failure to read or write is a no-op. */
 export const browserParkedStore: ParkedStore = {
-  read(serverUrl, targetId) {
+  read(serverUrl, owner) {
     try {
       const stored = globalThis.sessionStorage?.getItem(
-        keyOf(serverUrl, targetId),
+        keyOf(serverUrl, owner),
       );
       if (stored === null || stored === undefined) return {};
       return Option.getOrElse(decodeParked(stored), () => ({}));
@@ -83,9 +93,9 @@ export const browserParkedStore: ParkedStore = {
       return {};
     }
   },
-  write(serverUrl, targetId, parked) {
+  write(serverUrl, owner, parked) {
     try {
-      const key = keyOf(serverUrl, targetId);
+      const key = keyOf(serverUrl, owner);
       if (Object.keys(parked).length === 0) {
         globalThis.sessionStorage?.removeItem(key);
       } else {

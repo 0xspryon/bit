@@ -13,7 +13,7 @@ import type { HarnessInstanceView } from "@bit/contracts";
 
 import { App } from "../../src/lib/app.svelte";
 import TitleBar from "../../src/lib/components/TitleBar.svelte";
-import { browserModelMemory } from "../../src/lib/importerModelMemory";
+import { browserModelMemory } from "../../src/lib/modelMemory";
 import Target from "../../src/lib/screens/Target.svelte";
 import { FakeCountdown } from "../fakeCountdown";
 import { FakeServer, emptyScope, ok } from "../fakeServer";

@@ -8,7 +8,7 @@ import {
   browserParkedStore,
   parkedStart,
   type ParkedMessages,
-} from "../../src/lib/importerParked";
+} from "../../src/lib/conversationParked";
 
 const SERVER = "http://127.0.0.1:3000";
 const KEY = `bit.importerParked:${JSON.stringify([SERVER, "acme-corp"])}`;

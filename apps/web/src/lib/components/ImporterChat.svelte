@@ -12,7 +12,7 @@
    * ## It is {@link Chat}, laid out as a page
    *
    * `Chat` takes the group's subject as a type parameter it never looks inside, so this is
-   * the third caller and the importer's own subject ({@link ImporterTurn}) and separator are
+   * the third caller and the importer's own subject ({@link ThreadTurn}) and separator are
    * written here. `layout="thread"` is the one thing `Chat` was taught for it: A6 draws the
    * chat as the whole page — an 800px column, no frame, the composer pinned under the log —
    * where the planner's and the goal agent's are panels among other things. Rows go through
@@ -85,6 +85,7 @@
     ChatQuestion,
     ComposerNotice,
     OpenChatComposer,
+    ThreadTurn,
   } from "../chatShell";
   import {
     ENDED_NOTE,
@@ -92,7 +93,6 @@
     sendNowButtonTitle,
     sentNowTitle,
     strandedNote,
-    type ImporterTurn,
   } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import { composing } from "../composing";
@@ -577,7 +577,7 @@
   };
 
   /** The importer's session, as the shell draws it. */
-  const chat: ChatSession<ImporterTurn> = {
+  const chat: ChatSession<ThreadTurn> = {
     get label() {
       return `Load the scope for ${target}`;
     },
@@ -660,7 +660,7 @@
     loadFile: (path) => app.loadUploadedFile(path),
   };
 
-  let shell = $state<ChatShell<ImporterTurn> | undefined>(undefined);
+  let shell = $state<ChatShell<ThreadTurn> | undefined>(undefined);
 
   /**
    * Fills the composer with a pre-written first message and puts the cursor after it.

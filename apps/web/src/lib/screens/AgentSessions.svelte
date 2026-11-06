@@ -89,7 +89,7 @@
     IconSearch,
     IconUser,
   } from "../icons";
-  import { isolated } from "../importerChat";
+  import { isolated } from "../conversationChat";
   import { applyPlace, pathOf, type Place } from "../place";
   import { routedInApp } from "../placeLink";
 
