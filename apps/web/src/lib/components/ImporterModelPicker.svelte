@@ -49,14 +49,11 @@
     modelOptionDescriptors,
     type ModelOptionSelection,
   } from "@bit/contracts";
-  import type { Attachment } from "svelte/attachments";
 
   import { withModelOptionPicked, type App } from "../app.svelte";
-  import { IconAngleDown } from "../icons";
   import ErrorDialog from "./ErrorDialog.svelte";
-  import HarnessChoice from "./HarnessChoice.svelte";
-  import HarnessDialog from "./HarnessDialog.svelte";
-  import ModelOptionsColumn from "./ModelOptionsColumn.svelte";
+  import ModelChip from "./ModelChip.svelte";
+  import ModelSelector from "./ModelSelector.svelte";
 
   /** A started session, as far as its model goes. */
   interface PinnedModel {
@@ -111,7 +108,7 @@
    * A started session's dialog needs none of this: its open flag is this component's own
    * ({@link sessionOpen}), goes with it, and closes when the session on screen changes.
    */
-  const closesWithBranch: Attachment = () => () => {
+  const closesWithBranch = (): void => {
     app.importPickerOpen = false;
   };
 
@@ -119,7 +116,6 @@
     pinned?.harness ?? app.importInstance?.displayName ?? "",
   );
   let model = $derived(pinned?.model ?? app.effectiveImportModel);
-  let letter = $derived((harness.slice(0, 1) || "?").toLowerCase());
 
   /* ── A started session's picker: staged, then applied together ─────────────── */
 
@@ -253,146 +249,96 @@
   }
 </script>
 
-{#if pinned === null}
-  <div class="picker" {@attach closesWithBranch}>
-    <button
-      class="chip"
-      type="button"
-      aria-haspopup="dialog"
-      aria-expanded={app.importPickerOpen}
-      aria-label="Harness and model: {model}"
-      bind:this={trigger}
-      onclick={() => app.toggleImportPicker()}
-    >
-      <span class="glyph" aria-hidden="true">{letter}</span>
-      <span class="model">{model === "" ? "No model" : model}</span>
-      <IconAngleDown class="caret" width="11" height="11" />
-    </button>
-
-    {#if app.importPickerOpen}
-      <HarnessDialog
-        opener={trigger}
-        title="Harness, model and reasoning"
-        onclose={() => (app.importPickerOpen = false)}
-      >
-        <HarnessChoice
-          instances={app.harnesses}
-          active={app.importInstance}
-          model={app.effectiveImportModel}
-          bind:query={app.importModelQuery}
-          onPickInstance={(instanceId) => app.pickImportInstance(instanceId)}
-          onPickModel={(modelId) => app.pickImportModel(modelId)}
-        >
-          {#snippet note()}
-            A session is pinned to the harness it starts on. Changing harness
-            starts a new session; it never moves this one.
-          {/snippet}
-
-          {#snippet options()}
-            <ModelOptionsColumn
-              instance={app.importInstance}
-              model={app.effectiveImportModel}
-              modelView={app.importModelView}
-              descriptors={app.importModelDescriptors}
-              selections={app.pickedImportModelOptions}
-              dropped={app.droppedImportModelOptions}
-              onPick={(descriptorId, value) =>
-                app.pickImportModelOption(descriptorId, value)}
-              subject="A session"
-            />
-          {/snippet}
-        </HarnessChoice>
-      </HarnessDialog>
+{#snippet sessionFooter()}
+  <p class="foot-note" id={noteId}>
+    {#if otherHarness}
+      This session stays on {harness}. {stagedInstance?.displayName ??
+        stagedInstanceId} is another harness, so this opens a new session on it and
+      leaves this one as it is.
+    {:else}
+      This session stays on {harness} — picking another harness opens a new one. Models
+      and reasoning inside it can change at any time, including mid-run.
     {/if}
-  </div>
-{:else if switchable && sessionInstance !== undefined}
-  <div class="picker">
-    <button
-      class={["chip", switching !== undefined && "switching"]}
-      type="button"
-      aria-haspopup="dialog"
-      aria-expanded={sessionOpen}
-      aria-label="Model: {model}. Change this session's model"
-      title="The model this session runs on. Models and reasoning can change at any time, including mid-run; the harness is fixed."
-      bind:this={trigger}
-      onclick={openSession}
-    >
-      <span class="glyph" aria-hidden="true">{letter}</span>
-      <span class="model">{model}</span>
-      <IconAngleDown class="caret" width="11" height="11" />
-    </button>
-
-    {#if sessionOpen}
-      <HarnessDialog
-        opener={trigger}
-        title="Harness, model and reasoning"
-        onclose={() => (sessionOpen = false)}
-      >
-        <HarnessChoice
-          instances={app.harnesses}
-          active={stagedInstance}
-          model={stagedModel}
-          bind:query
-          onPickInstance={pickInstance}
-          onPickModel={(modelId) => (stagedModel = modelId)}
-        >
-          {#snippet options()}
-            <ModelOptionsColumn
-              instance={stagedInstance}
-              model={stagedModel}
-              modelView={stagedModelView}
-              descriptors={stagedDescriptors}
-              selections={stagedSelections}
-              dropped={stagedDropped}
-              onPick={pickOption}
-              subject="A session"
-            />
-          {/snippet}
-        </HarnessChoice>
-
-        {#snippet footer()}
-          <p class="foot-note" id={noteId}>
-            {#if otherHarness}
-              This session stays on {harness}. {stagedInstance?.displayName ??
-                stagedInstanceId} is another harness, so this opens a new session
-              on it and leaves this one as it is.
-            {:else}
-              This session stays on {harness} — picking another harness opens a new
-              one. Models and reasoning inside it can change at any time, including
-              mid-run.
-            {/if}
-          </p>
-          <button
-            class="foot-button"
-            type="button"
-            onclick={() => (sessionOpen = false)}>Cancel</button
-          >
-          <button
-            class="foot-button primary"
-            type="button"
-            bind:this={confirmButton}
-            aria-describedby={noteId}
-            aria-disabled={stagedModel === "" || switching !== undefined}
-            onclick={() => void confirm()}
-          >
-            {otherHarness
-              ? "Open a new session"
-              : switching !== undefined
-                ? "Switching…"
-                : "Use for this session"}
-          </button>
-        {/snippet}
-      </HarnessDialog>
-    {/if}
-  </div>
-{:else}
-  <span
-    class={["chip", "held"]}
-    title="The model this session ran on. Changing harness starts a new session; it never moves this one."
+  </p>
+  <button
+    class="foot-button"
+    type="button"
+    onclick={() => (sessionOpen = false)}>Cancel</button
   >
-    <span class="glyph" aria-hidden="true">{letter}</span>
-    <span class="model">{model}</span>
-  </span>
+  <button
+    class="foot-button primary"
+    type="button"
+    bind:this={confirmButton}
+    aria-describedby={noteId}
+    aria-disabled={stagedModel === "" || switching !== undefined}
+    onclick={() => void confirm()}
+  >
+    {otherHarness
+      ? "Open a new session"
+      : switching !== undefined
+        ? "Switching…"
+        : "Use for this session"}
+  </button>
+{/snippet}
+
+{#if pinned === null}
+  <!-- A new session's model, picked as it is made: `App`'s import pick. -->
+  <ModelSelector
+    instances={app.harnesses}
+    active={app.importInstance}
+    model={app.effectiveImportModel}
+    modelView={app.importModelView}
+    descriptors={app.importModelDescriptors}
+    selections={app.pickedImportModelOptions}
+    dropped={app.droppedImportModelOptions}
+    {harness}
+    bind:open={app.importPickerOpen}
+    bind:query={app.importModelQuery}
+    bind:trigger
+    onOpen={() => app.toggleImportPicker()}
+    onPickInstance={(instanceId) => app.pickImportInstance(instanceId)}
+    onPickModel={(modelId) => app.pickImportModel(modelId)}
+    onPickOption={(descriptorId, value) =>
+      app.pickImportModelOption(descriptorId, value)}
+    chipLabel="Harness and model: {model}"
+    onLeave={closesWithBranch}
+  >
+    {#snippet note()}
+      A session is pinned to the harness it starts on. Changing harness starts a
+      new session; it never moves this one.
+    {/snippet}
+  </ModelSelector>
+{:else if switchable && sessionInstance !== undefined}
+  <!-- A started session's model: staged in the dialog, applied together by its footer. -->
+  <ModelSelector
+    instances={app.harnesses}
+    active={stagedInstance}
+    model={stagedModel}
+    modelView={stagedModelView}
+    descriptors={stagedDescriptors}
+    selections={stagedSelections}
+    dropped={stagedDropped}
+    harness={pinned.harness}
+    chipModel={model}
+    bind:open={sessionOpen}
+    bind:query
+    bind:trigger
+    onOpen={openSession}
+    onPickInstance={pickInstance}
+    onPickModel={(modelId) => (stagedModel = modelId)}
+    onPickOption={pickOption}
+    switching={switching !== undefined}
+    chipLabel="Model: {model}. Change this session's model"
+    chipTitle="The model this session runs on. Models and reasoning can change at any time, including mid-run; the harness is fixed."
+    footer={sessionFooter}
+  />
+{:else}
+  <ModelChip
+    kind="held"
+    {harness}
+    {model}
+    title="The model this session ran on. Changing harness starts a new session; it never moves this one."
+  />
 {/if}
 
 {#if pinned !== null && failure !== undefined}
@@ -409,79 +355,6 @@
 {/if}
 
 <style>
-  /* A6's chip: 28px, a hairline border, a letter for the harness and the model in mono. */
-  .chip {
-    display: inline-flex;
-    /*
-     * Shrinks inside `.picker` when the strip is short of room (U6's "Send now" took some
-     * at 1024), so the model name ellipses rather than the chip spilling over the caption.
-     */
-    flex: 0 1 auto;
-    min-width: 0;
-    align-items: center;
-    gap: 8px;
-    max-width: 280px;
-    height: 28px;
-    padding: 0 9px;
-    box-sizing: border-box;
-    border: 1px solid var(--border-base);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--text-base);
-    font: 400 12px/var(--lh-compact) var(--font-mono);
-  }
-  button.chip {
-    cursor: pointer;
-  }
-  button.chip:hover,
-  button.chip[aria-expanded="true"] {
-    background: var(--overlay-hover);
-  }
-  button.chip:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 1px;
-  }
-  .chip.held {
-    cursor: default;
-  }
-  /* A switch is with the server: the chip shows the model it is still on, quietly. */
-  .chip.switching {
-    color: var(--text-muted);
-    cursor: progress;
-  }
-  .glyph {
-    display: inline-flex;
-    flex: none;
-    align-items: center;
-    justify-content: center;
-    width: 15px;
-    height: 15px;
-    border-radius: 4px;
-    background: var(--bg-layer-03);
-    color: var(--text-base);
-    font: 500 9px/15px var(--font-mono);
-  }
-  .model {
-    min-width: 0;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-  .chip :global(.caret) {
-    flex: none;
-    color: var(--icon-muted);
-  }
-  /*
-   * The chip's own wrapper, which once anchored a popover and now only keeps the chip one
-   * flex item on the strip, exactly as the chip alone was. The dialog is not in it:
-   * `HarnessDialog` leaves only an empty, `hidden` origin here and renders at the end of
-   * `<body>`, out of the composer's form.
-   */
-  .picker {
-    display: flex;
-    /* Gives way before the send button does, as every control on this strip does. */
-    min-width: 0;
-  }
   /* ── D6's footer: the note, Cancel, and the one solid action ───────────────── */
   .foot-note {
     flex: 1;
