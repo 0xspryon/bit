@@ -1112,6 +1112,170 @@ questions/:questionId/dismiss, activity, context, model}`.
 - **Read-only**: `test/readOnlyConversation.test.ts` builds a worker-attempt-shaped session
   from a replay plus live frames routed by `attemptId`, with the closed composer.
 
+#### Done (2026-11-06)
+
+**Status.** Everything in the target shape is built except the session picker extraction
+(see "Changed from the plan"). The importer behaves as before: its server suite
+(`scopeImporter.test.ts`, 123 tests) and every importer DOM suite pass unchanged. Test files
+changed only for a forced rename: import paths of moved modules, and
+`session.importId` → `session.conversationId`.
+
+**What moved where.**
+
+- **Contracts.** `packages/contracts/src/conversation.ts` holds:
+  - `ConversationMessageDraft` and `CONVERSATION_MESSAGE_MAX_CHARS`;
+  - `ConversationStart`, `ConversationSource`, `ConversationContinuation`,
+    `ConversationQueuedMessage` and `ConversationEndReason`;
+  - the field sets `conversationTurnAcceptedFields`, `conversationViewFields` and
+    `conversationSessionFields`.
+
+  `scopeImport.ts` spreads these into the importer's schemas and keeps the `Importer*` names,
+  so the wire is unchanged. `PendingQuestion.tag` (`"critical"`, optional) is added as a field
+  only.
+
+- **Server.** `apps/server/src/conversation/conversations.ts` (`makeConversations` and
+  `ConversationBinding`) holds everything the map marked A:
+  - the opening in flight, successor links and the newest-period follow, and the reopen
+    permit;
+  - held steers and take marks, the settle loop, and the narrator with its closed frame;
+  - Stop, Stop all and sub-agent Stop;
+  - the question: answer, dismiss, put-away and recheck;
+  - activity, context, the model switch, and the operator's end.
+
+  `ScopeImporter` keeps its interface and is now the importer binding (rows on
+  `import_sessions`, the importer credential and endpoint, the prompts, the words) plus its
+  own work: progress, pages, the closing report, `start` from links, and the reopen plan. The
+  routes did not change.
+
+- **Web.**
+  - `conversationSessions.svelte.ts` (`ConversationSessions<S>`, `ConversationBinding`,
+    `ConversationServer`) is the multi-session state machine. `importerSessions.svelte.ts`
+    (`ImporterSessions extends ConversationSessions`) keeps the starters, scenarios and
+    stand-in reply. The optional server abilities (`stopAll`, `stopSubagent`,
+    `answerQuestion`/`dismissQuestion`, `switchModel`, `context`) are guarded, so leaving one
+    out removes it.
+  - `conversationChat.ts` holds the turn builder, the replay/live merge (`conversationFeed`,
+    routed by the binding's `routeOf`), history and standing, labels and the notes (worded
+    by an agent noun). `importerChat.ts` keeps the tally, the pages notice, the Scope/Estate
+    sentences, `indexedSession`, `importerTurnAccepted`, and the importer's bindings of the
+    notes and the builder.
+  - `conversationServer.ts` (`conversationServer(appHooks, endpoints)`) turns an owner's
+    `ConversationEndpoints` into a `ConversationServer`. That covers sign-out, refusal words,
+    `unanswered`, forgetting a `lost` notice on open/resume/ended replay, and the turn watch.
+    `app.svelte.ts` now passes `#importerEndpoints` and nothing else.
+  - `conversationChatSession.ts` (`chatSessionOf`) builds the shell's `ChatSession`: the
+    blockers, the sentences above the box, Stop, Stop all and the dock.
+    `ImporterChat.svelte` supplies the importer's `ConversationChatWords`, its no-model
+    blocker, its connection key and its stoppable sub-agent count.
+  - `readOnlyConversation.ts` (`readOnlyGroups`, `readOnlyChat`) is the read-only mount.
+  - `ModelChip.svelte` and `ModelSelector.svelte` are the selector, controlled by props;
+    `ImporterModelPicker.svelte` draws its three branches with them.
+  - `conversationParked.ts` and `modelMemory.ts` (moved from `importer*`) are keyed by owner.
+    The importer's owner key is its target id, so stored keys are unchanged.
+- **One behaviour fix that fell out.** A history read released its in-flight mark in a
+  `finally` one microtask before installing the answer. A list arriving in that gap read the
+  replay a second time (two importer DOM tests caught it once timing shifted). The mark is
+  now released in the same step as the install.
+
+**Proofs.**
+
+- **Server:** `conversation/conversations.test.ts`, a probe owner on goal credentials and the
+  goal subject, 6 tests.
+- **Web:**
+  - `test/dom/conversationSessions.test.ts`, a goal-shaped owner routed by `goalId`, 7 tests;
+  - `test/readOnlyConversation.test.ts`, a worker attempt from a replay plus live frames, 3
+    tests;
+  - `test/dom/modelSelector.test.ts`, the selector mounted alone, 1 test.
+
+**Changed from the plan.**
+
+- **No session picker component.** The crumb picker stays in `TitleBar`. A9 H2b puts the
+  goal's picker above the transcript, not in the title bar, and the crumb's CSS is shared
+  with the bar's other crumbs. Everything it reads is already generic:
+  - from the state: `listed`, `open`, `start`, `pickerOpen`, `parked`, `question`, `current`;
+  - from `conversationChat.ts`: `sessionLabel`, `sessionHover` and `sessionWhen`.
+
+  The importer's only own part is the row's second line (`tallyLine`). A goal's picker is
+  new markup over the same calls.
+
+- **No contract endpoint factory.** Routes stay per role as planned (decision 1). The shared
+  schemas are what a goal reuses.
+
+**How each role mounts it.**
+
+- **Goal chat (interactive, many sessions).**
+  - _Server:_ a `goal_conversation_periods` table and its store (see "What the goal binding
+    will need"), then `makeConversations` inside the goal layer with:
+    - a binding: the goal credential and `goalMcp`, a per-period subject, `rows` on the new
+      table, `reopen` from the goal's pinned agent and `plan/goalPrompt.ts`, and words;
+    - its hooks: no progress, so `resumed` answers `true` and `idle` answers `"settled"`.
+
+    Then thin routes beside the importer's.
+
+  - _Web:_
+    - `ConversationEndpoints` over the new client calls (about 60 lines, as
+      `#importerEndpoints`), and `conversationServer(appHooks, endpoints)`;
+    - `new ConversationSessions(GOAL_BINDING, …)`, with `routeOf` reading the goal's period
+      off the frame (see the seam above);
+    - `chatSessionOf` with the goal's words, then `<ChatShell session={built.chat}>`;
+    - the dock, cards, chip and panel as `ImporterChat.svelte` passes them, and
+      `ModelSelector` in the strip.
+- **Planner stage (read-only).** Hold the stage's replay and its floor (taken with
+  `#activityHighWater()` before the request leaves) in page state. Then
+  `readOnlyChat({ groups: () => readOnlyGroups({ replay, live: app.liveItems, conversationId: <stage period>, routeOf: <stage route>, working, agent: "planner" }), closed: "The planner can't be prompted. To redirect it, ask the goal agent in Chat.", marker: () => <what the stage was given>, stop: stopRound, … })`.
+  Read the replay again on `restored` and when the stage settles, as
+  `ConversationSessions.#rereadSettled` does.
+- **Worker attempt (read-only).** The same, with `conversationId` the attempt id,
+  `routeOf: (item) => item.attemptId`, the attempt transcript route as the replay (mapped to
+  `ConversationReplayView`), and `closed: "The prompt is the intent's question."`.
+- **Selector outside a chat (A9 H4f, H6).** `<ModelSelector instances active model modelView descriptors selections dropped harness bind:open bind:query onPickInstance onPickModel onPickOption subject="A worker">`,
+  with the pick held in the dialog's own state (`withModelOptionPicked`,
+  `modelOptionDescriptors` and `explicitModelOptionSelections` as `App` uses them). An agent
+  chip beside it is `AgentChip.svelte` as it stands.
+
+**Gates (2026-11-06, `--force`, memory-capped).**
+
+| Gate             | Result                                           |
+| ---------------- | ------------------------------------------------ |
+| typecheck        | 3/3 tasks                                        |
+| test, server     | 2022 pass                                        |
+| test, web unit   | 754 pass                                         |
+| test, web DOM    | 622 pass                                         |
+| test:persistence | 1192 pass                                        |
+| build            | 3/3 tasks                                        |
+| lint             | clean                                            |
+| format:check     | only `sprint-roadmap.html`, which already failed |
+
+`lint:oxlint` against main is the same set: the findings moved with their code
+(`scopeImporter.ts` → `conversations.ts`, `importer*` → `conversation*`), and nothing is new.
+
+**Live check (2026-11-06).** Run at 1024 and 1440 px over CDP, covering the steps in the
+brief: new session, reply, Send now, Stop, the picker (new session and back), reload replay
+and the model switch.
+
+- **Claude Code, `claude-haiku-4-5`:**
+  - every step worked;
+  - Send now cut a list mid-item and "OK" came back;
+  - Stop settled in 1.5 s, and the interrupt marker is the same live and after a reload;
+  - the switch to `claude-sonnet-4-5` said "Now on …" and the next reply named Sonnet 4.5.
+- **OpenCode, `zai-coding-plan/glm-5.3-flash`:**
+  - every step worked; Send now answered "OK" after the message being written ended, as
+    worded;
+  - the switch to `zai-coding-plan/glm-5.3` took.
+  - Odd: Stop landed while GLM was still thinking, and the next message's turn first wrote
+    the essay the Stop had cut (67 s), then answered. The stopped request stays in OpenCode's
+    history unanswered and the model takes it up. That is the harness and model, not this
+    slice: the Stop and send paths are the same code as before.
+
+**What remains.**
+
+- The goal binding itself: table, migration, routes, binding, web endpoints and the page.
+- A period id on live frames for owners with several sessions, or several stages per round
+  (the seam above).
+- `PendingQuestion.tag`: drawing it in the dock and setting it from `ask_operator`.
+- The `#rereadHistory` path still releases its mark in a `finally`, as the first read did.
+  No test shows a double read there, since it is only reached once a replay is installed.
+
 ## Order
 
 Slices run **one at a time** on branch `a6-chat-revamp`, each committed by its implementer.
