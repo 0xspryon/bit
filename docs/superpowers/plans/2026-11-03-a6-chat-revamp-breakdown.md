@@ -405,6 +405,34 @@ warning dot (E6's "each surface keeps its own local signal") is not drawn.
 - A new question is announced in a visually hidden `role="status"` region, worded by the chat
   (`ChatWords.questionsAsked`: "The importer asks 3 questions").
 
+**Review 2 fixes (2026-11-06).**
+
+- **A question put away while its harness was unreachable is offered again when it is
+  back.** A paused `opencode serve` (SIGSTOP) keeps its event socket open, so no `restored`
+  ever comes, and nothing re-listed its forms; the form it still waited on then held every
+  later message unprocessed. Now a dismissal refused as `harness_unreachable` makes the
+  importer ask `pendingQuestions` again in the background: after 1 s, doubling to at most
+  15 s between asks, for `QUESTION_RECHECK_MS` (5 minutes), forked into the session's scope
+  so the session ending stops it. Still pending, the question is published again as a
+  `question` frame, which the page docks, and the "put away" line goes. Settled, a
+  `questionSettled` (`withdrawn`) takes it out of Needs you. Measured live: re-docked 0.2 s
+  after SIGCONT, answered, and the agent received the answer.
+- **The put-away line no longer says "the agent was not told"**, which was not known. It
+  says the questions were put away, gives the server's sentence (whether the agent was told
+  is not known), and says they are offered again if the harness comes back within 5 minutes;
+  after that, reload the page to check.
+- **A failed re-list after `restored` no longer empties Needs you.** Needs you no longer
+  clears on `restored`. The OpenCode driver re-lists, and narrates `questionSettled`
+  (`withdrawn`) only for a question a *successful* list no longer holds. A failed list says
+  nothing.
+- **Input methods.** `composing(event)` (`isComposing`, or `keyCode` 229) guards every Enter
+  and Esc on a text field in the chat: the dock, the shell's Esc, the composer's
+  Enter-to-send, the crumb pickers, the model picker's filter (its arrows too) and the
+  dialog layer's Esc. While a conversion is open, Enter accepts the candidate and Esc
+  cancels it, and neither does anything else.
+- The dock's Esc hint reads "Esc leave the box" while focus is in a written answer with
+  words in it.
+
 **A7-S — Sub-agent cards and panel (M), A7-Q → A7-S. Decided by the operator (2026-11-05):
 replaces U14's "omit content".** A7's E7/E8.
 
