@@ -117,7 +117,7 @@ export interface ConversationTurnAccepted {
 export interface ConversationBinding<S extends ConversationSession> {
   /**
    * The period a live frame belongs to, by the owner's subject id, or `null`: the
-   * importer's `importId`. A frame whose route is a session's `conversationId` is that
+   * importer's `conversationId`. A frame whose route is a session's `conversationId` is that
    * session's.
    */
   readonly routeOf: (frame: {
@@ -188,7 +188,7 @@ export type ConversationSwitchAnswer =
 /** A model switch of one session that is with the server and not yet answered. */
 export interface ModelSwitchInFlight {
   readonly sessionId: string;
-  readonly importId: string;
+  readonly conversationId: string;
   readonly model: string;
 }
 
@@ -262,7 +262,7 @@ export interface ConversationServer {
    * the work in flight, and `preemptive` ("Send now") lands at the harness's next step.
    */
   readonly send: (
-    importId: string,
+    conversationId: string,
     text: string,
     urgency?: SteerUrgency,
     /** The files the message carries, in the same request (A6 U13). */
@@ -272,15 +272,17 @@ export interface ConversationServer {
    * Stops the turn running in one import's session, keeping the conversation (A6 F5): the
    * harness is interrupted and the session stays open for the next message.
    */
-  readonly stop: (importId: string) => Promise<ConversationStopAnswer>;
+  readonly stop: (conversationId: string) => Promise<ConversationStopAnswer>;
   /**
    * E7's Stop all (A7-S): every sub-agent the server can stop on its own, then the turn and
    * background work, answered as {@link stop} is.
    */
-  readonly stopAll?: (importId: string) => Promise<ConversationStopAnswer>;
+  readonly stopAll?: (
+    conversationId: string,
+  ) => Promise<ConversationStopAnswer>;
   /** Stops one sub-agent of one import's session (A7-S), by its calling tool call's id. */
   readonly stopSubagent?: (
-    importId: string,
+    conversationId: string,
     callId: string,
   ) => Promise<SubagentStopAnswer>;
   /**
@@ -289,12 +291,12 @@ export interface ConversationServer {
    * server's reason and sentence; `unanswered` when no server answered.
    */
   readonly answerQuestion?: (
-    importId: string,
+    conversationId: string,
     questionId: string,
     answers: QuestionAnswers,
   ) => Promise<ConversationQuestionAnswer>;
   readonly dismissQuestion?: (
-    importId: string,
+    conversationId: string,
     questionId: string,
   ) => Promise<ConversationQuestionAnswer>;
   /**
@@ -302,7 +304,7 @@ export interface ConversationServer {
    * of its model (A6 F4). Never another harness: that is a new session.
    */
   readonly switchModel?: (
-    importId: string,
+    conversationId: string,
     draft: ConversationModelDraft,
   ) => Promise<ConversationSwitchAnswer>;
   /**
@@ -316,7 +318,7 @@ export interface ConversationServer {
    * harness said nothing.
    */
   readonly history: (
-    importId: string,
+    conversationId: string,
   ) => Promise<
     | { readonly view: ConversationReplayView; readonly floor: number }
     | undefined
@@ -365,7 +367,7 @@ export interface ConversationServer {
    * the feed. Returns a function that stops watching.
    */
   readonly watchTurn: (
-    importId: string,
+    conversationId: string,
     update: (activity: ConversationActivityState) => void,
   ) => () => void;
   /**
@@ -373,7 +375,7 @@ export interface ConversationServer {
    * too. `undefined` for a read that did not answer, which leaves the meter as it was.
    */
   readonly context?: (
-    importId: string,
+    conversationId: string,
     breakdown: boolean,
   ) => Promise<ConversationContext | undefined>;
 }
@@ -767,7 +769,7 @@ export class ConversationSessions<
             own: this.current.items,
             floors: this.current.floors,
             live: this.#live(),
-            conversationId: this.current.importId,
+            conversationId: this.current.conversationId,
             // The replay/live boundary. Undefined on a session whose words were never asked
             // for, which takes nothing away: it has no replay to collide with.
             historyFloor: this.current.historyFloor,
@@ -935,7 +937,7 @@ export class ConversationSessions<
   syncIndexed(indexed: readonly S[]): void {
     const onScreen = this.current;
     const ranOnScreen =
-      onScreen?.working === true ? onScreen.importId : undefined;
+      onScreen?.working === true ? onScreen.conversationId : undefined;
     const touched = new Map(
       this.sessions
         .filter(
@@ -1001,28 +1003,28 @@ export class ConversationSessions<
     const current = this.current;
     if (
       (current?.working === true || current?.background === true) &&
-      current.importId !== undefined &&
-      this.#watching !== current.importId
+      current.conversationId !== undefined &&
+      this.#watching !== current.conversationId
     ) {
-      this.#watch(current.importId);
+      this.#watch(current.conversationId);
     }
     // And its words, if this is the first list that named it: `openImporter` can open a
     // session by id before the index has arrived, so the read cannot only hang off `open`.
     if (current !== undefined) void this.#loadHistory(current);
     // And its meter, on the same first list (A6 U9).
-    const importId = current?.importId;
+    const conversationId = current?.conversationId;
     if (
-      importId !== undefined &&
-      this.contexts[importId] === undefined &&
-      !this.#readingContext.has(importId)
+      conversationId !== undefined &&
+      this.contexts[conversationId] === undefined &&
+      !this.#readingContext.has(conversationId)
     ) {
-      void this.readContext(importId);
+      void this.readContext(conversationId);
     }
     // A turn this reading of the list found over, which the turn watch was not there to see
     // end (A6 U9 review): its calls are what fills the window now.
     if (
       ranOnScreen !== undefined &&
-      current?.importId === ranOnScreen &&
+      current?.conversationId === ranOnScreen &&
       current.working !== true
     ) {
       void this.readContext(ranOnScreen, false, "turn");
@@ -1040,9 +1042,9 @@ export class ConversationSessions<
    */
   #withActivity(session: S): S {
     const known =
-      session.importId === undefined
+      session.conversationId === undefined
         ? undefined
-        : this.#activityOf.get(session.importId);
+        : this.#activityOf.get(session.conversationId);
     return known === undefined
       ? session
       : {
@@ -1058,12 +1060,12 @@ export class ConversationSessions<
    * entry is dropped, and from then on the server's row is the model, whoever changed it.
    */
   #withSwitchedModel(session: S): S {
-    const importId = session.importId;
-    if (importId === undefined) return session;
-    const switched = this.#switchedTo.get(importId);
+    const conversationId = session.conversationId;
+    if (conversationId === undefined) return session;
+    const switched = this.#switchedTo.get(conversationId);
     if (switched === undefined) return session;
     if (switched === session.model) {
-      this.#switchedTo.delete(importId);
+      this.#switchedTo.delete(conversationId);
       return session;
     }
     return { ...session, model: switched };
@@ -1106,12 +1108,12 @@ export class ConversationSessions<
       // harness opened by itself, or background work, runs under an import the list calls
       // finished. Watched to its end, so its cursor and its Stop follow the server here too
       // rather than only in the tab that sent the message.
-      if (opened.importId !== undefined && opened.ended !== true) {
-        this.#watch(opened.importId);
+      if (opened.conversationId !== undefined && opened.ended !== true) {
+        this.#watch(opened.conversationId);
       }
       // Its meter, whatever state it is in: an ended session is measured from its transcript.
-      if (opened.importId !== undefined) {
-        void this.readContext(opened.importId);
+      if (opened.conversationId !== undefined) {
+        void this.readContext(opened.conversationId);
       }
       void this.#loadHistory(opened);
     }
@@ -1145,28 +1147,30 @@ export class ConversationSessions<
    */
   async #loadHistory(session: S): Promise<void> {
     const server = this.#server;
-    const importId = session.importId;
+    const conversationId = session.conversationId;
     if (
       server === undefined ||
-      importId === undefined ||
+      conversationId === undefined ||
       session.loaded === true ||
       session.items.length > 0 ||
-      this.#reading.has(importId)
+      this.#reading.has(conversationId)
     ) {
       return;
     }
-    this.#reading.add(importId);
-    const midTurn = this.#asking(importId, session.id);
-    const answered = await server.history(importId).catch((error: unknown) => {
-      this.#reading.delete(importId);
-      throw error;
-    });
+    this.#reading.add(conversationId);
+    const midTurn = this.#asking(conversationId, session.id);
+    const answered = await server
+      .history(conversationId)
+      .catch((error: unknown) => {
+        this.#reading.delete(conversationId);
+        throw error;
+      });
     /*
      * Released in the same synchronous step as the install below, not in a `finally` on the
      * request: a `finally` ran a microtask before this resumed, and a list arriving in that
      * gap (`syncIndexed`) found the session neither reading nor loaded, and asked again.
      */
-    this.#reading.delete(importId);
+    this.#reading.delete(conversationId);
     if (answered === undefined) return;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
@@ -1184,7 +1188,7 @@ export class ConversationSessions<
       ...withReplay(before, answered),
       replayMidTurn: midTurn,
     }));
-    this.#installed(importId, midTurn);
+    this.#installed(conversationId, midTurn);
   }
 
   /**
@@ -1208,8 +1212,8 @@ export class ConversationSessions<
     if (item.kind !== TAKEN_KIND || ids.length === 0) return;
     const session = this.sessions.find(
       (each) =>
-        each.importId !== undefined &&
-        each.importId === this.#binding.routeOf(item),
+        each.conversationId !== undefined &&
+        each.conversationId === this.#binding.routeOf(item),
     );
     if (session === undefined) return;
     // Under each message it names: a take of several is one turn (A6 U4 review 3).
@@ -1238,21 +1242,21 @@ export class ConversationSessions<
   async #rereadHistory(sessionId: string): Promise<void> {
     const server = this.#server;
     const session = this.sessions.find((each) => each.id === sessionId);
-    const importId = session?.importId;
+    const conversationId = session?.conversationId;
     if (
       server === undefined ||
-      importId === undefined ||
-      this.#reading.has(importId)
+      conversationId === undefined ||
+      this.#reading.has(conversationId)
     ) {
       return;
     }
     // The rows this read can be an answer for: those held when it was asked for.
     const held = new Set(session?.items.map((item) => item.id));
-    this.#reading.add(importId);
-    const midTurn = this.#asking(importId, sessionId);
+    this.#reading.add(conversationId);
+    const midTurn = this.#asking(conversationId, sessionId);
     const answered = await server
-      .history(importId)
-      .finally(() => this.#reading.delete(importId));
+      .history(conversationId)
+      .finally(() => this.#reading.delete(conversationId));
     if (
       answered === undefined ||
       this.#server !== server ||
@@ -1264,7 +1268,7 @@ export class ConversationSessions<
       ...withReplay(before, answered, held),
       replayMidTurn: midTurn,
     }));
-    this.#installed(importId, midTurn);
+    this.#installed(conversationId, midTurn);
   }
 
   /**
@@ -1273,10 +1277,10 @@ export class ConversationSessions<
    * when asked, and not when the answer lands: an answer that cannot be installed (no
    * transcript) would otherwise leave it to be asked again on every later reading of the list.
    */
-  #asking(importId: string, sessionId: string): boolean {
+  #asking(conversationId: string, sessionId: string): boolean {
     const working =
       this.sessions.find((each) => each.id === sessionId)?.working === true;
-    if (!working) this.#readMidTurn.delete(importId);
+    if (!working) this.#readMidTurn.delete(conversationId);
     return working;
   }
 
@@ -1285,9 +1289,9 @@ export class ConversationSessions<
    * ({@link #readMidTurn}), and reads it again at once if that turn has settled while the
    * read was out — the turn watch fired then, and found a read already in flight.
    */
-  #installed(importId: string, midTurn: boolean): void {
+  #installed(conversationId: string, midTurn: boolean): void {
     if (!midTurn) return;
-    this.#readMidTurn.add(importId);
+    this.#readMidTurn.add(conversationId);
     this.#rereadSettled();
   }
 
@@ -1300,12 +1304,12 @@ export class ConversationSessions<
   #rereadSettled(): void {
     if (this.sending) return;
     for (const session of this.sessions) {
-      const importId = session.importId;
+      const conversationId = session.conversationId;
       if (
-        importId === undefined ||
+        conversationId === undefined ||
         session.working ||
-        !this.#readMidTurn.has(importId) ||
-        this.#reading.has(importId)
+        !this.#readMidTurn.has(conversationId) ||
+        this.#reading.has(conversationId)
       ) {
         continue;
       }
@@ -1317,19 +1321,19 @@ export class ConversationSessions<
    * Watches one import's turn and marks its session idle once the server says it is.
    * One at a time: a later turn, or another session's, replaces the watch.
    */
-  #watch(importId: string): void {
+  #watch(conversationId: string): void {
     const server = this.#server;
     if (server === undefined) return;
     this.#stopWatching();
     /** Whether anything ran while watched: only then does the list need reading again. */
     let busy = this.sessions.some(
       (session) =>
-        session.importId === importId &&
+        session.conversationId === conversationId &&
         (session.working || session.background === true),
     );
-    const stop = server.watchTurn(importId, (activity) => {
+    const stop = server.watchTurn(conversationId, (activity) => {
       if (this.#unwatch !== stop) return;
-      this.#activityOf.set(importId, activity);
+      this.#activityOf.set(conversationId, activity);
       const over = !activity.running && !activity.background;
       if (over) {
         this.#unwatch = undefined;
@@ -1339,7 +1343,7 @@ export class ConversationSessions<
       // Every session filed under the import: a reopen's fresh thread shares its old one's
       // import id until the list is read again.
       const under = this.sessions.filter(
-        (session) => session.importId === importId,
+        (session) => session.conversationId === conversationId,
       );
       const wasWorking = under.some((session) => session.working);
       if (
@@ -1350,7 +1354,7 @@ export class ConversationSessions<
         )
       ) {
         this.sessions = this.sessions.map((session) =>
-          session.importId === importId
+          session.conversationId === conversationId
             ? {
                 ...session,
                 working: activity.running,
@@ -1365,7 +1369,7 @@ export class ConversationSessions<
       const said = this.#busyStop;
       if (
         said !== undefined &&
-        said.ids.includes(importId) &&
+        said.ids.includes(conversationId) &&
         (said.about === "turn" ? !activity.running : !activity.background)
       ) {
         this.#busyStop = undefined;
@@ -1375,13 +1379,13 @@ export class ConversationSessions<
         this.#turnsEnded();
         this.#rereadSettled();
         // A turn ended: its calls are what fills the window now (A6 U9).
-        void this.readContext(importId, false, "turn");
+        void this.readContext(conversationId, false, "turn");
       }
       // What ran wrote what it wrote: the list's tally is the server's to restate.
       if (over && busy) void server.reread();
     });
     this.#unwatch = stop;
-    this.#watching = importId;
+    this.#watching = conversationId;
   }
 
   /**
@@ -1394,19 +1398,19 @@ export class ConversationSessions<
    */
   noteActivity(item: LiveItem): void {
     const session = this.current;
-    const importId = session?.importId;
+    const conversationId = session?.conversationId;
     if (
-      importId === undefined ||
-      this.#binding.routeOf(item) !== importId ||
+      conversationId === undefined ||
+      this.#binding.routeOf(item) !== conversationId ||
       item.origin !== "activity" ||
       this.sending ||
       session?.ended === true ||
       session?.working === true ||
-      this.#watching === importId
+      this.#watching === conversationId
     ) {
       return;
     }
-    this.#watch(importId);
+    this.#watch(conversationId);
   }
 
   /**
@@ -1417,9 +1421,11 @@ export class ConversationSessions<
    * this tab has a message with the server; its turn's settling reads it.
    */
   noteConnection(frame: LiveConnection): void {
-    const importId = this.#binding.routeOf(frame);
-    if (importId === null) return;
-    const session = this.sessions.find((each) => each.importId === importId);
+    const conversationId = this.#binding.routeOf(frame);
+    if (conversationId === null) return;
+    const session = this.sessions.find(
+      (each) => each.conversationId === conversationId,
+    );
     if (session === undefined) return;
     if (frame.state === "closed") {
       /*
@@ -1428,13 +1434,13 @@ export class ConversationSessions<
        * reads as ended or dormant and the composer says what the next message will do; and
        * so is the replay, so a question it was waiting on reads as no longer answerable here.
        */
-      this.#closedImports.add(importId);
+      this.#closedPeriods.add(conversationId);
       void this.#server?.reread();
       void this.#rereadHistory(session.id);
       return;
     }
     if (frame.state !== "restored") return;
-    this.#readMidTurn.add(importId);
+    this.#readMidTurn.add(conversationId);
     if (this.sending) return;
     void this.#rereadHistory(session.id);
   }
@@ -1451,25 +1457,29 @@ export class ConversationSessions<
   // so the chip is stale until then (a switch made while the session idles shows only at its
   // next call or reload). V2 should put a model switch on the live feed for every tab.
   noteUsage(frame: LiveUsage): void {
-    const importId = this.#binding.routeOf(frame);
+    const conversationId = this.#binding.routeOf(frame);
     const model = frame.model;
     const server = this.#server;
     if (
       server === undefined ||
-      importId === null ||
+      conversationId === null ||
       model === null ||
       model === ""
     ) {
       return;
     }
-    const session = this.sessions.find((each) => each.importId === importId);
+    const session = this.sessions.find(
+      (each) => each.conversationId === conversationId,
+    );
     if (session === undefined || sameModel(model, session.model)) return;
-    if (sameModel(model, this.contexts[importId]?.reading.usedModel)) return;
-    if (this.switches.some((each) => each.importId === importId)) return;
-    if (sameModel(model, this.#movedTo.get(importId))) return;
-    this.#movedTo.set(importId, model);
+    if (sameModel(model, this.contexts[conversationId]?.reading.usedModel))
+      return;
+    if (this.switches.some((each) => each.conversationId === conversationId))
+      return;
+    if (sameModel(model, this.#movedTo.get(conversationId))) return;
+    this.#movedTo.set(conversationId, model);
     void server.reread();
-    void this.readContext(importId, false, "switch");
+    void this.readContext(conversationId, false, "switch");
   }
 
   #stopWatching(): void {
@@ -1642,8 +1652,10 @@ export class ConversationSessions<
     // Behind a switch of this very import, the server holds the message until the switch
     // has answered: say so, since that can be a minute and a half.
     this.waitingForSwitch =
-      session.importId !== undefined &&
-      this.switches.some((each) => each.importId === session.importId);
+      session.conversationId !== undefined &&
+      this.switches.some(
+        (each) => each.conversationId === session.conversationId,
+      );
     // The switch confirmation on screen as the message leaves, which an accepted message
     // makes stale: "your next message runs on it" has been. One that a switch answering
     // meanwhile puts up is about this message's successor, and stays.
@@ -1659,7 +1671,7 @@ export class ConversationSessions<
     // conversation already pinned to its agent, which the server reads off the row.
     const agentId = session.agentId;
     const opening =
-      session.importId === undefined
+      session.conversationId === undefined
         ? { sessionId: session.id, text }
         : undefined;
     if (opening !== undefined) this.#opening = opening;
@@ -1670,13 +1682,16 @@ export class ConversationSessions<
     // earlier copy in the real replay is older than this, whatever the thread holds.
     const known = new Set(this.sessions.map((each) => each.id));
     const baseline: ConfirmBaseline = {
-      ids: session.importId === undefined ? new Set() : idsSaid(session, text),
+      ids:
+        session.conversationId === undefined
+          ? new Set()
+          : idsSaid(session, text),
       sentAt: this.#now(),
     };
     const answer =
-      session.importId === undefined
+      session.conversationId === undefined
         ? await server.open(text, agentId, files)
-        : await server.send(session.importId, text, urgency, files);
+        : await server.send(session.conversationId, text, urgency, files);
     const pinnedAgent = agentId ?? this.agents?.defaultAgentId;
     if (opening !== undefined && this.#opening === opening) {
       this.#opening = undefined;
@@ -1699,7 +1714,7 @@ export class ConversationSessions<
       const detail =
         answer._tag === "refused"
           ? answer.detail
-          : unansweredDetail(session.importId === undefined);
+          : unansweredDetail(session.conversationId === undefined);
       // Still on it: the words are still in the box, under what is known of them.
       const heldOn =
         this.currentId === session.id
@@ -1799,7 +1814,7 @@ export class ConversationSessions<
           ? { sentNow: [...(before.sentNow ?? []), turn.messageId] }
           : {}),
         id: turn.harnessSessionId,
-        importId: turn.conversationId,
+        conversationId: turn.conversationId,
         model: turn.model,
         harness: server.harnessName(turn.harnessInstanceId),
         harnessInstanceId: turn.harnessInstanceId,
@@ -1889,7 +1904,7 @@ export class ConversationSessions<
     detail: string,
     outcome: ParkedMessage["outcome"],
   ): WordsHeld {
-    const first = session.importId === undefined;
+    const first = session.conversationId === undefined;
     const on = this.current;
     const unknown = outcome === "unknown";
     if (
@@ -2030,12 +2045,12 @@ export class ConversationSessions<
       if (found.id !== this.currentId) {
         this.open(found.id);
         // The page's empty session became it, as an accepted answer would have made it.
-        if (session.importId === undefined) this.becameId = found.id;
+        if (session.conversationId === undefined) this.becameId = found.id;
       } else {
         void this.#rereadHistory(found.id);
       }
       this.notice =
-        session.importId === undefined
+        session.conversationId === undefined
           ? "No answer came back, but the server did open a session for that message: this is it."
           : "No answer came back, but that message did reach this session: it is in the thread.";
       this.refused = false;
@@ -2078,19 +2093,19 @@ export class ConversationSessions<
     baseline: ConfirmBaseline,
     foreign: Set<string>,
   ): Promise<S | undefined> {
-    const first = session.importId === undefined;
+    const first = session.conversationId === undefined;
     // As the server holds the words: cut, and marked, past the field cap.
     const replayed = truncateNarration(text);
     const candidates = this.sessions.filter((each) =>
       first
         ? each.indexed === true &&
-          each.importId !== undefined &&
+          each.conversationId !== undefined &&
           !known.has(each.id)
         : each.id === session.id,
     );
     for (const each of candidates) {
-      if (each.importId === undefined) continue;
-      const answered = await server.history(each.importId);
+      if (each.conversationId === undefined) continue;
+      const answered = await server.history(each.conversationId);
       if (answered === undefined) continue;
       const view = answered.view;
       const sentOnServer =
@@ -2144,8 +2159,8 @@ export class ConversationSessions<
     const session = this.current;
     if (session === undefined) return;
     const server = this.#server;
-    const importId = session.importId;
-    if (server === undefined || importId === undefined) {
+    const conversationId = session.conversationId;
+    if (server === undefined || conversationId === undefined) {
       this.#replace(session.id, (before) => ({
         ...before,
         working: false,
@@ -2158,8 +2173,8 @@ export class ConversationSessions<
     this.stopping = true;
     // Stop all (A7-S, E7): the session's sub-agents first, then the turn, in one request.
     const answer = await (all && server.stopAll !== undefined
-      ? server.stopAll(importId)
-      : server.stop(importId));
+      ? server.stopAll(conversationId)
+      : server.stop(conversationId));
     this.stopping = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
@@ -2182,7 +2197,7 @@ export class ConversationSessions<
     const background = stopped.outcome === "background_stopped";
     this.#busyStop = stopped.working
       ? {
-          ids: [importId, stopped.conversationId],
+          ids: [conversationId, stopped.conversationId],
           text: stopped.detail,
           about: background ? "background" : "turn",
         }
@@ -2195,7 +2210,7 @@ export class ConversationSessions<
      * turn watch's next read said the same.
      */
     const backgroundOver = background || !stopped.background;
-    for (const id of [importId, stopped.conversationId]) {
+    for (const id of [conversationId, stopped.conversationId]) {
       const known = this.#activityOf.get(id);
       if (known === undefined) continue;
       this.#activityOf.set(id, {
@@ -2204,7 +2219,8 @@ export class ConversationSessions<
       });
     }
     this.sessions = this.sessions.map((each) =>
-      each.importId === importId || each.importId === stopped.conversationId
+      each.conversationId === conversationId ||
+      each.conversationId === stopped.conversationId
         ? {
             ...each,
             working: background ? each.working : false,
@@ -2216,7 +2232,7 @@ export class ConversationSessions<
     this.#rereadSettled();
     // What the stopped turn left in the window (A6 U9 review): the turn watch does not see
     // this turn end, since the session already reads as idle when it next answers.
-    void this.readContext(importId, false, "stop");
+    void this.readContext(conversationId, false, "stop");
   }
 
   /**
@@ -2234,11 +2250,12 @@ export class ConversationSessions<
   async stopSubagent(callId: string): Promise<void> {
     const session = this.current;
     const server = this.#server;
-    const importId = session?.importId;
-    if (server?.stopSubagent === undefined || importId === undefined) return;
+    const conversationId = session?.conversationId;
+    if (server?.stopSubagent === undefined || conversationId === undefined)
+      return;
     if (this.subagentStopping.includes(callId)) return;
     this.subagentStopping = [...this.subagentStopping, callId];
-    const answer = await server.stopSubagent(importId, callId);
+    const answer = await server.stopSubagent(conversationId, callId);
     this.subagentStopping = this.subagentStopping.filter((id) => id !== callId);
     if (this.#server !== server) return;
     if (answer._tag === "refused") {
@@ -2305,19 +2322,19 @@ export class ConversationSessions<
       };
       return true;
     }
-    const importId = session.importId;
-    if (importId === undefined || server.switchModel === undefined)
+    const conversationId = session.conversationId;
+    if (conversationId === undefined || server.switchModel === undefined)
       return false;
     const inFlight: ModelSwitchInFlight = {
       sessionId: session.id,
-      importId,
+      conversationId: conversationId,
       model,
     };
     this.switches = [...this.switches, inFlight];
     if (this.switchNotice?.sessionId === session.id) {
       this.switchNotice = undefined;
     }
-    const answer = await server.switchModel(importId, {
+    const answer = await server.switchModel(conversationId, {
       model,
       ...(modelOptions === undefined ? {} : { modelOptions }),
     });
@@ -2375,8 +2392,8 @@ export class ConversationSessions<
     void this.readContext(switched.conversationId, false, "switch");
     this.sessions = this.sessions.map((each) =>
       each.id === session.id ||
-      each.importId === importId ||
-      each.importId === switched.conversationId
+      each.conversationId === conversationId ||
+      each.conversationId === switched.conversationId
         ? {
             ...each,
             model: switched.model,
@@ -2384,7 +2401,7 @@ export class ConversationSessions<
             // The import the switch landed on: a successor's, if the one addressed had
             // been taken over, and the one the next message goes to.
             ...(each.id === session.id
-              ? { importId: switched.conversationId }
+              ? { conversationId: switched.conversationId }
               : {}),
           }
         : each,
@@ -2418,20 +2435,21 @@ export class ConversationSessions<
   // and after a compaction on the live feed, so every tab's meter and its breakdown follow
   // without asking.
   readContext(
-    importId: string,
+    conversationId: string,
     breakdown = false,
     cause: ContextReadCause = breakdown ? "asked" : "opened",
   ): Promise<void> {
     const server = this.#server;
     if (server === undefined) return Promise.resolve();
-    if (!breakdown) return this.#askContext(server, importId, false, cause);
+    if (!breakdown)
+      return this.#askContext(server, conversationId, false, cause);
     // The operator opened the meter: a fresh opening may re-count once more per model.
-    this.#meterOpen.add(importId);
-    this.#recountedFor.delete(importId);
-    const out = this.#breakdowns.get(importId);
+    this.#meterOpen.add(conversationId);
+    this.#recountedFor.delete(conversationId);
+    const out = this.#breakdowns.get(conversationId);
     if (out !== undefined) {
       out.wanted = true;
-      this.#counting(importId, true);
+      this.#counting(conversationId, true);
       return out.done;
     }
     // V2(chat): a breakdown read nobody wants any more is left to run, not aborted: the
@@ -2439,33 +2457,33 @@ export class ConversationSessions<
     // request would only stop the server waiting while the CLI went on counting, and a
     // meter opened again would start a second count beside it. V2 could abort once the
     // harness call can be withdrawn.
-    return this.#countBreakdown(server, importId, cause);
+    return this.#countBreakdown(server, conversationId, cause);
   }
 
   /** Starts the one breakdown read for an import. */
   #countBreakdown(
     server: ConversationServer,
-    importId: string,
+    conversationId: string,
     cause: ContextReadCause,
   ): Promise<void> {
     const read = { wanted: true, done: Promise.resolve() };
-    this.#breakdowns.set(importId, read);
-    this.#counting(importId, true);
-    read.done = this.#askContext(server, importId, true, cause, read);
+    this.#breakdowns.set(conversationId, read);
+    this.#counting(conversationId, true);
+    read.done = this.#askContext(server, conversationId, true, cause, read);
     return read.done;
   }
 
   /**
    * The meter closed, or another session came on screen (A6 U9 review): the breakdown read
-   * out for `importId` — for every import without one — is not wanted. Nothing reads as
+   * out for `conversationId` — for every import without one — is not wanted. Nothing reads as
    * counting any more, and the answer is dropped when it lands unless the meter is opened
    * again first ({@link readContext}).
    */
-  leaveBreakdown(importId?: string): void {
-    if (importId === undefined) this.#meterOpen.clear();
-    else this.#meterOpen.delete(importId);
+  leaveBreakdown(conversationId?: string): void {
+    if (conversationId === undefined) this.#meterOpen.clear();
+    else this.#meterOpen.delete(conversationId);
     for (const [id, read] of this.#breakdowns) {
-      if (importId !== undefined && id !== importId) continue;
+      if (conversationId !== undefined && id !== conversationId) continue;
       read.wanted = false;
       this.#counting(id, false);
     }
@@ -2473,34 +2491,34 @@ export class ConversationSessions<
 
   async #askContext(
     server: ConversationServer,
-    importId: string,
+    conversationId: string,
     breakdown: boolean,
     cause: ContextReadCause,
     read?: { wanted: boolean },
   ): Promise<void> {
     this.#readingContext.set(
-      importId,
-      (this.#readingContext.get(importId) ?? 0) + 1,
+      conversationId,
+      (this.#readingContext.get(conversationId) ?? 0) + 1,
     );
     let answer: ConversationContext | undefined;
     try {
       answer =
         server.context === undefined
           ? undefined
-          : await server.context(importId, breakdown);
+          : await server.context(conversationId, breakdown);
     } finally {
-      const left = (this.#readingContext.get(importId) ?? 1) - 1;
-      if (left > 0) this.#readingContext.set(importId, left);
-      else this.#readingContext.delete(importId);
-      if (read !== undefined && this.#breakdowns.get(importId) === read) {
-        this.#breakdowns.delete(importId);
-        this.#counting(importId, false);
+      const left = (this.#readingContext.get(conversationId) ?? 1) - 1;
+      if (left > 0) this.#readingContext.set(conversationId, left);
+      else this.#readingContext.delete(conversationId);
+      if (read !== undefined && this.#breakdowns.get(conversationId) === read) {
+        this.#breakdowns.delete(conversationId);
+        this.#counting(conversationId, false);
       }
     }
     if (answer === undefined || this.#server !== server) return;
     if (read !== undefined && !read.wanted) return;
-    this.#takeContext(importId, answer, cause);
-    this.#recountIfStale(server, importId);
+    this.#takeContext(conversationId, answer, cause);
+    this.#recountIfStale(server, conversationId);
   }
 
   /**
@@ -2512,11 +2530,11 @@ export class ConversationSessions<
    * before is kept with its model, and the meter compares only figures of one model.
    */
   #takeContext(
-    importId: string,
+    conversationId: string,
     answer: ConversationContext,
     cause: ContextReadCause,
   ): void {
-    const held = this.contexts[importId];
+    const held = this.contexts[conversationId];
     const counted =
       answer.breakdown._tag === "categories"
         ? {
@@ -2537,7 +2555,7 @@ export class ConversationSessions<
       if (categories !== held.categories) {
         this.contexts = {
           ...this.contexts,
-          [importId]: {
+          [conversationId]: {
             ...held,
             ...(categories === undefined ? {} : { categories }),
           },
@@ -2554,7 +2572,7 @@ export class ConversationSessions<
         !sameModel(before.usedModel, answer.usedModel));
     this.contexts = {
       ...this.contexts,
-      [importId]: {
+      [conversationId]: {
         reading: answer,
         previous: moved
           ? { used: before.used, model: before.usedModel }
@@ -2576,19 +2594,22 @@ export class ConversationSessions<
    * meter ({@link #recountedFor}), so a count that comes back on another model asks again
    * only for a model not yet asked for, which takes another switch.
    */
-  #recountIfStale(server: ConversationServer, importId: string): void {
-    if (!this.#meterOpen.has(importId) || this.#breakdowns.has(importId)) {
+  #recountIfStale(server: ConversationServer, conversationId: string): void {
+    if (
+      !this.#meterOpen.has(conversationId) ||
+      this.#breakdowns.has(conversationId)
+    ) {
       return;
     }
-    const held = this.contexts[importId];
+    const held = this.contexts[conversationId];
     if (held === undefined) return;
     const { breakdown, model } = held.reading;
     if (breakdown._tag === "none" && breakdown.reason !== "not_asked") return;
     if (sameWindow(held.categories?.model, model)) return;
-    if (this.#recountedFor.get(importId) === model) return;
-    this.#recountedFor.set(importId, model);
+    if (this.#recountedFor.get(conversationId) === model) return;
+    this.#recountedFor.set(conversationId, model);
     // Not `asked`: the operator opened nothing, and the footer says so (U9 review 3).
-    void this.#countBreakdown(server, importId, "recount");
+    void this.#countBreakdown(server, conversationId, "recount");
   }
 
   /**
@@ -2603,11 +2624,11 @@ export class ConversationSessions<
   }
 
   /** Marks one import's categories as being counted, or not. */
-  #counting(importId: string, counting: boolean): void {
-    if (this.countingBreakdown.has(importId) === counting) return;
+  #counting(conversationId: string, counting: boolean): void {
+    if (this.countingBreakdown.has(conversationId) === counting) return;
     const next = new Set(this.countingBreakdown);
-    if (counting) next.add(importId);
-    else next.delete(importId);
+    if (counting) next.add(conversationId);
+    else next.delete(conversationId);
     this.countingBreakdown = next;
   }
 
@@ -2637,7 +2658,7 @@ export class ConversationSessions<
    * authority period, and carrying the session on opens a new one under a new id, so an id
    * once here stays here. One entry per import ended while this tab was open.
    */
-  #closedImports = new Set<string>();
+  #closedPeriods = new Set<string>();
 
   /**
    * The question the session on screen is waiting on, or `undefined`: the replay's answer
@@ -2654,13 +2675,16 @@ export class ConversationSessions<
    * message where a message would carry the session on (`answerability: "message"`).
    */
   noteQuestion(frame: LiveQuestion): void {
-    const importId = this.#binding.routeOf(frame);
-    if (importId === null) return;
-    const session = this.sessions.find((each) => each.importId === importId);
+    const conversationId = this.#binding.routeOf(frame);
+    if (conversationId === null) return;
+    const session = this.sessions.find(
+      (each) => each.conversationId === conversationId,
+    );
     if (session === undefined) return;
     // Asked of an import the server has let go of (A7-S review 1): nothing holds it to
     // answer, and the replay already read on `closed` says what the question is now.
-    if (frame.question !== null && this.#closedImports.has(importId)) return;
+    if (frame.question !== null && this.#closedPeriods.has(conversationId))
+      return;
     if (frame.question !== null) {
       const asked = frame.question;
       this.#replace(session.id, (before) => ({
@@ -2712,12 +2736,12 @@ export class ConversationSessions<
     const server = this.#server;
     const session = this.current;
     const question = this.question;
-    const importId = session?.importId;
+    const conversationId = session?.conversationId;
     if (
       server === undefined ||
       session === undefined ||
       question === undefined ||
-      importId === undefined ||
+      conversationId === undefined ||
       server.answerQuestion === undefined ||
       server.dismissQuestion === undefined ||
       this.questionBusy
@@ -2728,11 +2752,11 @@ export class ConversationSessions<
     const answer =
       how === "answer"
         ? await server.answerQuestion(
-            importId,
+            conversationId,
             question.questionId,
             answers ?? {},
           )
-        : await server.dismissQuestion(importId, question.questionId);
+        : await server.dismissQuestion(conversationId, question.questionId);
     this.questionBusy = false;
     if (this.#server !== server) return;
     const putAway = (): void =>

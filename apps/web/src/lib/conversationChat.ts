@@ -300,7 +300,7 @@ export interface ConversationSession<
    * What this page holds of the session itself, oldest first: the operator's own rows
    * (minted here, see `operatorTurn`), and in the state picker's declared sessions every
    * row. **Not** what the importer said on a real target — that is the target's live feed,
-   * filed by {@link importId} and merged in by {@link conversationFeed}, so an entry is held in
+   * filed by {@link conversationId} and merged in by {@link conversationFeed}, so an entry is held in
    * one place and never copied into a session.
    */
   readonly items: readonly LiveItem[];
@@ -356,7 +356,7 @@ export interface ConversationSession<
    * on the page's own empty session until its first message is accepted, which is what
    * makes that message open a conversation rather than continue one.
    */
-  readonly importId?: string;
+  readonly conversationId?: string;
   /**
    * True when the operator ended this session (`ended_reason = 'operator'`). Its authority is
    * over and the server refuses a message to it, so the composer is disabled rather than

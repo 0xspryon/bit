@@ -786,7 +786,7 @@ describe("the composer posts to the server", () => {
     expect(draft).toEqual({ text: "Read https://hackerone.com/acme/policy" });
     // The page's empty session became the server's, under its id and import.
     expect(app.importer.current?.id).toBe("ses_opened");
-    expect(app.importer.current?.importId).toBe("imp_opened");
+    expect(app.importer.current?.conversationId).toBe("imp_opened");
     expect(text()).toContain("A new importer session was opened");
   });
 
@@ -1047,7 +1047,7 @@ describe("the composer posts to the server", () => {
     await send(words);
     await settle();
     await settle();
-    expect(app.importer.current?.importId).toBeUndefined();
+    expect(app.importer.current?.conversationId).toBeUndefined();
     expect(text()).toContain("whether this message was sent is not known");
 
     written = true;
@@ -1099,7 +1099,7 @@ describe("the composer posts to the server", () => {
     await settle();
     await settle();
 
-    expect(app.importer.current?.importId).toBeUndefined();
+    expect(app.importer.current?.conversationId).toBeUndefined();
     expect(composer().value).toBe("Read the policy");
     expect(text()).toContain("may open a second session for it");
   });
@@ -1520,7 +1520,7 @@ describe("the composer posts to the server", () => {
     await settle();
     await settle();
     // The one read so far failed, so the list does not name the session yet.
-    expect(app.importer.current?.importId).toBeUndefined();
+    expect(app.importer.current?.conversationId).toBeUndefined();
     expect(text()).toContain("whether this message was sent is not known");
 
     await exhaustConfirm(app);
@@ -3034,7 +3034,7 @@ describe("the server's connection to the importer's narration (U13 review 5)", (
   test("a break is said over the thread; its return reads the replay again, shows what the gap said, and clears the note", async () => {
     const fake = new FakeServer();
     const app = await continueWith(fake);
-    expect(app.importer.current?.importId).toBe("imp_newest");
+    expect(app.importer.current?.conversationId).toBe("imp_newest");
     fake.watch.send(liveOpened());
     fake.watch.send(connection("reconnecting"));
     await settle();

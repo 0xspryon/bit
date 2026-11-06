@@ -223,7 +223,7 @@ export const indexedSession = (
   },
   reading: true,
   indexed: true,
-  importId: view.importId,
+  conversationId: view.importId,
   agentId: view.agentId,
   ...(view.harnessInstanceId === null
     ? {}

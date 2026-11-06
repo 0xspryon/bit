@@ -121,9 +121,9 @@
    */
   let connection = $derived(
     connectionNote(
-      session?.importId === undefined
+      session?.conversationId === undefined
         ? undefined
-        : app.liveConnection[`import:${session.importId}`],
+        : app.liveConnection[`import:${session.conversationId}`],
     ),
   );
   let groups = $derived(importer.groups);
@@ -567,7 +567,7 @@
     send: (urgency) => importer.send(urgency),
     get sendNow() {
       return {
-        offered: session?.importId !== undefined,
+        offered: session?.conversationId !== undefined,
         title: sendNowButtonTitle(importer.sendNow),
       };
     },

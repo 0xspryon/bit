@@ -71,7 +71,7 @@
   // `ContextMeter` in its own pane, fed by live frames alone, so it shows nothing after a
   // reload and no categories. V2 should give the goal conversation the same reading
   // (`ConversationContext`, a goal route) and one meter component for both.
-  let contextImport = $derived(importer.current?.importId);
+  let contextImport = $derived(importer.current?.conversationId);
   let meter = $derived(
     crumbMeter(
       contextImport === undefined
