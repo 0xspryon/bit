@@ -120,7 +120,6 @@ import {
   ImporterConversationRefused,
   QUESTION_RECHECK_MS,
   QuestionRefused,
-  questionAnswersProblem,
   SCOPE_IMPORT_MAX_LINKS,
   ScopeImportNotFound,
   type ConversationModelDraft,
@@ -129,11 +128,9 @@ import {
   type ConversationContext,
   type ConversationStopped,
   type ImporterConversationView,
-  type ImporterQueuedMessage,
   type ImporterTurnAccepted,
   type ImportModelDraft,
   type ModelOptionSelection,
-  type PendingQuestion,
   type QuestionAnswers,
   type QuestionSettled,
   type ScopeImportView,
@@ -141,18 +138,7 @@ import {
   SubagentStopRefused,
   type SubagentStopped,
 } from "@bit/contracts";
-import {
-  Clock,
-  Context,
-  Deferred,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Schedule,
-  Semaphore,
-  type Duration,
-} from "effect";
+import { Clock, Context, Deferred, Effect, Layer, type Duration } from "effect";
 
 import {
   agentUnavailableDetail,
@@ -168,42 +154,26 @@ import { importerSessionTitle } from "./importerTitle";
 import { ScopeImportProgress, widenPages } from "./progress";
 import { IMPORTER_AGENT, type AgentDefinition } from "../agent/registry";
 import {
-  lastAssistantText,
-  truncateNarration,
-  type AgentHarness,
-  type HarnessFailure,
-  type HarnessNarration,
-  type HarnessQuestion,
-} from "../harness/agentHarness";
-import type { QuestionNotPending } from "../harness/errors";
-import {
-  makeLiveAgentSessions,
-  type LiveAgentSession,
-  type LiveSessionCloseReason,
-  type LiveSessionOpenFailure,
+  makeConversations,
+  type ConversationAccepted,
+  type ConversationOpening,
+  type ConversationRow,
+  type ConversationSend,
+  type Conversations,
+} from "../conversation/conversations";
+import { lastAssistantText } from "../harness/agentHarness";
+import type {
+  LiveAgentSession,
+  LiveSessionCloseReason,
 } from "../harness/liveAgentSessions";
-import { attachmentView, type MessageAttachment } from "../harness/attachments";
 import { resolveSessionModelOptions } from "../harness/modelOptions";
-import {
-  pendingQuestionView,
-  transcriptQuestionId,
-} from "../harness/questions";
-import {
-  checkModelSwitch,
-  type CheckedModelSwitch,
-  modelSwitched,
-  modelSwitchRefusal,
-  recordRefusal,
-  sameModelChoice,
-} from "../harness/modelSwitch";
 import { HarnessResolver } from "../harness/resolver";
-import { turnStopped, turnStopRefusal } from "../harness/turnStop";
+import { turnStopped } from "../harness/turnStop";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { RunNarrations } from "../run/narration";
-import { narrateCoalesced } from "../run/streamingCoalescer";
 import { WorkerEndpoints } from "../run/supervisor";
 import type { ReadUpload } from "../upload/uploads";
 
@@ -277,10 +247,24 @@ interface ImportSessionMeta {
 }
 
 /** Where an import's first turn says how its open went, for a caller that waits on it. */
-type Opening = Deferred.Deferred<
-  LiveAgentSession<ImportSessionMeta>,
+type Opening = ConversationOpening<
+  ImportSessionMeta,
   ImporterConversationRefused
 >;
+
+/** An `import_sessions` row as the conversation core reads it, with the importer's own fields. */
+interface ImportRow extends ConversationRow {
+  /** The pages the import may cite, durable since `0029`; null before. */
+  readonly pages: readonly string[] | null;
+  /** The agent the session runs as (`0002`). */
+  readonly agentId: string;
+}
+
+/** What a message made citable, which an accepted message names. */
+interface PagesWidened {
+  readonly added: readonly string[];
+  readonly notAdded: readonly string[];
+}
 
 /**
  * Turns a failure to open an importer session into the refusal a composer prints.
@@ -354,9 +338,6 @@ const notHeldBecause = (reason: string | null): string => {
       return "the server has restarted since it was opened, and its authority lived only in that process";
   }
 };
-
-/** A join attempt that found nothing to join. Never leaves this module. */
-const NOT_LIVE = { _tag: "NotLive" } as const;
 
 export interface ScopeImportRequest {
   readonly targetId: string;
@@ -752,620 +733,222 @@ export class ScopeImporter extends Context.Service<
           ),
         );
 
+      /** One import's row, as the conversation core reads it. */
+      const importRow = (targetId: string, importId: string) =>
+        Effect.map(
+          withTargetStore(stores, targetId, (store) =>
+            store.importSession(importId),
+          ),
+          (row): ImportRow | undefined =>
+            row === undefined
+              ? undefined
+              : {
+                  targetId: row.targetId,
+                  harnessSessionId: row.harnessSessionId,
+                  harnessInstanceId: row.harnessInstanceId,
+                  model: row.model,
+                  modelOptions: row.modelOptions,
+                  endedReason: row.endedReason,
+                  latestId: row.latestImportId,
+                  pages: row.pages,
+                  agentId: row.agentId,
+                },
+        );
+
+      /** An accepted message on the importer's wire: the import's id and its pages. */
+      const turnAccepted = (
+        base: ConversationAccepted,
+        pages: PagesWidened,
+      ): ImporterTurnAccepted => {
+        const { conversationId, ...rest } = base;
+        return {
+          ...rest,
+          importId: conversationId,
+          pagesAdded: [...pages.added],
+          pagesNotAdded: [...pages.notAdded],
+        };
+      };
+
       /**
-       * Every import session this process holds, on the shared spine
-       * (`harness/liveAgentSessions.ts`), keyed by import id.
+       * Every import session this process holds, on the conversation core
+       * (`conversation/conversations.ts`) over the shared registry, keyed by import id.
        *
-       * **This is the line that makes a session outlive its first turn.** The import used to
-       * own its scope inside the fiber that ran it and close it on the fiber's exit, so the
-       * credential and the registration went the moment `waitForIdle` returned — there was
-       * nothing to send a second message to. The scope now lives here, and only the three
-       * things this module's header lists close it.
+       * **This is the line that makes a session outlive its first turn**: the scope lives in
+       * the registry, and only the three things this module's header lists close it.
        *
-       * The importer's half of the descriptor: the importer endpoint, an importer
-       * credential with no clock, `revokeImport` as the belt-and-braces check, and `ended_at`
-       * with its reason recorded once the session is closed.
+       * The importer's half of the binding: the importer endpoint, an importer credential
+       * with no clock, `revokeImport` as the belt-and-braces check, `import_sessions` as the
+       * rows, and the import's progress, pages and closing report as the hooks.
        */
-      const sessions = yield* makeLiveAgentSessions<ImportSessionMeta>(
-        { endpoints },
+      const conversations: Conversations<
+        ImportSessionMeta,
+        ScopeImportNotFound,
+        ImporterConversationRefused,
+        ImporterTurnAccepted
+      > = yield* makeConversations<
+        ImportSessionMeta,
+        ImportRow,
+        ScopeImportNotFound,
+        ImporterConversationRefused,
+        PagesWidened,
+        ImporterTurnAccepted
+      >(
+        { endpoints, narrations, resolver, recheck, scope: own },
         {
-          // The **importer** endpoint. The path selects the toolkit and the grant decides
-          // whether the request is served at all: an importer credential at the worker URL
-          // is a `401` before any tool list is produced, and a worker's credential here is
-          // the same — which is what makes "three tools, and nowhere else" a property of
-          // the registration rather than of a filter.
-          endpoint: (urls) => urls.importerMcp,
-          // No clock, as a goal's has none (S2.3). A fourth caller kind is still what
-          // makes this session's three tools unreachable from a worker, a planner or a goal
-          // agent: each endpoint refuses a grant whose tag is not the role it serves. What
-          // stands behind the missing clock is an `operator` end (`0026`, `0027`), which the
-          // toolkit reads before every write.
-          issue: (input) =>
-            credentials.issueWithoutExpiry({
-              _tag: IMPORT_SESSION_ROLE,
-              targetId: input.targetId,
-              importId: input.id,
-            }),
-          revokeStray: credentials.revokeImport,
-          afterClose: (entry, reason) =>
-            Effect.andThen(
-              // What the session held queued went with it, and is not this process's to
-              // replay (`steers`). Not on the narrator's exit: a narration stream can end
-              // while the session lives on.
-              Effect.sync(() => {
-                steers.delete(entry.id);
-                deliveries.delete(entry.id);
+          role: {
+            // The **importer** endpoint. The path selects the toolkit and the grant decides
+            // whether the request is served at all: an importer credential at the worker URL
+            // is a `401` before any tool list is produced, and a worker's credential here is
+            // the same — which is what makes "three tools, and nowhere else" a property of
+            // the registration rather than of a filter.
+            endpoint: (urls) => urls.importerMcp,
+            // No clock, as a goal's has none (S2.3). A fourth caller kind is still what
+            // makes this session's three tools unreachable from a worker, a planner or a goal
+            // agent. What stands behind the missing clock is an `operator` end (`0026`,
+            // `0027`), which the toolkit reads before every write.
+            issue: (input) =>
+              credentials.issueWithoutExpiry({
+                _tag: IMPORT_SESSION_ROLE,
+                targetId: input.targetId,
+                importId: input.id,
               }),
-              markEnded(entry.targetId, entry.id, reason),
-            ),
+            revokeStray: credentials.revokeImport,
+            words: {
+              unregisterRefused:
+                "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
+              strayCredential:
+                "a scope importer's credential outlived its session's scope and had to be revoked explicitly; the scope that acquired it should have done that",
+              closed: "a scope import's session was closed",
+              idKey: "importId",
+            },
+          },
+          subject: (importId) => ({ _tag: "import", importId }),
+          questionSubject: (importId) => ({
+            attemptId: null,
+            roundId: null,
+            goalId: null,
+            importId,
+          }),
+          rows: {
+            read: importRow,
+            markEnded,
+            recordModel: (targetId, input) =>
+              withTargetStore(stores, targetId, (store) =>
+                store.recordImportSessionModel({
+                  importId: input.id,
+                  model: input.model,
+                  modelOptions: input.modelOptions,
+                }),
+              ),
+          },
+          notFound: (targetId, importId, clause) =>
+            new ScopeImportNotFound({
+              reason: "unknown_import",
+              importId,
+              detail: `no scope import '${importId}' is recorded on target '${targetId}', so ${clause}`,
+            }),
+          openRefused: refusal,
+          refused: (reason, detail) =>
+            new ImporterConversationRefused({
+              reason: reason === "ended" ? "import_ended" : reason,
+              detail,
+            }),
+          // The agent's own prompts, and only through it: the agent pinned to the entry.
+          followUp: (meta, text) =>
+            meta.agent.prompt.followUp({ message: text }),
+          reopen: ({ send, row }) => reopen(send, row),
+          accepted: turnAccepted,
           words: {
-            unregisterRefused:
-              "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
-            strayCredential:
-              "a scope importer's credential outlived its session's scope and had to be revoked explicitly; the scope that acquired it should have done that",
-            closed: "a scope import's session was closed",
-            idKey: "importId",
+            what: (importId) => `import ${importId}`,
+            agent: "importer",
+            undelivered: (detail) =>
+              `${detail}. The harness would not take the message, so this import's session has been closed; your next message opens a fresh one under a new import.`,
+            unwritable: (detail) =>
+              `${detail}. The session is still open; send the message again.`,
+            narrationFailed:
+              "a scope import's narration stream failed; this says nothing about the session, and the next message still reaches it",
+            stoppedBeforeOpen: (importId) =>
+              `import ${importId} was stopped before its session had opened, so nothing was said to it`,
+            ended: (importId) =>
+              `import ${importId} was ended by the operator, so its session's authority has ended with it and its tools refuse every write. An ended import is not reopened; start a new session to carry on.`,
+          },
+          hooks: {
+            /*
+             * A page the operator typed is added to the pages this import may cite,
+             * **before** the message is delivered, so a write citing it is never refused for
+             * a page the operator has just given.
+             */
+            delivering: (entry, text) =>
+              Effect.gen(function* () {
+                const widened = yield* progress.addLinks(
+                  entry.id,
+                  operatorPages(text),
+                );
+                // The durable copy (`0029`), so a session reopened after a restart can carry
+                // these forward. Advisory like the row it lives on.
+                if (widened !== undefined && widened.added.length > 0) {
+                  yield* withTargetStore(stores, entry.targetId, (store) =>
+                    store.recordImportPages(entry.id, widened.pages),
+                  ).pipe(
+                    Effect.catch((failure) =>
+                      Effect.logWarning(
+                        "the pages a scope import may cite were widened but could not be recorded; a session reopened after a restart will not carry them forward",
+                        { importId: entry.id, detail: failure.message },
+                      ),
+                    ),
+                  );
+                }
+                return widened ?? { added: [], notAdded: [] };
+              }),
+            // The import is marked working again; the core settles it once it goes idle.
+            resumed: (importId) => progress.resume(importId),
+            idle: ({ id, harness, sessionId, failure, more }) =>
+              Effect.gen(function* () {
+                if (yield* progress.stopped(id)) return "stop" as const;
+                /*
+                 * The session's closing report, read once, after it has settled: the only
+                 * account anything in this process has of why an import wrote what it
+                 * wrote. `messages` rather than the narration bus (D16): one message, pulled
+                 * after the fact, for a panel and a toast that may have no browser
+                 * subscribed. A failure to read it is not a failure of the import.
+                 *
+                 * A failure of the wait is still `finished`, not `failed` (D15): the session
+                 * ending badly says nothing about whether the pages it read produced entries.
+                 */
+                const report = yield* Effect.map(
+                  Effect.result(harness.messages(sessionId)),
+                  (read) =>
+                    read._tag === "Failure"
+                      ? null
+                      : importReport(lastAssistantText(read.success)),
+                );
+                // Delivered while the report was read: that message's turn is the one to settle.
+                if (more()) return "again" as const;
+                yield* progress.settle({
+                  importId: id,
+                  status: "finished",
+                  detail:
+                    failure !== undefined
+                      ? `the importer's session ended early: ${failure.message}. Anything it had already written is kept.${report === null ? "" : ` It reported: ${report}`}`
+                      : report,
+                });
+                return "settled" as const;
+              }),
+            /*
+             * Running while the import is, too: from a message's acceptance until its settle
+             * has read the closing report, which the session list's `running` reports.
+             */
+            alsoRunning: (importId) =>
+              Effect.map(
+                progress.view(importId),
+                (view) => view?.status === "running",
+              ),
+            // The panel names the model the session runs, so it follows a live switch.
+            switched: (importId, model) =>
+              progress.switchModel(importId, model),
           },
         },
       );
-
-      /**
-       * The first turn of each import still running, so a stop can reach the fiber a route
-       * does not hold. Separate from {@link sessions}: the turn ends when the session goes
-       * idle, and the session does not.
-       */
-      const turns = new Map<string, Fiber.Fiber<void>>();
-
-      /**
-       * The operator's messages each live import's harness transcript does not hold yet, by
-       * import id and then by message id (A6 U4 review, review 2), and the message ids the
-       * harness has said it took.
-       *
-       * **Why this process keeps them at all**, when it keeps no other word of a
-       * conversation (DECISIONS.md §8): a steer delivered while a turn runs is queued in the
-       * harness, and neither harness's transcript holds it until it is taken — so a reload in
-       * that window lost the message, and the reply to it then read as part of the turn
-       * before. {@link replay} carries these beside the transcript, and a reloaded tab draws
-       * them.
-       *
-       * **A take does not remove one** (review 2). Claude Code narrates the take 30–130 ms
-       * before its transcript holds the message, so a replay read in that gap — which is when
-       * a tab that saw the take of a message it had no row for reads it — found it in neither
-       * half. A take only marks the message `taken`; {@link replay} leaves out whatever its
-       * transcript holds, by id. Removed when a replay finds it **written** (review 3:
-       * anywhere in the transcript, so a copy older than the replay's window or later
-       * compacted away is not put back at the end), when the turn settles idle (everything
-       * delivered before its wait began is in the transcript by then), and with the session
-       * when it closes (`afterClose`). Never on a take alone, nor by a replay that has not
-       * found it written: two tabs reading at once on the same take would otherwise race,
-       * one read taking the message off while the other's transcript was read before it was
-       * written.
-       *
-       * `taken` is there for the race the other way round: the harness can take a steer
-       * before `deliver` has returned to say it was delivered, and a take seen first must
-       * still mark the message taken when it is added — with the messages taken with it,
-       * when the harness took several as one (review 3). Memory only, bounded by the messages
-       * an operator sends to a session this process holds.
-       *
-       * V2(chat): queued steers live in memory only; a server restart loses a steer that was
-       * still queued (and the harness session that held it), and nothing tells the operator
-       * it was never read. Proper V2: persist queued messages with the app-owned queue.
-       */
-      const steers = new Map<
-        string,
-        {
-          readonly queued: Map<string, ImporterQueuedMessage>;
-          /** Each message taken, to the messages taken with it when there were several. */
-          readonly taken: Map<string, readonly string[] | undefined>;
-        }
-      >();
-      const steersOf = (importId: string) => {
-        const held = steers.get(importId);
-        if (held !== undefined) return held;
-        const fresh = {
-          queued: new Map<string, ImporterQueuedMessage>(),
-          taken: new Map<string, readonly string[] | undefined>(),
-        };
-        steers.set(importId, fresh);
-        return fresh;
-      };
-      /** A held message, marked taken — with the messages taken with it, if any. */
-      const tookIt = (
-        message: ImporterQueuedMessage,
-        together: readonly string[] | undefined,
-      ): ImporterQueuedMessage => ({
-        messageId: message.messageId,
-        text: message.text,
-        acceptedAt: message.acceptedAt,
-        taken: true,
-        ...(together === undefined ? {} : { takenTogether: [...together] }),
-      });
-      /**
-       * How many messages have been accepted into each import's live session, ever (A6 U4
-       * review 3): what lets {@link settleTurn} tell that a message arrived while it was
-       * finishing — after the session's idle point, during the closing report's read —
-       * which `turns` alone cannot, since the settling fiber is still in it then. Counted in
-       * {@link deliverTurn} **before** it asks whether the import is working again.
-       */
-      const deliveries = new Map<string, number>();
-      const deliveriesTo = (importId: string): number =>
-        deliveries.get(importId) ?? 0;
-      /**
-       * Takes an import's fiber out of {@link turns}, only if it is the calling fiber's own:
-       * a fiber that has finished settling may already have been followed by a fresh one
-       * for the next message, which must stay findable by `stop`.
-       */
-      const releaseTurn = (importId: string) =>
-        Effect.withFiber((fiber) =>
-          Effect.sync(() => {
-            if (turns.get(importId) === fiber) turns.delete(importId);
-          }),
-        );
-
-      /**
-       * Every import whose first turn has not yet learned how its open went, by import id.
-       *
-       * **What makes "still opening" visible before the spine publishes anything.** The
-       * spine puts an entry in its map only once the credential and the MCP registration
-       * exist, but the index row is written — and confirmed, so the picker lists it — before
-       * either. A message to the import in that window found no entry, read a row that was
-       * neither live nor ended, and took the reopen path: a second session under a new id,
-       * answered with a note claiming the server had restarted. A message now waits on this
-       * instead, and then asks again, by which time the open is known either way.
-       *
-       * Set the instant the id is minted and released by the first of: the open being known
-       * (`run`), the turn ending, or `startWith` failing before it forked the turn. Releasing
-       * twice is a no-op.
-       */
-      const inFlight = new Map<
-        string,
-        { readonly targetId: string; readonly known: Deferred.Deferred<void> }
-      >();
-      const releaseOpening = (importId: string) =>
-        Effect.suspend(() => {
-          const held = inFlight.get(importId);
-          if (held === undefined) return Effect.void;
-          inFlight.delete(importId);
-          return Deferred.succeed(held.known, undefined);
-        });
-
-      /**
-       * Which import took over from one whose session this process no longer held.
-       *
-       * Written **the moment the successor's id is minted** (`startWith`), not once its
-       * session has opened: a message whose request is dropped while the fresh session opens
-       * would otherwise skip the write — the session itself is forked into this layer's scope
-       * and opens regardless — and the next message to the old id would open a third. A
-       * message that follows the link to a successor still opening waits on {@link inFlight}.
-       * Taken back if that open fails, so the next message reopens from the id the operator
-       * knows. Bounded by the number of reopenings an operator causes, and not swept, for
-       * `liveAgentSessions.ts`'s `opening` map's reason.
-       */
-      const successors = new Map<string, string>();
-
-      /**
-       * Publishes one import session's narration under its import, for as long as the
-       * session lives.
-       *
-       * `plan/goalConversation.ts`'s `narrate`, with the subject changed and nothing else: an
-       * importer conversation has no terminal outcome to read off the stream either, because
-       * it does not settle — a turn settles, and that is read from `waitForIdle`, not from
-       * here. The spine forks this into the session's own scope and interrupts it **first**
-       * on every close (`harness/liveAgentSessions.ts`, `closeSession`), so it needs no
-       * lifecycle of its own: the operator's stop, a refused prompt, a failed open and the
-       * layer's finalizer all end it, before the credential goes.
-       *
-       * **A stream that ends does not end the conversation.** It is logged and nothing more:
-       * the stream breaking says nothing about the session, and the next message still
-       * reaches it through `deliverTurn`, which does not look at this fiber at all. What is
-       * lost is what the chat would have shown until a reload replays from the harness.
-       *
-       * **Publishing is not persisting.** With nobody on the Auto-load page — which is
-       * always the case for an import started from the create-target form — every entry is
-       * published to no subscriber and kept nowhere (`run/narration.ts`'s header). That path's
-       * closing report is still read from `messages` after `waitForIdle`; see
-       * {@link settleTurn}.
-       */
-      const narrate = Effect.fnUntraced(function* (input: {
-        readonly harness: AgentHarness["Service"];
-        readonly targetId: string;
-        readonly importId: string;
-        readonly sessionId: string;
-      }) {
-        /*
-         * The narration's last word for this session (A7-Q, from the chat shell's review 2):
-         * when the narrator goes — the spine interrupts it first on every close, and a
-         * stream can also end — a `connection` `closed` is published, so a chat open on the
-         * session learns that its authority ended here even when the end came from outside
-         * the page (another tab, the API, a shutdown), and a question still docked hears it
-         * is withdrawn. Published under `ensuring`, so an interrupt still sends it.
-         */
-        const closed = Effect.suspend(() =>
-          narrations.publish({
-            targetId: input.targetId,
-            subject: { _tag: "import", importId: input.importId },
-            harnessSessionId: input.sessionId,
-            entry: {
-              type: "bit.connection.closed",
-              sequence: undefined,
-              at: Date.now(),
-              outcome: undefined,
-              detail: {
-                _tag: "connection",
-                state: "closed",
-                reason: "this server stopped holding the session",
-              },
-            },
-          }),
-        );
-        const outcome = yield* Effect.result(
-          // Block deltas coalesced into partial updates for the live chat, and published
-          // nowhere else (`run/streamingCoalescer.ts`).
-          narrateCoalesced({
-            events: input.harness.sessionEvents(input.sessionId),
-            publish: (entry) => {
-              // The harness took queued messages: they are being worked on, and stay this
-              // process's to replay until the transcript holds them (`steers`). Several
-              // taken as one are one turn, and are held saying so (A6 U4 review 3).
-              if (entry.detail._tag === "taken") {
-                const held = steersOf(input.importId);
-                const ids = entry.detail.messageIds;
-                const together = ids.length > 1 ? [...ids] : undefined;
-                for (const id of ids) {
-                  held.taken.set(id, together);
-                  const message = held.queued.get(id);
-                  if (message !== undefined) {
-                    held.queued.set(id, tookIt(message, together));
-                  }
-                }
-              }
-              return narrations.publish({
-                targetId: input.targetId,
-                subject: { _tag: "import", importId: input.importId },
-                harnessSessionId: input.sessionId,
-                entry,
-              });
-            },
-          }).pipe(Effect.ensuring(closed)),
-        );
-        if (outcome._tag === "Failure") {
-          yield* Effect.logWarning(
-            "a scope import's narration stream failed; this says nothing about the session, and the next message still reaches it",
-            {
-              importId: input.importId,
-              sessionId: input.sessionId,
-              detail: outcome.failure.message,
-            },
-          );
-        }
-      });
-
-      /**
-       * The first turn of one import: open the session, let it work, settle the view.
-       *
-       * The acquire order is the spine's, and each step rules out the next step's
-       * ambiguity: the checked directory before the session, so a session is never created
-       * inside the workspace; the credential before the registration, so
-       * there is something to register; the registration before the prompt, so turn one has
-       * the tools. A failure at any step closes the scope, which revokes the credential and
-       * unregisters the server — including the case where the *next* step is the thing that
-       * failed.
-       *
-       * **When this returns the session is still open**, which is the only observable
-       * difference from before: the entries, the settle and the closing report are exactly
-       * what they were.
-       */
-      const run = Effect.fnUntraced(function* (input: {
-        readonly importId: string;
-        readonly request: ScopeImportRequest;
-        /** The agent the session runs as, as `startWith` recorded it on the row. */
-        readonly agent: AgentDefinition<ImporterPromptInput>;
-        readonly harness: AgentHarness["Service"];
-        readonly model: string;
-        readonly options: readonly ModelOptionSelection[] | undefined;
-        readonly links: readonly string[];
-        readonly sessionId: string;
-        /** The operator's first message, for a conversation. See `ScopeImportRequest`. */
-        readonly message: string | undefined;
-        /** Completed once the open is known, for a caller that waits on it (`converse`). */
-        readonly opening: Opening | undefined;
-        /** The import this one takes over from, if any. See `ScopeImportRequest`. */
-        readonly predecessor: string | undefined;
-        /** The earlier session's pages, for the opener. See `ScopeImportRequest`. */
-        readonly earlierPages: readonly string[];
-      }) {
-        /*
-         * A resume continues a conversation; everything else about this function is the same.
-         *
-         * Two things change and they are both in `prepare`: the directory is the one the
-         * harness resolves the session in (so the check is of where the agent runs), and the
-         * opening prompt is the short reconnection note rather than the whole opener, because
-         * the rules and the pages are already in the session's own history.
-         */
-        const resume = input.request.resume;
-        const harness = input.harness;
-        const opened = yield* Effect.result(
-          sessions.open<
-            LiveAgentSession<ImportSessionMeta> | undefined,
-            LiveSessionOpenFailure,
-            never
-          >({
-            id: input.importId,
-            // Unreachable: every `start` mints a fresh import id, so nothing can have
-            // opened this one first. Answered rather than died on, and without touching a
-            // session this run did not open.
-            joined: () => Effect.succeed(undefined),
-            refuse: (failure) => failure,
-            prepare: Effect.succeed({
-              targetId: input.request.targetId,
-              harness,
-              model: input.model,
-              ...(input.options === undefined
-                ? {}
-                : { options: input.options }),
-              sessionId: input.sessionId,
-              // `importerTitle.ts` recognises this name when a harness hands it back.
-              // V2(chat): V1 opens every session under this name, and OpenCode titles only a
-              // session created without one, so an OpenCode importer session is never named
-              // in D5's list — it is labelled by its date alone (seen live in U8 on
-              // zai-coding-plan/glm-5.3-flash, after three turns). Opening it untitled is
-              // not the fix by itself: OpenCode would title it from the whole first user
-              // message (`session/title.ts`, no cut), which is this server's ~3 KB framing
-              // with the operator's words at the end, so its names would repeat as Claude
-              // Code's do (`claudeCodeClient.ts`, `sessionTitle`); and each title is one more
-              // LLM call per session (`source: "title"` usage, which bit does not read). The
-              // operator decided (U8, 2026-11-05) to keep the harnesses' names for V1. V2
-              // should author the title in bit from the operator's first message — no
-              // framing, no extra model call — and keep it on the import's row, so names are
-              // distinct and the same on both harnesses (`claudeCodeClient.ts`,
-              // `sessionTitle`, has Claude Code's half).
-              title: importerSessionTitle(input.request.targetName),
-              ...(resume === undefined ? {} : { resume: resume.sessionId }),
-              /*
-               * The session's directory, which on a resume is **not** this import's.
-               *
-               * Both drivers resolve a conversation through the directory it was created in,
-               * so a resumed session is checked and run
-               * where the harness will actually resolve it (`importerReopen` checked that the
-               * path is one of this target's own). `ensureImportDirectory` recreates it if it
-               * was swept, which is also the answer to OpenCode's `LocationNotFoundError`.
-               */
-              ensureDirectory: fleet.ensureImportDirectory(
-                input.request.targetId,
-                resume?.directoryImportId ?? input.importId,
-              ),
-              // The importer draws the question dock and answers it (A7-Q), so its agent
-              // may ask the operator through the harness's own question tool.
-              operatorQuestions: true,
-              // Reading the program's pages is its job: on Claude Code, `WebFetch` is
-              // pre-approved for it, whatever the operator's settings allow otherwise.
-              fetchesPages: true,
-              // The engagement folder, so the containment check can refuse an import
-              // directory inside it. `undefined` says this target has none.
-              workspace: input.request.workspacePath ?? undefined,
-              /*
-               * The session now exists, and the index is told so. Until this lands the row
-               * `start` wrote names an id the harness may never have minted, and the session
-               * list does not show it (`0025`). Advisory like the row itself: a failure is
-               * logged with the id and the import carries on, and the session is merely not
-               * listed.
-               */
-              afterCreate: () =>
-                withTargetStore(stores, input.request.targetId, (store) =>
-                  store.confirmImportSession(input.importId),
-                ).pipe(
-                  Effect.catch((failure) =>
-                    Effect.logWarning(
-                      "a scope import's session was created but could not be marked as such; the session will not appear in the target's list",
-                      {
-                        targetId: input.request.targetId,
-                        importId: input.importId,
-                        sessionId: input.sessionId,
-                        detail: failure.message,
-                      },
-                    ),
-                  ),
-                ),
-              // The narrator, forked by the spine into this session's scope. D16 as
-              // amended: the panel keeps its call list, and the chat shows this.
-              narrate: (sessionId: string) =>
-                narrate({
-                  harness,
-                  targetId: input.request.targetId,
-                  importId: input.importId,
-                  sessionId,
-                }),
-              // The agent's own prompts, and only through it: the agent is what decides what a
-              // conversation is told, and this is the one place an opener is written.
-              openingPrompt: () =>
-                resume !== undefined && input.message !== undefined
-                  ? input.agent.prompt.resume({ message: input.message })
-                  : input.agent.prompt.opening({
-                      targetName: input.request.targetName,
-                      links: input.links,
-                      message: input.message,
-                      earlierPages: input.earlierPages,
-                    }),
-              // Pinned to the entry, so every later message into this session is framed by
-              // the agent that opened it (`deliverTurn`).
-              meta: { agent: input.agent },
-              // The first message's files, stored by the spine in the session's directory.
-              ...(input.request.uploads === undefined
-                ? {}
-                : { uploads: input.request.uploads }),
-            }),
-            opened: (entry) => Effect.succeed(entry),
-          }),
-        );
-
-        // A successor that could not open is not one: the next message to the import it was
-        // to replace reopens from there, under the id the operator knows.
-        if (
-          (opened._tag === "Failure" || opened.success === undefined) &&
-          input.predecessor !== undefined &&
-          successors.get(input.predecessor) === input.importId
-        ) {
-          successors.delete(input.predecessor);
-        }
-        // The open is known: a message that arrived while it was in flight may now ask again.
-        yield* releaseOpening(input.importId);
-        if (input.opening !== undefined) {
-          yield* opened._tag === "Failure"
-            ? Deferred.fail(input.opening, refusal(opened.failure))
-            : opened.success === undefined
-              ? Deferred.fail(
-                  input.opening,
-                  new ImporterConversationRefused({
-                    reason: "store_unavailable",
-                    detail:
-                      "this import already had a session open in this process, so a second was not opened",
-                  }),
-                )
-              : Deferred.succeed(input.opening, opened.success);
-        }
-        if (opened._tag === "Failure" || opened.success === undefined) {
-          const detail =
-            opened._tag === "Failure"
-              ? opened.failure.message
-              : "this import already has a session open in this process, so a second was not opened";
-          yield* progress.settle({
-            importId: input.importId,
-            status: "failed",
-            detail,
-          });
-          yield* Effect.logWarning("a scope import could not be opened", {
-            targetId: input.request.targetId,
-            importId: input.importId,
-            detail,
-          });
-          // Whatever was built is gone — the spine closed it — so the import is over. A
-          // session the harness created and then could not be given tools is a session
-          // this process will never prompt again.
-          // `open_failed` unless the spine already recorded `refused` for a prompt the
-          // harness would not take: the first end wins.
-          if (opened._tag === "Failure") {
-            yield* markEnded(
-              input.request.targetId,
-              input.importId,
-              "open_failed",
-            );
-          }
-          return;
-        }
-        yield* settleTurn(input.importId, harness, opened.success.sessionId);
-      });
-
-      /**
-       * Waits for one turn of an import's session to go idle, then settles its view.
-       *
-       * The first turn's tail, and a later turn's whole fiber: a message delivered into a
-       * session marks the import `running` again (`progress.resume`) and this is what settles
-       * it once the session has finished with it.
-       *
-       * **A loop, until no message arrived since its wait began** (A6 U4 review 3). A message
-       * delivered while this fiber is finishing — after the idle point, during the closing
-       * report's read — finds it still in `turns` and starts no fiber of its own; this one
-       * used to settle over it, leaving the import `finished` while the message's turn ran
-       * and the message held in `steers` until the session closed. Now it waits again for any
-       * message delivered since its wait began ({@link deliveries}), and takes itself out of
-       * `turns` in the same synchronous step as its last check, so a message delivered after
-       * that check starts a fiber of its own.
-       */
-      const settleTurn = Effect.fnUntraced(function* (
-        importId: string,
-        harness: AgentHarness["Service"],
-        sessionId: string,
-      ) {
-        for (;;) {
-          // Where this wait starts: the messages delivered so far, and when.
-          const mark = { delivered: deliveriesTo(importId), at: Date.now() };
-          /** Whether a message was delivered since this wait began. */
-          const more = () => deliveriesTo(importId) !== mark.delivered;
-          /*
-           * Wait for the session to go idle, then settle.
-           *
-           * `waitForIdle` rather than a poll, and nothing is read out of the result: what
-           * the import *did* is already in `scope_entries`, in `asset_imports` and on the
-           * panel, written call by call as it went. The only thing this adds is "it is no
-           * longer going to write anything", which is what turns the last link's `reading`
-           * into `read`.
-           *
-           * A failure here is still `finished`, not `failed`, and that is D15 rather than
-           * carelessness: the session ending badly says nothing about whether the pages it
-           * already read produced entries. Those entries are written and are the operator's
-           * to review. The detail carries what went wrong so the panel can say so.
-           */
-          const settled = yield* Effect.result(harness.waitForIdle(sessionId));
-          /*
-           * Idle: whatever was delivered before the wait began has been taken, whether or
-           * not the take was seen. Only that: a message delivered after it may have arrived
-           * after the idle point this wait saw — the next turn's to take — and is dropped by
-           * the next pass, whose wait begins after it.
-           */
-          for (const [id, message] of steers.get(importId)?.queued ?? []) {
-            if (message.acceptedAt <= mark.at)
-              steers.get(importId)?.queued.delete(id);
-          }
-          // A session that ended has nothing more to wait for, whatever was sent to it.
-          const ended = settled._tag === "Failure";
-          if (!ended && more()) continue;
-          if (yield* progress.stopped(importId)) return;
-
-          /*
-           * The session's closing report, read once, after it has settled.
-           *
-           * **This is the only account anything in this process has of why an import wrote
-           * what it wrote.** The prompt asks for it in as many words, and the most common
-           * outcome of a real import needs it: a client-rendered program page answers `200`
-           * with no scope in it, so every step here succeeds, nothing is written, and
-           * without this the operator is told "nothing could be read" and no more.
-           *
-           * `messages` rather than the narration bus, and that distinction is D16's: this is
-           * one message, pulled after the fact, for a panel and a toast that have no browser
-           * subscribed to anything — the create-target path, where an import is still a batch
-           * job. The session's narration *is* drained now (`narrate`), but onto a bus that
-           * keeps nothing for a reader who is not there, so it cannot stand in for this. The
-           * call list is untouched; what this produces is a single status line.
-           *
-           * A failure to read it is not a failure of the import. The entries are written and
-           * are the operator's to review; the report is an explanation, and an explanation
-           * that could not be fetched leaves the import exactly as `finished` as it was.
-           */
-          const report = yield* Effect.map(
-            Effect.result(harness.messages(sessionId)),
-            (read) =>
-              read._tag === "Failure"
-                ? null
-                : importReport(lastAssistantText(read.success)),
-          );
-          // Delivered while the report was read: that message's turn is the one to settle.
-          if (!ended && more()) continue;
-
-          yield* progress.settle({
-            importId: importId,
-            status: "finished",
-            detail:
-              settled._tag === "Failure"
-                ? `the importer's session ended early: ${settled.failure.message}. Anything it had already written is kept.${report === null ? "" : ` It reported: ${report}`}`
-                : report,
-          });
-          /*
-           * The last check and the release in one synchronous step: a message delivered
-           * before it is waited for here; one delivered after it finds no fiber in `turns`
-           * and starts its own.
-           */
-          const done = yield* Effect.withFiber((fiber) =>
-            Effect.sync(() => {
-              if (!ended && more()) return false;
-              if (turns.get(importId) === fiber) turns.delete(importId);
-              return true;
-            }),
-          );
-          if (done) return;
-          // Delivered between the settle and the check: the import is working again.
-          yield* progress.resume(importId);
-        }
-      });
 
       const startWith = Effect.fn("ScopeImporter.start")(function* (
         request: ScopeImportRequest,
@@ -1505,23 +1088,10 @@ export class ScopeImporter extends Context.Service<
           "a scope import",
         );
         const importId = newImportId();
+        const resume = request.resume;
         // A resume names the session it continues: minting a fresh id would start a second
         // conversation and leave the session index showing one as two (S3.3).
         const sessionId = request.resume?.sessionId ?? harness.newSessionId();
-        /*
-         * Still opening, from this instant: see `inFlight`. And, for a reopen, the old id's
-         * successor — written here rather than once the session opens, so a caller that stops
-         * waiting cannot lose it. Both synchronous with the mint, so no interrupt can land
-         * between an id existing and these knowing about it.
-         */
-        inFlight.set(importId, {
-          targetId: request.targetId,
-          known: Deferred.makeUnsafe<void>(),
-        });
-        if (request.predecessor !== undefined) {
-          successors.set(request.predecessor, importId);
-        }
-
         /*
          * The pages this import may cite: the pasted links, then the earlier session's when
          * this continues one, then the pages the operator's message is about — each step
@@ -1545,123 +1115,144 @@ export class ScopeImporter extends Context.Service<
         const dispatchedOptions: readonly ModelOptionSelection[] | undefined =
           options;
 
-        const fiber = yield* Effect.gen(function* () {
-          /*
-           * The index entry, written before the session exists.
-           *
-           * That is the attempt rows' arrangement and for their reason: the harness holds
-           * every session of every project and cannot be asked which were ours, so the
-           * index is the only way an operator finds this one again, and an id recorded first
-           * cannot be lost to a crash between creating the session and writing the row. The
-           * price is an entry for a session that never opened (a directory refused, a
-           * harness that would not create it). That entry is not listed: it is marked once `createSession` returns
-           * (`confirmImportSession`, `0025`), and the session list reads only marked ones, so
-           * an id the harness never minted cannot be offered for a resume.
-           *
-           * **A failure to write it does not refuse the import.** The index is a way of
-           * finding a session and is advisory in the way `ScopeImportView` is: the import's
-           * work is its entries and assets, and they land whether or not this row does. It is
-           * logged with the id, which is what recovers it by hand.
-           */
-          yield* withTargetStore(stores, request.targetId, (store) =>
-            store.recordImportSession({
+        /*
+         * The first turn, begun on the core: from this instant the import is "still
+         * opening" (a message to it waits) and, for a reopen, the old id's successor — both
+         * synchronous with the id existing. `before` writes the index entry and opens the
+         * panel; the first turn is then forked into this layer's scope, so `start` answers
+         * without it.
+         */
+        yield* conversations.begin({
+          id: importId,
+          targetId: request.targetId,
+          predecessor: request.predecessor,
+          opening,
+          before: Effect.gen(function* () {
+            /*
+             * The index entry, written before the session exists: the harness holds every
+             * session of every project and cannot be asked which were ours, so the index is
+             * the only way an operator finds this one again. It is not listed until
+             * `confirmImportSession` (`0025`), so an id the harness never minted cannot be
+             * offered for a resume. **A failure to write it does not refuse the import.**
+             */
+            yield* withTargetStore(stores, request.targetId, (store) =>
+              store.recordImportSession({
+                importId,
+                targetId: request.targetId,
+                harnessSessionId: sessionId,
+                harnessInstanceId: harness.instance.instanceId,
+                model: choice.model,
+                modelOptions: dispatchedOptions,
+                pages: given.pages,
+                agentId: agent.id,
+              }),
+            ).pipe(
+              Effect.catch((failure) =>
+                Effect.logWarning(
+                  "a scope import's session could not be indexed; the import runs regardless, and the session will not appear in the target's list",
+                  {
+                    targetId: request.targetId,
+                    importId,
+                    sessionId,
+                    detail: failure.message,
+                  },
+                ),
+              ),
+            );
+            // Opened before the fiber starts, so the panel's first poll finds an import with
+            // every link `waiting` rather than a `404` for the first moment of its life.
+            yield* progress.open({
               importId,
               targetId: request.targetId,
-              harnessSessionId: sessionId,
+              urls: given.pages,
+              droppedLinks,
               harnessInstanceId: harness.instance.instanceId,
               model: choice.model,
-              modelOptions: dispatchedOptions,
-              pages: given.pages,
-              agentId: agent.id,
-            }),
-          ).pipe(
-            Effect.catch((failure) =>
-              Effect.logWarning(
-                "a scope import's session could not be indexed; the import runs regardless, and the session will not appear in the target's list",
-                {
-                  targetId: request.targetId,
-                  importId,
-                  sessionId,
-                  detail: failure.message,
-                },
-              ),
-            ),
-          );
-
-          // Opened before the fiber starts, so the panel's first poll finds an import with
-          // every link `waiting` rather than a `404` for the first moment of its life.
-          yield* progress.open({
-            importId,
+            });
+          }),
+          plan: {
             targetId: request.targetId,
-            urls: given.pages,
-            droppedLinks,
-            harnessInstanceId: harness.instance.instanceId,
+            harness,
             model: choice.model,
-          });
-
-          /*
-           * The first turn, forked into this layer's scope so `start` answers without it.
-           *
-           * **Its exit no longer closes anything.** The session's scope is the spine's, made
-           * there with `Scope.make` rather than the caller's for the reason it always was —
-           * the caller is an HTTP handler about to answer, and a credential acquired in the
-           * request's scope would be revoked the instant the target was created — and closed
-           * only by what this module's header lists. The fiber ending is the end of a turn.
-           */
-          return yield* Effect.forkIn(
-            run({
-              importId,
-              request,
-              agent,
-              harness,
-              model: choice.model,
-              options: dispatchedOptions,
-              links,
-              sessionId,
-              message: request.message,
-              opening,
-              predecessor: request.predecessor,
-              earlierPages: carried.added,
-            }).pipe(
-              Effect.ensuring(releaseTurn(importId)),
-              Effect.ensuring(releaseOpening(importId)),
-              // A turn stopped before its open was known still answers whoever is waiting on
-              // it. A no-op when the open already completed the deferred.
-              Effect.ensuring(
-                opening === undefined
-                  ? Effect.void
-                  : Deferred.fail(
-                      opening,
-                      new ImporterConversationRefused({
-                        reason: "import_ended",
-                        detail: `import ${importId} was stopped before its session had opened, so nothing was said to it`,
-                      }),
-                    ),
-              ),
+            ...(dispatchedOptions === undefined
+              ? {}
+              : { options: dispatchedOptions }),
+            sessionId,
+            // `importerTitle.ts` recognises this name when a harness hands it back.
+            // V2(chat): V1 opens every session under this name, and OpenCode titles only a
+            // session created without one, so an OpenCode importer session is never named
+            // in D5's list — it is labelled by its date alone. The operator decided (U8,
+            // 2026-11-05) to keep the harnesses' names for V1. V2 should author the title in
+            // bit from the operator's first message and keep it on the import's row.
+            title: importerSessionTitle(request.targetName),
+            ...(resume === undefined ? {} : { resume: resume.sessionId }),
+            /*
+             * The session's directory, which on a resume is **not** this import's: both
+             * drivers resolve a conversation through the directory it was created in
+             * (`importerReopen` checked that the path is one of this target's own).
+             * `ensureImportDirectory` recreates it if it was swept.
+             */
+            ensureDirectory: fleet.ensureImportDirectory(
+              request.targetId,
+              resume?.directoryImportId ?? importId,
             ),
-            own,
-          );
-        }).pipe(
-          // Failed or interrupted before the turn existed — a dropped request lands here —
-          // so nothing will learn how an open went: release whoever waits, and take back a
-          // successor link to an import that will never open.
-          Effect.onExit((exit) =>
-            Exit.isSuccess(exit)
-              ? Effect.void
-              : Effect.andThen(
-                  Effect.sync(() => {
-                    if (
-                      request.predecessor !== undefined &&
-                      successors.get(request.predecessor) === importId
-                    ) {
-                      successors.delete(request.predecessor);
-                    }
-                  }),
-                  releaseOpening(importId),
+            // The importer draws the question dock and answers it (A7-Q).
+            operatorQuestions: true,
+            // Reading the program's pages is its job: on Claude Code, `WebFetch` is
+            // pre-approved for it, whatever the operator's settings allow otherwise.
+            fetchesPages: true,
+            workspace: request.workspacePath ?? undefined,
+            /*
+             * The session now exists, and the index is told so (`0025`). Advisory like the
+             * row itself: a failure is logged and the session is merely not listed.
+             */
+            afterCreate: () =>
+              withTargetStore(stores, request.targetId, (store) =>
+                store.confirmImportSession(importId),
+              ).pipe(
+                Effect.catch((failure) =>
+                  Effect.logWarning(
+                    "a scope import's session was created but could not be marked as such; the session will not appear in the target's list",
+                    {
+                      targetId: request.targetId,
+                      importId,
+                      sessionId,
+                      detail: failure.message,
+                    },
+                  ),
                 ),
-          ),
-        );
-        turns.set(importId, fiber);
+              ),
+            /*
+             * The agent's own prompts, and only through it. A resume continues a
+             * conversation: the short reconnection note rather than the whole opener,
+             * because the rules and the pages are already in the session's own history.
+             */
+            openingPrompt: () =>
+              resume !== undefined && request.message !== undefined
+                ? agent.prompt.resume({ message: request.message })
+                : agent.prompt.opening({
+                    targetName: request.targetName,
+                    links,
+                    message: request.message,
+                    earlierPages: carried.added,
+                  }),
+            // Pinned to the entry, so every later message is framed by the agent that
+            // opened it.
+            meta: { agent },
+            ...(request.uploads === undefined
+              ? {}
+              : { uploads: request.uploads }),
+          },
+          failed: (detail) =>
+            Effect.andThen(
+              progress.settle({ importId, status: "failed", detail }),
+              Effect.logWarning("a scope import could not be opened", {
+                targetId: request.targetId,
+                importId,
+                detail,
+              }),
+            ),
+        });
 
         yield* Effect.logInfo("a scope import started", {
           targetId: request.targetId,
@@ -1687,197 +1278,23 @@ export class ScopeImporter extends Context.Service<
         "ScopeImporter.stop",
       )(function* (importId) {
         /*
-         * The registry first, the session second, and the order is the point.
-         *
-         * Marking it stopped settles the view and revokes nothing, so the route can answer
-         * immediately with the receipt for what landed. Then the credential goes — before
-         * the interrupt is waited on, so a session mid-call finds its next call refused at
-         * the door rather than having however long the harness takes to come back. Then
-         * the harness is told to stop, the first turn's fiber is interrupted if it is still
-         * running, and the session is closed: the operator ending it is the one intentional
-         * close on this module's list, and the one end the toolkit refuses writes on.
-         *
-         * Everything written before this stays. That is what makes stopping early a
-         * decision rather than a loss, and it is true because the session wrote as it read.
+         * The view first, the session second, and the order is the point: marking it
+         * stopped settles the view and revokes nothing, so the route can answer at once
+         * with the receipt for what landed. Then the core ends the period — the credential
+         * before the interrupt, the operator's end recorded before anything is interrupted,
+         * and the close. Everything written before this stays.
          */
         const view = yield* progress.stop(
           importId,
           "stopped by the operator. Everything written up to this point is kept.",
         );
         if (view === undefined) return undefined;
-
-        const entry = sessions.get(importId);
-        const turn = turns.get(importId);
-        if (entry === undefined && turn === undefined) return view;
-
-        yield* credentials.revokeImport(importId);
-        /*
-         * The end is recorded as the operator's **here**, after the revoke and before
-         * anything is interrupted, and the order is what makes the reason true. Interrupting
-         * a first turn that is still opening makes the spine close what it built as
-         * `open_failed`, and the first recorded end wins — so recorded after the interrupt,
-         * an operator's stop mid-open would read as a failed open, and the toolkit would not
-         * refuse on it. Also covers the stop that landed before any entry was published:
-         * there was no session to close, and the import is over all the same.
-         */
-        yield* markEnded(view.targetId, importId, "operator");
-        /*
-         * No interrupt first. The close ends the harness session (`AgentHarness.endSession`),
-         * which stops the turn in flight and drops anything queued behind it; an interrupt
-         * would only stop the turn, and on Claude Code it is what makes the CLI go straight
-         * on to a queued message — which it then ran after the operator had ended the import.
-         * An interrupt mid-open is the spine's to clean up: it closes a scope in no map
-         * (ending the session it built), and an entry it had published but not yet prompted.
-         */
-        if (turn !== undefined) yield* Fiber.interrupt(turn);
-        yield* sessions.close(importId, "operator");
+        yield* conversations.end(view.targetId, importId);
         return view;
       });
 
       const start: ScopeImporter["Service"]["start"] = (request) =>
         startWith(request);
-
-      /** What an accepted message answers with. */
-      const accepted = (
-        entry: LiveAgentSession<ImportSessionMeta>,
-        conversation: ImporterTurnAccepted["conversation"],
-        note: string,
-        pages: {
-          readonly added: readonly string[];
-          readonly notAdded: readonly string[];
-        },
-        /** The steer's id, on a `continued` turn: see `ImporterTurnAccepted.messageId`. */
-        messageId?: string,
-        /**
-         * The files this message carried, as stored: a follow-up's from its delivery, an
-         * opening's from the entry the spine opened with them (A6 U13).
-         */
-        attachments: readonly MessageAttachment[] = entry.openedWith,
-      ): ImporterTurnAccepted => ({
-        targetId: entry.targetId,
-        importId: entry.id,
-        harnessSessionId: entry.sessionId,
-        harnessInstanceId: entry.instanceId,
-        model: entry.model,
-        conversation,
-        note,
-        pagesAdded: [...pages.added],
-        pagesNotAdded: [...pages.notAdded],
-        acceptedAt: Date.now(),
-        ...(messageId === undefined ? {} : { messageId }),
-        ...(attachments.length === 0
-          ? {}
-          : { attachments: attachments.map(attachmentView) }),
-      });
-
-      /**
-       * Gives one message to an import whose session is live and preambled.
-       *
-       * Delivery is the spine's (`LiveAgentSessions.deliver`): a `steer` at the operator's
-       * urgency, `queued` by default — the goal conversation's seam and reasoning
-       * (DECISIONS.md §24.1) — and a refusal closes the session as `refused`. **The import id does not change**: this is the same
-       * authority period, so the writes this turn makes are filed under the same
-       * `caller_scope` and the session's tally keeps counting (S3.3).
-       *
-       * Two things are the importer's own. A page the operator typed is added to the pages
-       * this import may cite, **before** the message is delivered, so a write citing it is
-       * never refused for a page the operator has just given. And the import is marked
-       * working again, with a fiber to settle it once the session goes idle — unless a turn's
-       * fiber is already waiting, which will.
-       */
-      const deliverTurn = Effect.fnUntraced(function* (
-        entry: LiveAgentSession<ImportSessionMeta>,
-        text: string,
-        urgency: SteerUrgency,
-        uploads?: readonly ReadUpload[],
-      ) {
-        const widened = yield* progress.addLinks(entry.id, operatorPages(text));
-        // The durable copy (`0029`), so a session reopened after a restart can carry these
-        // forward. Advisory like the row it lives on: the in-memory list is what the toolkit
-        // checks while this process holds the import.
-        if (widened !== undefined && widened.added.length > 0) {
-          yield* withTargetStore(stores, entry.targetId, (store) =>
-            store.recordImportPages(entry.id, widened.pages),
-          ).pipe(
-            Effect.catch((failure) =>
-              Effect.logWarning(
-                "the pages a scope import may cite were widened but could not be recorded; a session reopened after a restart will not carry them forward",
-                { importId: entry.id, detail: failure.message },
-              ),
-            ),
-          );
-        }
-        const delivered = yield* Effect.result(
-          sessions.deliver(
-            entry,
-            entry.meta.agent.prompt.followUp({ message: text }),
-            urgency,
-            uploads,
-          ),
-        );
-        if (
-          delivered._tag === "Failure" &&
-          delivered.failure._tag === "UploadWriteFailed"
-        ) {
-          // Nothing was asked of the harness, so the session is kept.
-          return yield* new ImporterConversationRefused({
-            reason: "upload_unwritable",
-            detail: `${delivered.failure.message}. The session is still open; send the message again.`,
-          });
-        }
-        if (delivered._tag === "Failure") {
-          return yield* new ImporterConversationRefused({
-            reason: "harness_unreachable",
-            detail: `${delivered.failure.message}. The harness would not take the message, so this import's session has been closed; your next message opens a fresh one under a new import.`,
-          });
-        }
-        const turn = accepted(
-          entry,
-          "continued",
-          "",
-          widened ?? { added: [], notAdded: [] },
-          delivered.success.messageId,
-          delivered.success.attachments,
-        );
-        /*
-         * Held until the transcript has it (`steers`), marked taken if the take came first.
-         * Only while this process still holds this very session: a close that ran while the
-         * message was out has already dropped the session's `steers`, and a fresh entry made
-         * now would outlive it with nothing left to remove it. No yield from this check to
-         * the write, so a close cannot land between them.
-         */
-        if (sessions.get(entry.id) === entry) {
-          const held = steersOf(entry.id);
-          const waiting: ImporterQueuedMessage = {
-            messageId: delivered.success.messageId,
-            text: truncateNarration(text),
-            acceptedAt: turn.acceptedAt,
-            taken: false,
-          };
-          held.queued.set(
-            delivered.success.messageId,
-            held.taken.has(delivered.success.messageId)
-              ? tookIt(waiting, held.taken.get(delivered.success.messageId))
-              : waiting,
-          );
-        }
-        /*
-         * Counted before the import is marked working, so a settling fiber still in `turns`
-         * — which this send will not start another beside — sees it on its next check, and
-         * waits for this message's turn rather than settling over it (`settleTurn`).
-         */
-        deliveries.set(entry.id, deliveriesTo(entry.id) + 1);
-        if ((yield* progress.resume(entry.id)) && !turns.has(entry.id)) {
-          const fiber = yield* Effect.forkIn(
-            settleTurn(entry.id, entry.harness, entry.sessionId).pipe(
-              Effect.ensuring(releaseTurn(entry.id)),
-            ),
-            own,
-          );
-          turns.set(entry.id, fiber);
-        }
-        return turn;
-      });
 
       /**
        * Starts an import with the operator's message as its first turn, and waits for the
@@ -1892,8 +1309,7 @@ export class ScopeImporter extends Context.Service<
         >();
         const started = yield* startWith(request, opening);
         if (started._tag === "none") {
-          // Unreachable: a request with a message is never `none`. Answered rather than died
-          // on, in the same words a reader of the code would use.
+          // Unreachable: a request with a message is never `none`.
           return yield* new ImporterConversationRefused({
             reason: "store_unavailable",
             detail: "there was nothing to say to the importer",
@@ -1923,1207 +1339,215 @@ export class ScopeImporter extends Context.Service<
           // substitution, and `startWith` is where its authority is checked.
           ...(input.agent === undefined ? {} : { agent: input.agent }),
         });
-        return accepted(
-          entry,
-          "opened",
-          "A new importer session was opened for this message: the importer has its rules, the three tools that let it write, and whatever its harness gives it for reading a page — all inside its own directory. It has read nothing else yet.",
+        return turnAccepted(
+          conversations.acceptedOf(
+            entry,
+            "opened",
+            "A new importer session was opened for this message: the importer has its rules, the three tools that let it write, and whatever its harness gives it for reading a page — all inside its own directory. It has read nothing else yet.",
+          ),
           { added: started.pagesAdded, notAdded: started.pagesNotAdded },
         );
       });
 
       /**
-       * One permit per dead import id, held while a fresh session is opened in its place.
-       *
-       * The spine's per-id permit does not cover this: the fresh session is opened under a
-       * **new** id, so two concurrent messages to one dead import would each take a
-       * different permit and open two sessions — the goal path's measured double-open bug in
-       * a new shape. This permit is on the *old* id, and the successor is re-read inside it.
+       * A message to an import this process does not hold and the operator did not end —
+       * closed after a refused prompt, shut down, never opened, or lost to a restart — opens
+       * its successor under a **new** import id (the core's `send`, under the old id's
+       * reopen permit, with the row read inside it).
        */
-      const reopening = new Map<string, Semaphore.Semaphore>();
-      const reopenLock = (importId: string): Semaphore.Semaphore => {
-        const held = reopening.get(importId);
-        if (held !== undefined) return held;
-        const made = Semaphore.makeUnsafe(1);
-        reopening.set(importId, made);
-        return made;
-      };
-
-      /**
-       * The index row a message to an import acts on, refused when there is nothing to say
-       * it to: unknown on this target, or ended by the operator.
-       */
-      const recordedImport = (input: {
-        readonly targetId: string;
-        readonly importId: string;
-      }) =>
-        Effect.gen(function* () {
-          const row = yield* withTargetStore(stores, input.targetId, (store) =>
-            store.importSession(input.importId),
-          ).pipe(Effect.mapError(refusal));
-          if (row === undefined || row.targetId !== input.targetId) {
-            return yield* new ScopeImportNotFound({
-              reason: "unknown_import",
-              importId: input.importId,
-              detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no session to say this to`,
-            });
-          }
-          // The one end that is final, and the one the importer's tools refuse writes on.
-          if (row.endedReason === "operator") {
-            return yield* new ImporterConversationRefused({
-              reason: "import_ended",
-              detail: `import ${input.importId} was ended by the operator, so its session's authority has ended with it and its tools refuse every write. An ended import is not reopened; start a new session to carry on.`,
-            });
-          }
-          return row;
+      const reopen: (
+        input: ConversationSend,
+        row: ImportRow,
+      ) => Effect.Effect<
+        ImporterTurnAccepted,
+        ImporterConversationRefused | ScopeImportNotFound
+      > = Effect.fnUntraced(function* (
+        input: ConversationSend,
+        row: ImportRow,
+      ) {
+        const target = yield* fleet
+          .target(input.targetId)
+          .pipe(Effect.mapError(refusal));
+        if (target === undefined) {
+          return yield* new ImporterConversationRefused({
+            reason: "target_unavailable",
+            detail: `no target '${input.targetId}' is registered on this server`,
+          });
+        }
+        /*
+         * The agent the conversation runs as, from the row: pinned when its first message
+         * was sent, so the successor — resumed or fresh — runs as the same one. Refused
+         * rather than defaulted when this server does not define it.
+         */
+        const agent = importSessionAgent(row.agentId);
+        if (agent === undefined) {
+          return yield* new ImporterConversationRefused({
+            reason: "agent_unavailable",
+            // The replay's sentence for the same row (`importerHistory.ts`).
+            detail: agentUnavailableDetail(input.conversationId, row.agentId),
+          });
+        }
+        /*
+         * The earlier session's pages, carried forward: they were the operator's, and this
+         * is the same conversation. From memory when this process still holds the old
+         * import's list (a refused prompt), and from the row (`0029`) when it does not.
+         */
+        const earlierPages = widenPages(
+          (yield* progress.linksOf(input.conversationId)) ?? [],
+          row.pages ?? [],
+        ).pages;
+        /*
+         * Resume the conversation, or open a new one, according to what the harness
+         * actually still holds (S6): the same function the replay route answers
+         * `continuation` with, so what the composer was told and what happens here cannot
+         * disagree. It never fails.
+         */
+        const decided = yield* importerReopenFor({
+          resolver,
+          targetId: input.targetId,
+          harnessSessionId: row.harnessSessionId,
+          harnessInstanceId: row.harnessInstanceId,
+          importDirectory: fleet.paths.importDirectory,
         });
-
-      /**
-       * The run a message or a switch addressed to `importId` belongs to instead, when that is
-       * not `importId` itself: its harness session's newest confirmed run (A6 F5, from F4's
-       * review).
-       *
-       * In-process, {@link successors} already follows a reopen to the import it minted. A
-       * restart forgets that map and the rows do not: I1 → I2 → I3 is three rows naming one
-       * harness session, and an old tab still holding I1 would otherwise reopen from I1's
-       * row — resuming the same Claude Code session a second time while I3 holds it — or
-       * switch a model on a row nothing reads. `latest_import_id` is the session list's own
-       * answer to "which run is the conversation now", so following it agrees with the
-       * picker. `undefined` when the row is the newest, or when no run was ever confirmed.
-       */
-      const newerRun = (
-        importId: string,
-        row: { readonly latestImportId: string | null },
-      ): string | undefined =>
-        row.latestImportId !== null && row.latestImportId !== importId
-          ? row.latestImportId
-          : undefined;
-
-      const send: ScopeImporter["Service"]["send"] = Effect.fn(
-        "ScopeImporter.send",
-      )(function* (input) {
-        const urgency = input.urgency ?? "queued";
-        // The fast path: live, preambled, and this target's.
-        const live = sessions.ready(input.importId);
-        if (live !== undefined && live.targetId === input.targetId) {
-          return yield* deliverTurn(live, input.text, urgency, input.uploads);
-        }
-
-        /*
-         * Still opening: wait until the open is known, then ask again (see `inFlight`).
-         *
-         * Before the index row, because that row exists — and is confirmed, so the picker
-         * lists it — before the spine has published anything, and a row that is neither live
-         * nor ended is what the reopen below acts on. Asked again rather than continued
-         * from here, because what the open became decides everything after: live, so the
-         * fast path delivers; refused or stopped, so the row says which.
-         */
-        const opening = inFlight.get(input.importId);
-        if (opening !== undefined && opening.targetId === input.targetId) {
-          yield* Deferred.await(opening.known);
-          return yield* send(input);
-        }
-
-        const addressed = yield* recordedImport(input);
-        const newest = newerRun(input.importId, addressed);
-        if (newest !== undefined) {
-          return yield* send({ ...input, importId: newest });
-        }
-
-        /*
-         * Published but not yet preambled: join it, under the spine's permit. `prepare`
-         * refuses rather than builds, because **nothing is ever built under an import id that
-         * has been opened before** — a fresh session is a new authority period and gets a new
-         * id (S3.3). So a joiner that finds the opener's session gone falls through to the
-         * reopen below. (An import still opening *before* it was published waited above.)
-         */
-        if (sessions.get(input.importId) !== undefined) {
-          const joined = yield* Effect.result(
-            sessions.open<
-              ImporterTurnAccepted,
-              ImporterConversationRefused | typeof NOT_LIVE,
-              never
-            >({
-              id: input.importId,
-              joined: (entry) =>
-                deliverTurn(entry, input.text, urgency, input.uploads),
-              prepare: Effect.fail(NOT_LIVE),
-              refuse: refusal,
-              opened: () => Effect.fail(NOT_LIVE),
-            }),
-          );
-          if (joined._tag === "Success") return joined.success;
-          const failure = joined.failure;
-          if (failure._tag !== "NotLive") return yield* Effect.fail(failure);
-        }
-
-        /*
-         * Not live in this process and not ended by the operator: closed after a refused
-         * prompt, shut down, never opened, or lost to a restart. A fresh session, under a
-         * **new** import id — `ended_at` is never cleared, and a session under the old id
-         * would be a second authority period wearing the first one's name.
-         */
-        return yield* Semaphore.withPermit(reopenLock(input.importId))(
-          Effect.gen(function* () {
-            const successor = successors.get(input.importId);
-            if (successor !== undefined) {
-              return yield* send({ ...input, importId: successor });
-            }
-            /*
-             * The row again, inside the permit. A model switch to this import writes the row
-             * under this same permit (`switchModel`), so the model the successor opens on
-             * below is the one the last switch left — never the one read above, before a
-             * switch that landed while this message waited for the permit.
-             */
-            const row = yield* recordedImport(input);
-            // Again inside the permit, for the reason the row is read again: a reopen under
-            // another id's permit can have made a newer run since the read above.
-            const newer = newerRun(input.importId, row);
-            if (newer !== undefined) {
-              return yield* send({ ...input, importId: newer });
-            }
-            const target = yield* fleet
-              .target(input.targetId)
-              .pipe(Effect.mapError(refusal));
-            if (target === undefined) {
-              return yield* new ImporterConversationRefused({
-                reason: "target_unavailable",
-                detail: `no target '${input.targetId}' is registered on this server`,
-              });
-            }
-            /*
-             * The agent the conversation runs as, from the row: pinned when its first message
-             * was sent, so the successor — resumed or fresh — runs as the same one. Refused
-             * rather than defaulted when this server does not define it, because opening the
-             * conversation as some other agent is a substitution nobody chose.
-             */
-            const agent = importSessionAgent(row.agentId);
-            if (agent === undefined) {
-              return yield* new ImporterConversationRefused({
-                reason: "agent_unavailable",
-                // The replay's sentence for the same row (`importerHistory.ts`), so the
-                // composer was already disabled on it with these words.
-                detail: agentUnavailableDetail(input.importId, row.agentId),
-              });
-            }
-            /*
-             * The earlier session's pages, carried forward: they were the operator's, and
-             * this is the same conversation. From memory when this process still holds the
-             * old import's list (a refused prompt), and from the row (`0029`) when it does
-             * not (a restart). Bounded by the shared cap in `startWith`.
-             */
-            const earlierPages = widenPages(
-              (yield* progress.linksOf(input.importId)) ?? [],
-              row.pages ?? [],
-            ).pages;
-            /*
-             * Resume the conversation, or open a new one, according to what the harness
-             * actually still holds (S6).
-             *
-             * The same function the replay route answers `continuation` with, so what the
-             * composer was told and what happens here cannot disagree — which is the whole
-             * point of it being a function rather than a branch in each place. It never
-             * fails: a harness that cannot be asked, a transcript that was swept, a session
-             * killed before its first prompt, a directory this server did not make — all
-             * four are a fresh session, with the reason in the sentence.
-             */
-            const reopen = yield* importerReopenFor({
-              resolver,
-              targetId: input.targetId,
-              harnessSessionId: row.harnessSessionId,
-              harnessInstanceId: row.harnessInstanceId,
-              importDirectory: fleet.paths.importDirectory,
-            });
-            const { entry, started } = yield* openWith({
-              targetId: input.targetId,
-              targetName: target.name,
-              workspacePath: target.workspacePath ?? null,
-              links: [],
-              message: input.text,
-              ...(input.uploads === undefined
-                ? {}
-                : { uploads: input.uploads }),
-              earlierPages,
-              predecessor: input.importId,
-              agent,
-              ...(reopen._tag === "resume"
-                ? {
-                    resume: {
-                      sessionId: reopen.sessionId,
-                      directoryImportId: reopen.directoryImportId,
-                    },
-                  }
-                : {}),
-              // The same harness the earlier session ran on, and the model it is on now —
-              // the last `switchModel`'s, or the one it opened with — so the conversation
-              // does not quietly change models under the operator. A row from before
-              // instances were recorded has nothing to pin, and D15's rule applies.
-              //
-              // V2(chat): the row holds only the session's *current* model and options.
-              // V1 model switching (within the pinned harness) overwrites them in place and
-              // records no history of when a switch happened, so a reload knows the model a
-              // session ended on and nothing about the turns before. Proper V2: an
-              // append-only switch log keyed by session, so the transcript can mark each
-              // switch, plus cross-harness handoff that carries the graph, the agent
-              // definition and a summary of the conversation into a new harness session.
-              ...(row.harnessInstanceId === null
-                ? {}
-                : {
-                    choice: {
-                      instanceId: row.harnessInstanceId,
-                      model: row.model,
-                      // And the same setting of it (`0028`): a reopen that dropped the
-                      // operator's reasoning choice would be a silent downgrade.
-                      ...(row.modelOptions === null
-                        ? {}
-                        : { modelOptions: row.modelOptions }),
-                    },
-                  }),
-            });
-            const carried = started.pagesCarried.length;
-            const pages =
-              carried === 0
-                ? ""
-                : `, and the ${carried === 1 ? "page" : `${String(carried)} pages`} you gave it ${carried === 1 ? "is" : "are"} carried forward`;
-            return accepted(
-              entry,
-              reopen._tag === "resume" ? "resumed" : "opened",
-              reopen._tag === "resume"
-                ? // One conversation, a second authority period. The session id is the same
-                  // one — which is why the session list still shows one row — and the import
-                  // id is not, because an import id names one authority period (`0027`).
-                  `Import ${input.importId}'s authority is not held by this server — ${notHeldBecause(row.endedReason)} — so this message took the conversation back over under import ${entry.id}. The session itself is the same one: ${reopen.detail}, and the importer in it has its own history${pages}.`
-                : `Import ${input.importId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — and could not be carried on: ${reopen.detail}. So this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate${pages}.`,
-              { added: started.pagesAdded, notAdded: started.pagesNotAdded },
-            );
-          }),
+        const { entry, started } = yield* openWith({
+          targetId: input.targetId,
+          targetName: target.name,
+          workspacePath: target.workspacePath ?? null,
+          links: [],
+          message: input.text,
+          ...(input.uploads === undefined ? {} : { uploads: input.uploads }),
+          earlierPages,
+          predecessor: input.conversationId,
+          agent,
+          ...(decided._tag === "resume"
+            ? {
+                resume: {
+                  sessionId: decided.sessionId,
+                  directoryImportId: decided.directoryImportId,
+                },
+              }
+            : {}),
+          // The same harness the earlier session ran on, and the model it is on now — the
+          // last switch's, or the one it opened with — and the same setting of it (`0028`).
+          //
+          // V2(chat): the row holds only the session's *current* model and options, so a
+          // reload knows the model a session ended on and nothing about the turns before.
+          // Proper V2: an append-only switch log keyed by session, plus cross-harness
+          // handoff that carries the graph, the agent and a summary into a new session.
+          ...(row.harnessInstanceId === null
+            ? {}
+            : {
+                choice: {
+                  instanceId: row.harnessInstanceId,
+                  model: row.model,
+                  ...(row.modelOptions === null
+                    ? {}
+                    : { modelOptions: row.modelOptions }),
+                },
+              }),
+        });
+        const carried = started.pagesCarried.length;
+        const pages =
+          carried === 0
+            ? ""
+            : `, and the ${carried === 1 ? "page" : `${String(carried)} pages`} you gave it ${carried === 1 ? "is" : "are"} carried forward`;
+        return turnAccepted(
+          conversations.acceptedOf(
+            entry,
+            decided._tag === "resume" ? "resumed" : "opened",
+            decided._tag === "resume"
+              ? // One conversation, a second authority period: the same session id, a new
+                // import id, because an import id names one authority period (`0027`).
+                `Import ${input.conversationId}'s authority is not held by this server — ${notHeldBecause(row.endedReason)} — so this message took the conversation back over under import ${entry.id}. The session itself is the same one: ${decided.detail}, and the importer in it has its own history${pages}.`
+              : `Import ${input.conversationId}'s session is not held by this server — ${notHeldBecause(row.endedReason)} — and could not be carried on: ${decided.detail}. So this message opened a new session, under import ${entry.id}. The importer in it has not read the earlier session; what that session wrote is on the Scope tab and in the Estate${pages}.`,
+          ),
+          { added: started.pagesAdded, notAdded: started.pagesNotAdded },
         );
       });
 
       /**
-       * The replay: this process's answer to `live`, and the harness's to everything else.
-       *
-       * `sessions.get` rather than `ready`: an entry that is published and not yet preambled
-       * is still a session **this process holds**, which is what `live` means, and this
-       * describes a session rather than delivering into one.
+       * The replay: the harness's transcript (`importerConversation`), with what the core
+       * holds beside it — the messages not yet written, and the question waiting now.
        */
       const replay: ScopeImporter["Service"]["replay"] = Effect.fn(
         "ScopeImporter.replay",
       )(function* (input) {
-        const held = sessions.get(input.importId);
-        /*
-         * What this process holds of the session's steers, read **before** the transcript
-         * (A6 U4 review 2): a message accepted before this read is here, and stays here
-         * until a read has found it written, or the session idles or closes — so whether the
-         * transcript below has written it yet or not, it is in one of the two. Which one is
-         * decided by id, not by when.
-         */
-        const pending = [
-          ...(steers.get(input.importId)?.queued.values() ?? []),
-        ];
-        /*
-         * The ids the **whole** transcript holds, not only the newest `limit` items this
-         * answer keeps (A6 U4 review 3): a steer whose copy is older than the window is
-         * written all the same, and joined to the window alone it was put back at the end.
-         */
-        let written: ReadonlySet<string> = new Set();
-        const view = yield* importerConversation({
-          resolver,
-          targetId: input.targetId,
-          importId: input.importId,
-          recorded: input.recorded,
-          liveSessionId: held?.sessionId,
-          liveDirectory: held?.directory,
-          importDirectory: fleet.paths.importDirectory,
-          ...(input.limit === undefined ? {} : { limit: input.limit }),
-          ...(input.fetchTimeout === undefined
-            ? {}
-            : { fetchTimeout: input.fetchTimeout }),
-          onTranscript: (ids) => {
-            written = ids;
-          },
-        });
-        /*
-         * A message a read has found written is no longer this process's to hold (review 3):
-         * the transcript has it, and a compaction that later summarises it away must not put
-         * it back at the end. Race-free where review 2's removal was not: a read that then
-         * misses it in `pending` read `steers` after this removal, which came after this
-         * transcript held it — so its own transcript read, later still, holds it too, unless
-         * the harness has since dropped it, which is the case this is for.
-         */
-        if (view.live) {
-          const holding = steers.get(input.importId)?.queued;
-          for (const id of written) holding?.delete(id);
-        }
-        return {
-          ...view,
-          queued: view.live
-            ? pending
-                .filter((message) => !written.has(message.messageId))
-                .sort((left, right) => left.acceptedAt - right.acceptedAt)
-            : [],
-          question: yield* questionNow(input.importId, held, view.question),
-        };
-      });
-
-      /**
-       * Question ids read back from a transcript that the operator put away (A7-Q), by
-       * harness session: the replay stops offering them. In this process's memory only.
-       *
-       * V2(chat): a restart forgets them, so a question the operator dismissed after its
-       * request was already gone is offered again (as a message) until they write again.
-       * Proper V2 keeps the dismissal beside the import's row.
-       */
-      const putAway = new Map<string, Set<string>>();
-
-      /**
-       * The question a replay offers (A7-Q): the newest one the harness is still waiting
-       * on, as `live`, when this process holds the session; otherwise what the transcript
-       * ends on (`importerConversation`), unless the operator put it away.
-       *
-       * A harness that cannot be asked leaves the transcript's answer standing: a question
-       * it may still hold is offered as a message rather than not at all.
-       */
-      const questionNow = Effect.fnUntraced(function* (
-        importId: string,
-        held: LiveAgentSession<ImportSessionMeta> | undefined,
-        fromTranscript: PendingQuestion | null,
-      ) {
-        if (held !== undefined) {
-          const asked = yield* Effect.result(
-            held.harness.pendingQuestions(held.sessionId),
-          );
-          const newest =
-            asked._tag === "Success" ? asked.success.at(-1) : undefined;
-          if (newest !== undefined) {
-            return pendingQuestionView({
-              question: newest,
-              harnessSessionId: held.sessionId,
-              subject: {
-                attemptId: null,
-                roundId: null,
-                goalId: null,
-                importId,
-              },
-              answerability: "live",
-            });
-          }
-        }
-        if (fromTranscript === null) return null;
-        return putAway
-          .get(fromTranscript.harnessSessionId)
-          ?.has(fromTranscript.questionId) === true
-          ? null
-          : fromTranscript;
-      });
-
-      /** The import ids a switch has claimed (`switchFrom`). */
-      const switchingImports = new Set<string>();
-
-      /**
-       * The import a switch addressed to `importId` lands on, decided under that id's reopen
-       * permit.
-       *
-       * **The permit is the point.** A message to an import that is not live reopens it
-       * under this permit, reading the row's model and opening a successor on it — under
-       * the successor's opening permit, not this id's, so the spine's claim does not cover
-       * it. A switch that wrote this row while the message held the permit would answer
-       * success and be lost: the successor would open on the model read before it. So a
-       * switch takes the same permit, and the reopen re-reads the row inside it (`send`).
-       * Lock order is reopen → opening, as `send`'s; along a chain, predecessor before
-       * successor, as `send` follows it.
-       *
-       * Inside the permit no successor can be added to this id — only a reopen under it
-       * mints one — but one can be taken back, when its open fails. So a successor still
-       * opening is waited on, and followed only if it is still the successor once its open
-       * is known; taken back, the next message reopens from this id's row, which is the one
-       * to switch.
-       */
-      const switchFrom = (
-        importId: string,
-        input: Parameters<ScopeImporter["Service"]["switchModel"]>[0],
-      ): ReturnType<ScopeImporter["Service"]["switchModel"]> =>
-        /*
-         * Claimed before the permit, and refused when another switch holds it: the permit
-         * makes a switch wait for a reopen, and must not make it queue behind another
-         * switch, which the spine refuses rather than queues (`LiveAgentSessions.switchModel`
-         * says why). Claimed on every id along the chain, so a switch addressed to the
-         * predecessor and one addressed to its successor meet on the successor's claim.
-         */
-        Effect.acquireUseRelease(
-          Effect.sync(() => {
-            if (switchingImports.has(importId)) return false;
-            switchingImports.add(importId);
-            return true;
-          }),
-          (claimed) =>
-            claimed
-              ? Semaphore.withPermit(reopenLock(importId))(
-                  Effect.gen(function* () {
-                    const successor = successors.get(importId);
-                    if (successor !== undefined) {
-                      const following = inFlight.get(successor);
-                      if (following !== undefined) {
-                        yield* Deferred.await(following.known);
-                      }
-                      if (successors.get(importId) === successor) {
-                        return yield* switchFrom(successor, input);
-                      }
-                    }
-                    // The newest run after a restart, which `successors` no longer knows
-                    // (`newerRun`). A row of another target, or none, is `switchOne`'s to
-                    // refuse as not found.
-                    const row = yield* withTargetStore(
-                      stores,
-                      input.targetId,
-                      (store) => store.importSession(importId),
-                    ).pipe(
-                      Effect.mapError(
-                        (failure) =>
-                          new ConversationModelRefused({
-                            reason: "store_unavailable",
-                            detail: `import ${importId}'s record could not be read (${failure.message}), so nothing was switched.`,
-                          }),
-                      ),
-                    );
-                    const newer =
-                      row === undefined || row.targetId !== input.targetId
-                        ? undefined
-                        : newerRun(importId, row);
-                    if (newer !== undefined) {
-                      return yield* switchFrom(newer, input);
-                    }
-                    return yield* switchOne(importId, input);
-                  }),
-                )
-              : Effect.fail(
-                  modelSwitchRefusal(
-                    { _tag: "ModelSwitchInFlight" },
-                    {
-                      what: `import ${importId}`,
-                      model: input.model,
-                      previous: null,
-                    },
-                  ),
-                ),
-          (claimed) =>
-            claimed
-              ? Effect.sync(() => {
-                  switchingImports.delete(importId);
-                })
-              : Effect.void,
-        );
-
-      const switchModel: ScopeImporter["Service"]["switchModel"] = Effect.fn(
-        "ScopeImporter.switchModel",
-      )(function* (input) {
-        return yield* switchFrom(input.importId, input);
-      });
-
-      /** One import's switch, once {@link switchFrom} has decided it is this one. */
-      const switchOne = Effect.fn("ScopeImporter.switchOne")(function* (
-        importId: string,
-        input: Parameters<ScopeImporter["Service"]["switchModel"]>[0],
-      ) {
-        /*
-         * Still opening: wait until the open is known (`inFlight`), as a message does. The
-         * opener wrote the row with the model it is opening on and does not read it again,
-         * so a row switched in that window would be a change the session never saw.
-         */
-        const opening = inFlight.get(importId);
-        if (opening !== undefined && opening.targetId === input.targetId) {
-          yield* Deferred.await(opening.known);
-        }
-        const what = `import ${importId}`;
-        // Read inside the claim, for the answer and for the uncertain answer's sentence. A
-        // holder rather than two `let`s, which narrowing would read as never assigned.
-        const decided: {
-          previous: string | null;
-          answer:
-            | {
-                readonly checked: CheckedModelSwitch;
-                readonly changed: boolean;
-              }
-            | undefined;
-        } = { previous: null, answer: undefined };
-        const applied = yield* Effect.result(
-          sessions.switchModel({
-            id: importId,
-            prepare: Effect.gen(function* () {
-              const row = yield* withTargetStore(
-                stores,
-                input.targetId,
-                (store) => store.importSession(importId),
-              ).pipe(
-                Effect.mapError(
-                  (failure) =>
-                    new ConversationModelRefused({
-                      reason: "store_unavailable",
-                      detail: `${what}'s record could not be read (${failure.message}), so nothing was switched.`,
-                    }),
-                ),
-              );
-              if (row === undefined || row.targetId !== input.targetId) {
-                return yield* new ScopeImportNotFound({
-                  reason: "unknown_import",
-                  importId: input.importId,
-                  detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no session to switch`,
-                });
-              }
-              if (row.endedReason === "operator") {
-                return yield* new ConversationModelRefused({
-                  reason: "conversation_ended",
-                  detail: `${what} was ended by the operator, so nothing will run on it again and there is no model to switch. Start a new session to carry on.`,
-                });
-              }
-              if (row.harnessInstanceId === null) {
-                return yield* new ConversationModelRefused({
-                  reason: "no_session",
-                  detail: `${what} was recorded before its harness instance was, so there is no pinned harness to switch within.`,
-                });
-              }
-              decided.previous = row.model;
-              const checked = yield* checkModelSwitch({
-                resolver,
-                instanceId: row.harnessInstanceId,
-                model: input.model,
-                requested: input.modelOptions,
-                what,
-              });
-              const changed = !sameModelChoice(row, checked);
-              decided.answer = { checked, changed };
-              return {
-                instanceId: checked.instanceId,
-                model: checked.model,
-                options: checked.options,
-                // The importer's meta is the agent it runs as, which a switch does not touch.
-                meta: (meta: ImportSessionMeta) => meta,
-                record: (
-                  entry: LiveAgentSession<ImportSessionMeta> | undefined,
-                ) =>
-                  Effect.gen(function* () {
-                    // The panel names the model the session runs, so it follows a live
-                    // switch; with no live session it already shows the one it ran on.
-                    if (entry !== undefined) {
-                      yield* progress.switchModel(importId, checked.model);
-                    }
-                    if (!changed) return;
-                    yield* withTargetStore(stores, input.targetId, (store) =>
-                      store.recordImportSessionModel({
-                        importId,
-                        model: checked.model,
-                        modelOptions: checked.options,
-                      }),
-                    ).pipe(
-                      Effect.mapError((failure) =>
-                        recordRefusal({
-                          what,
-                          model: checked.model,
-                          harnessMoved: entry !== undefined,
-                          detail: failure.message,
-                        }),
-                      ),
-                      // Nothing written is not a switch recorded: the row `prepare` read is
-                      // gone from this target's file, so a reopen would not open on it.
-                      Effect.flatMap((written) =>
-                        written
-                          ? Effect.void
-                          : Effect.fail(
-                              recordRefusal({
-                                what,
-                                model: checked.model,
-                                harnessMoved: entry !== undefined,
-                                detail: `this target's file no longer holds ${what}'s record`,
-                              }),
-                            ),
-                      ),
-                    );
-                  }),
-              };
+        const { view, queued, question } = yield* conversations.replay({
+          id: input.importId,
+          fromTranscript: (read: ImporterConversationView) => read.question,
+          read: (held, onTranscript) =>
+            importerConversation({
+              resolver,
+              targetId: input.targetId,
+              importId: input.importId,
+              recorded: input.recorded,
+              liveSessionId: held?.sessionId,
+              liveDirectory: held?.directory,
+              importDirectory: fleet.paths.importDirectory,
+              ...(input.limit === undefined ? {} : { limit: input.limit }),
+              ...(input.fetchTimeout === undefined
+                ? {}
+                : { fetchTimeout: input.fetchTimeout }),
+              onTranscript,
             }),
-          }),
-        );
-        if (applied._tag === "Failure") {
-          const failure = applied.failure;
-          return yield* failure._tag === "ModelSwitchInFlight" ||
-          failure._tag === "ModelSwitchUncertain" ||
-          failure._tag === "ModelSwitchStale"
-            ? Effect.fail(
-                modelSwitchRefusal(failure, {
-                  what,
-                  model: input.model,
-                  previous: decided.previous,
-                }),
-              )
-            : Effect.fail(failure);
-        }
-        const answer = decided.answer;
-        if (answer === undefined) {
-          // Unreachable: a switch that succeeded ran `prepare`.
-          return yield* new ConversationModelRefused({
-            reason: "store_unavailable",
-            detail: `${what}'s switch answered without a plan, so nothing is known to have changed.`,
-          });
-        }
-        return modelSwitched({
-          conversationId: importId,
-          checked: answer.checked,
-          applied: applied.success,
-          changed: answer.changed,
         });
+        return { ...view, queued: [...queued], question };
       });
 
-      /**
-       * The import holding the session now, from the newest run the rows know of: whatever
-       * this process has opened after it. An open still in flight is waited for, so a Stop
-       * pressed as a reopen lands reaches the session it opened rather than finding none.
-       * The chain only ever runs forward (a successor is minted after its predecessor), so
-       * this ends.
-       */
-      const holdingNow = Effect.fnUntraced(function* (from: string) {
-        let importId = from;
-        for (;;) {
-          const opening = inFlight.get(importId);
-          if (opening !== undefined) yield* Deferred.await(opening.known);
-          const next = successors.get(importId);
-          if (next === undefined) break;
-          importId = next;
-        }
-        return importId;
-      });
-
-      const activity: ScopeImporter["Service"]["activity"] = Effect.fn(
-        "ScopeImporter.activity",
-      )(function* (input) {
-        const read = yield* Effect.result(
-          withTargetStore(stores, input.targetId, (store) =>
-            store.importSession(input.importId),
-          ),
-        );
-        if (read._tag === "Failure") {
-          yield* Effect.logWarning(
-            "an import's record could not be read for its activity; answering for the import addressed",
-            { importId: input.importId, detail: read.failure.message },
-          );
-        }
-        const row = read._tag === "Success" ? read.success : undefined;
-        if (
-          read._tag === "Success" &&
-          (row === undefined || row.targetId !== input.targetId)
-        ) {
-          return yield* new ScopeImportNotFound({
-            reason: "unknown_import",
-            importId: input.importId,
-            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so nothing of it is running`,
-          });
-        }
-        const importId = yield* holdingNow(
-          (row === undefined ? undefined : newerRun(input.importId, row)) ??
-            input.importId,
-        );
-        const found = yield* sessions.status(importId);
-        if (found._tag === "not_live") {
-          return {
-            conversationId: importId,
-            turn: "not_live",
-            background: false,
-          };
-        }
-        /*
-         * Running while the import is, too: from a message's acceptance until its settle has
-         * read the closing report, which the session list's `running` reports. So this answer
-         * says "running" whenever the list does, and a screen reading both never sees the
-         * list call a turn running that this calls over.
-         */
-        const view = yield* progress.view(importId);
-        return {
-          conversationId: importId,
-          turn:
-            found.running || view?.status === "running" ? "running" : "idle",
-          background: found.background,
-        };
-      });
-
-      const context: ScopeImporter["Service"]["context"] = Effect.fn(
-        "ScopeImporter.context",
-      )(function* (input) {
-        const readRow = (importId: string) =>
-          Effect.result(
-            withTargetStore(stores, input.targetId, (store) =>
-              store.importSession(importId),
-            ),
-          );
-        const read = yield* readRow(input.importId);
-        const addressed = read._tag === "Success" ? read.success : undefined;
-        if (
-          read._tag === "Success" &&
-          (addressed === undefined || addressed.targetId !== input.targetId)
-        ) {
-          return yield* new ScopeImportNotFound({
-            reason: "unknown_import",
-            importId: input.importId,
-            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no context to measure`,
-          });
-        }
-        const importId = yield* holdingNow(
-          (addressed === undefined
-            ? undefined
-            : newerRun(input.importId, addressed)) ?? input.importId,
-        );
-        // The successor's own row: its harness session and model are the conversation's now.
-        const row =
-          importId === input.importId
-            ? addressed
-            : yield* Effect.map(readRow(importId), (again) =>
-                again._tag === "Success" &&
-                again.success?.targetId === input.targetId
-                  ? again.success
-                  : addressed,
-              );
-        /*
-         * Stamped once the harness has answered, not when it was asked (A6 U9 review): a
-         * `full` count takes about a second, and stamped at the asking, one asked mid-turn
-         * would read as older than the turn-end reading that overtook it, though it saw at
-         * least as much.
-         */
-        const unread = (model: string) =>
-          Effect.map(
-            Clock.currentTimeMillis,
-            (measuredAt): ConversationContext => ({
-              conversationId: importId,
-              model,
-              used: null,
-              usedModel: null,
-              window: null,
-              reading: "unread",
-              breakdown: { _tag: "none", reason: "unanswered" },
-              measuredAt,
-            }),
-          );
-        if (row === undefined) return yield* unread("");
-        const answered = yield* Effect.result(
-          Effect.flatMap(
-            resolver.resolve(row.harnessInstanceId ?? undefined),
-            ({ harness }) =>
-              harness.contextUsage(row.harnessSessionId, {
-                model: row.model,
-                breakdown: input.breakdown,
-              }),
-          ),
-        );
-        if (answered._tag === "Failure") {
-          yield* Effect.logDebug(
-            "an import's harness could not report its context; answering unread",
-            { importId, detail: answered.failure.message },
-          );
-          return yield* unread(row.model);
-        }
-        // The window's model as the harness answered it, where it said (A6 U9 review 2):
-        // the row is written only once a switch has returned.
-        const { model, ...usage } = answered.success;
-        return {
-          conversationId: importId,
-          model: model ?? row.model,
-          ...usage,
-          measuredAt: yield* Clock.currentTimeMillis,
-        };
-      });
-
-      /**
-       * The import a question is addressed through, and the session holding it now: the
-       * row read against the target, then followed to the newest run and any successor, as
-       * a Stop is. `undefined` for the session when this process holds none.
-       */
-      const questionSession = Effect.fnUntraced(function* (
-        input: {
-          readonly targetId: string;
-          readonly importId: string;
-          readonly questionId: string;
-        },
-        how: "answer" | "dismiss",
-      ) {
-        const row = yield* withTargetStore(stores, input.targetId, (store) =>
-          store.importSession(input.importId),
-        ).pipe(
-          Effect.mapError(
-            (failure) =>
-              new QuestionRefused({
-                questionId: input.questionId,
-                reason: "harness_unreachable",
-                detail: `import ${input.importId}'s record could not be read (${failure.message}), so the question was not ${how === "answer" ? "answered" : "dismissed"}.`,
-              }),
-          ),
-        );
-        if (row === undefined || row.targetId !== input.targetId) {
-          return yield* new ScopeImportNotFound({
-            reason: "unknown_import",
-            importId: input.importId,
-            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no question to answer`,
-          });
-        }
-        const importId = yield* holdingNow(
-          newerRun(input.importId, row) ?? input.importId,
-        );
-        return {
-          harnessSessionId: row.harnessSessionId,
-          held: sessions.get(importId),
-        };
-      });
-
-      const notWaiting = (questionId: string): QuestionRefused =>
-        new QuestionRefused({
-          questionId,
-          reason: "settled",
-          detail:
-            "The agent is no longer waiting on these questions: they were answered or dismissed, a Stop withdrew them, or the session was let go. Send your answers as a message instead.",
-        });
-
-      /** A harness's refusal of an answer or dismissal, as the route's. */
-      const questionRefusal =
-        (questionId: string, how: "answer" | "dismiss") =>
-        (failure: HarnessFailure | QuestionNotPending): QuestionRefused =>
-          failure._tag === "QuestionNotPending"
-            ? failure.reason === "settled"
-              ? notWaiting(questionId)
-              : new QuestionRefused({
-                  questionId,
-                  reason: failure.reason,
-                  detail: failure.detail,
-                })
-            : new QuestionRefused({
-                questionId,
-                reason: "harness_unreachable",
-                detail:
-                  how === "answer"
-                    ? `the harness did not answer (${failure.message}), so whether it took this is not known. Your answers are kept; try again.`
-                    : `the harness did not answer (${failure.message}), so whether the agent was told you declined is not known.`,
-              });
-
-      const answerQuestion: ScopeImporter["Service"]["answerQuestion"] =
-        Effect.fn("ScopeImporter.answerQuestion")(function* (input) {
-          const { held } = yield* questionSession(input, "answer");
-          if (held === undefined) {
-            return yield* notWaiting(input.questionId);
-          }
-          const asked = yield* held.harness
-            .pendingQuestions(held.sessionId)
-            .pipe(Effect.mapError(questionRefusal(input.questionId, "answer")));
-          const question = asked.find(
-            (candidate) => candidate.questionId === input.questionId,
-          );
-          if (question === undefined) {
-            return yield* notWaiting(input.questionId);
-          }
-          const problem = questionAnswersProblem(
-            question.fields,
-            input.answers,
-          );
-          if (problem !== null) {
-            return yield* new QuestionRefused({
-              questionId: input.questionId,
-              reason: "invalid",
-              detail: problem,
-            });
-          }
-          yield* held.harness
-            .answerQuestion(held.sessionId, input.questionId, input.answers)
-            .pipe(Effect.mapError(questionRefusal(input.questionId, "answer")));
-          return { questionId: input.questionId, settled: "answered" as const };
-        });
-
-      /** The questions being asked after now (`recheckQuestion`), by session and id. */
-      const rechecking = new Set<string>();
-
-      /**
-       * Asks the harness again, in the background, whether a question whose dismissal it
-       * did not answer still waits, and says what it finds on the session's live stream
-       * (A7-Q review 2).
-       *
-       * **Why it is needed.** The page puts such a question away, since the operator has
-       * declined and a dock that cannot be put away would hold the box hostage. Whether the
-       * harness heard is not known, and a harness that comes back without breaking its
-       * connection says nothing: a paused `opencode serve` (SIGSTOP) keeps the event socket
-       * open, so no `restored` ever comes and nothing re-lists its forms, while the form it
-       * still waits on holds every later message unprocessed. Measured on 2.2.5.
-       *
-       * So the harness's own list is read again, backing off ({@link QuestionRecheck}) and
-       * for a bounded time: the question still listed is published again as a `question`,
-       * which the page docks; not listed, a `questionSettled` (`withdrawn`), which takes it
-       * out of Needs you. A list that keeps failing for the whole window says nothing, and
-       * the page's words for the dismissal tell the operator to reload to check.
-       *
-       * **Forked into the session's scope**, so the session ending — its close, a Stop of
-       * the import, this server going down — interrupts it. One per question at a time: a
-       * second refused dismissal of the same question while one is asking adds nothing.
-       *
-       * V2(chat): the window is fixed. A harness paused for longer is found again only by a
-       * reload's replay (or the operator writing, which the form then holds).
-       */
-      const recheckQuestion = (
-        held: LiveAgentSession<ImportSessionMeta>,
-        targetId: string,
-        questionId: string,
-      ) => {
-        const key = `${held.sessionId}\u0000${questionId}`;
-        /*
-         * **Said only while this server still holds the session** (A7-S review 1). The
-         * session's close takes this fiber's scope down last, after it has ended the harness
-         * session — which, on a paused harness, waits — so a list that came back in between
-         * would dock a question on an import already ended, after its `closed`. The live map
-         * is emptied first thing in a close, so it is what says the import is over.
-         */
-        const say = (detail: HarnessNarration["detail"]) =>
-          Effect.suspend(() =>
-            sessions.get(held.id)?.scope !== held.scope
-              ? Effect.logDebug(
-                  "a question re-checked after its session was let go of is not said again",
-                  { importId: held.id, questionId },
-                )
-              : narrations.publish({
-                  targetId,
-                  subject: { _tag: "import", importId: held.id },
-                  harnessSessionId: held.sessionId,
-                  entry: {
-                    type: "bit.question.rechecked",
-                    sequence: undefined,
-                    at: Date.now(),
-                    outcome: undefined,
-                    detail,
-                  },
-                }),
-          );
-        const found = (asked: readonly HarnessQuestion[]) => {
-          const question = asked.find(
-            (candidate) => candidate.questionId === questionId,
-          );
-          return question !== undefined
-            ? say({ _tag: "question", question })
-            : say({
-                _tag: "questionSettled",
-                questionId,
-                settled: "withdrawn",
-              });
-        };
-        const asking = Effect.suspend(() => {
-          if (rechecking.has(key)) return Effect.void;
-          rechecking.add(key);
-          return Effect.sleep(recheck.first).pipe(
-            Effect.andThen(held.harness.pendingQuestions(held.sessionId)),
-            Effect.retry(
-              Schedule.min([
-                Schedule.exponential(recheck.first, 2),
-                Schedule.spaced(recheck.most),
-              ]).pipe(Schedule.upTo({ duration: recheck.window })),
-            ),
-            Effect.flatMap(found),
-            Effect.catch((failure) =>
-              Effect.logWarning(
-                "a question whose dismissal the harness did not answer could not be read back; the page says to reload to check",
-                {
-                  importId: held.id,
-                  questionId,
-                  detail: failure.message,
-                },
-              ),
-            ),
-            Effect.ensuring(
-              Effect.sync(() => {
-                rechecking.delete(key);
-              }),
-            ),
-          );
-        });
-        return Effect.asVoid(Effect.forkIn(asking, held.scope));
-      };
-
-      const dismissQuestion: ScopeImporter["Service"]["dismissQuestion"] =
-        Effect.fn("ScopeImporter.dismissQuestion")(function* (input) {
-          const { harnessSessionId, held } = yield* questionSession(
-            input,
-            "dismiss",
-          );
-          // Read back from a transcript: nothing native to cancel, so it is put away.
-          if (input.questionId.startsWith(transcriptQuestionId(""))) {
-            const set = putAway.get(harnessSessionId) ?? new Set<string>();
-            set.add(input.questionId);
-            putAway.set(harnessSessionId, set);
-            return {
-              questionId: input.questionId,
-              settled: "dismissed" as const,
-            };
-          }
-          if (held === undefined) {
-            return yield* notWaiting(input.questionId);
-          }
-          yield* held.harness
-            .dismissQuestion(held.sessionId, input.questionId)
-            .pipe(
-              Effect.mapError(questionRefusal(input.questionId, "dismiss")),
-              // Not told, perhaps: asked again until it is known (`recheckQuestion`).
-              Effect.tapError((refusal) =>
-                refusal.reason === "harness_unreachable"
-                  ? recheckQuestion(held, input.targetId, input.questionId)
-                  : Effect.void,
-              ),
-            );
-          return {
-            questionId: input.questionId,
-            settled: "dismissed" as const,
-          };
-        });
-
-      const stopTurn: ScopeImporter["Service"]["stopTurn"] = Effect.fn(
-        "ScopeImporter.stopTurn",
-      )(function* (input) {
-        const row = yield* withTargetStore(stores, input.targetId, (store) =>
-          store.importSession(input.importId),
-        ).pipe(
-          Effect.mapError(
-            (failure) =>
-              new ConversationStopRefused({
-                reason: "store_unavailable",
-                detail: `import ${input.importId}'s record could not be read (${failure.message}), so nothing was stopped.`,
-              }),
-          ),
-        );
-        if (row === undefined || row.targetId !== input.targetId) {
-          return yield* new ScopeImportNotFound({
-            reason: "unknown_import",
-            importId: input.importId,
-            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no turn to stop`,
-          });
-        }
-        const importId = yield* holdingNow(
-          newerRun(input.importId, row) ?? input.importId,
-        );
-        // Named as the operator sees it from its own chat, never by its id (A6 U6 review).
-        const what = "this session";
-        const found = yield* sessions
-          .interrupt(importId)
-          .pipe(Effect.mapError((failure) => turnStopRefusal(failure, what)));
-        return turnStopped({ found, conversationId: importId, what });
-      });
-
-      /** The import holding the session now, for a sub-agent's Stop, as `stopTurn` finds it. */
-      const subagentSession = Effect.fnUntraced(function* (input: {
+      /** The import addressed, as the core's period. */
+      const period = (input: {
         readonly targetId: string;
         readonly importId: string;
-      }) {
-        const row = yield* withTargetStore(stores, input.targetId, (store) =>
-          store.importSession(input.importId),
-        ).pipe(
-          Effect.mapError(
-            (failure) =>
-              new SubagentStopRefused({
-                reason: "store_unavailable",
-                detail: `import ${input.importId}'s record could not be read (${failure.message}), so nothing was stopped.`,
-              }),
-          ),
-        );
-        if (row === undefined || row.targetId !== input.targetId) {
-          return yield* new ScopeImportNotFound({
-            reason: "unknown_import",
-            importId: input.importId,
-            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no sub-agent to stop`,
-          });
-        }
-        const importId = yield* holdingNow(
-          newerRun(input.importId, row) ?? input.importId,
-        );
-        return { importId, held: sessions.get(importId) };
-      });
-
-      const stopSubagent: ScopeImporter["Service"]["stopSubagent"] = Effect.fn(
-        "ScopeImporter.stopSubagent",
-      )(function* (input) {
-        const { importId, held } = yield* subagentSession(input);
-        if (held === undefined) {
-          return yield* new SubagentStopRefused({
-            reason: "not_live",
-            detail:
-              "This server does not hold the session now, so it cannot reach the sub-agent. Reload the page to see where it stands.",
-          });
-        }
-        const answer = yield* held.harness
-          .stopSubagent(held.sessionId, input.callId)
-          .pipe(
-            Effect.mapError(
-              (failure) =>
-                new SubagentStopRefused({
-                  reason: "harness_unreachable",
-                  detail: `The harness did not answer the Stop (${failure.message}), so whether the sub-agent stopped is not known.`,
-                }),
-            ),
-          );
-        if (answer === "not_stoppable") {
-          return yield* new SubagentStopRefused({
-            reason: "not_stoppable",
-            detail:
-              "This sub-agent runs inside the importer's turn: Stop the turn to stop it.",
-          });
-        }
-        if (answer === "not_running") {
-          return yield* new SubagentStopRefused({
-            reason: "not_running",
-            detail:
-              "The sub-agent is no longer running, or this session did not start it.",
-          });
-        }
-        return {
-          conversationId: importId,
-          callId: input.callId,
-          detail:
-            "The sub-agent was stopped. The harness tells the importer, which may answer about it.",
-        };
-      });
-
-      const stopAll: ScopeImporter["Service"]["stopAll"] = Effect.fn(
-        "ScopeImporter.stopAll",
-      )(function* (input) {
-        const found = yield* subagentSession(input).pipe(
-          Effect.mapError((failure) =>
-            failure._tag === "SubagentStopRefused"
-              ? new ConversationStopRefused({
-                  reason: "store_unavailable",
-                  detail: failure.detail,
-                })
-              : failure,
-          ),
-        );
-        const children =
-          found.held === undefined
-            ? undefined
-            : yield* Effect.result(
-                found.held.harness.stopSubagents(found.held.sessionId),
-              );
-        const stopped = yield* stopTurn(input);
-        if (children?._tag === "Failure") {
-          return yield* new ConversationStopRefused({
-            reason: "harness_unreachable",
-            detail: `${stopped.detail} The harness did not answer a sub-agent's Stop (${children.failure.message}), so it may still be running.`,
-          });
-        }
-        return stopped;
-      });
+      }) => ({ targetId: input.targetId, conversationId: input.importId });
 
       return ScopeImporter.of({
         start,
         stop,
         view: progress.view,
         converse,
-        send,
+        send: (input) =>
+          conversations.send({
+            targetId: input.targetId,
+            conversationId: input.importId,
+            text: input.text,
+            urgency: input.urgency,
+            uploads: input.uploads,
+          }),
         replay,
-        switchModel,
-        stopTurn,
-        stopSubagent,
-        stopAll,
-        answerQuestion,
-        dismissQuestion,
-        activity,
-        context,
-        holds: (importId) =>
-          Effect.sync(() => sessions.get(importId) !== undefined),
-        heldSteers: (importId) =>
-          Effect.sync(() => steers.get(importId)?.queued.size ?? 0),
+        switchModel: (input) =>
+          conversations.switchModel({
+            ...period(input),
+            model: input.model,
+            ...(input.modelOptions === undefined
+              ? {}
+              : { modelOptions: input.modelOptions }),
+          }),
+        stopTurn: (input) => conversations.stopTurn(period(input)),
+        stopSubagent: (input) =>
+          conversations.stopSubagent({
+            ...period(input),
+            callId: input.callId,
+          }),
+        stopAll: (input) => conversations.stopAll(period(input)),
+        answerQuestion: (input) =>
+          conversations.answerQuestion({
+            ...period(input),
+            questionId: input.questionId,
+            answers: input.answers,
+          }),
+        dismissQuestion: (input) =>
+          conversations.dismissQuestion({
+            ...period(input),
+            questionId: input.questionId,
+          }),
+        activity: (input) => conversations.activity(period(input)),
+        context: (input) =>
+          conversations.context({
+            ...period(input),
+            breakdown: input.breakdown,
+          }),
+        holds: conversations.holds,
+        heldSteers: conversations.heldSteers,
       });
     }),
   );
