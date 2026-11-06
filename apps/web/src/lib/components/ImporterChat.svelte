@@ -421,7 +421,8 @@
     words: WORDS,
     label: () => `Load the scope for ${target}`,
     endedReason: "import_ended",
-    connection: (importId) => app.liveConnection[`import:${importId}`],
+    connection: (importId) =>
+      app.liveConnection[importer.binding.connectionKey(importId)],
     unavailable: () =>
       noModel
         ? {

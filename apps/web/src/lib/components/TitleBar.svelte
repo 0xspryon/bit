@@ -79,7 +79,7 @@
         : importer.contexts[contextImport],
       contextImport === undefined
         ? undefined
-        : app.liveUsage[`import:${contextImport}`],
+        : app.liveUsage[importer.binding.connectionKey(contextImport)],
     ),
   );
   let sessionRows = $derived(

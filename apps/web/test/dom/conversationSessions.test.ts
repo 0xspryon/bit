@@ -32,6 +32,8 @@ import {
   ConversationSessions,
   type ConversationBinding,
 } from "../../src/lib/conversationSessions.svelte";
+import { usageScope } from "../../src/lib/chat";
+import { IMPORTER_BINDING } from "../../src/lib/importerSessions.svelte";
 import { AT, ok, replayItem } from "../fakeServer";
 import { click, mountInto, press, settle as drawn, type Mounted } from "./dom";
 
@@ -54,6 +56,7 @@ interface ProbeTurn {
 const BINDING: ConversationBinding<ConversationSession> = {
   // A goal's frames: the period is named by `goalId`, never `importId`.
   routeOf: (frame) => frame.goalId,
+  connectionKey: (periodId) => `goal:${periodId}`,
   agent: "goal agent",
   emptySession: (now, id) => ({
     id: id ?? "ses_new",
@@ -444,6 +447,23 @@ describe("the generic chat state through a goal-shaped owner", () => {
     await settle();
     expect(probe.forgotten).toEqual(["gper_1", "gper_2"]);
     expect(probe.state.current?.conversationId).toBe("gper_2");
+  });
+
+  test("a binding's connection key is what the app files the owner's frames under", () => {
+    const subject = {
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: null,
+    };
+    // The app keeps `lost` notices and model calls by `usageScope`; each owner's key for its
+    // period must be that same string, or its notice is never read nor forgotten.
+    expect(BINDING.connectionKey("gper_1")).toBe(
+      usageScope({ ...subject, goalId: "gper_1" }) ?? "",
+    );
+    expect(IMPORTER_BINDING.connectionKey("imp_1")).toBe(
+      usageScope({ ...subject, importId: "imp_1" }) ?? "",
+    );
   });
 
   test("the shell's session says the owner's lost notice, and nothing once it is closed", () => {

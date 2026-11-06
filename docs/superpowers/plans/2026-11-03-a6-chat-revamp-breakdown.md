@@ -1002,9 +1002,13 @@ the importer's proof. The routes stay where they are.
 - **Live frames.** The web routes a frame to a session by `binding.routeOf(frame)`. For the
   importer that is `frame.importId`, which is the period id. Replay/live merging
   (`conversationFeed`) takes the period id and the floors, as `importerFeed` did. The
-  `lost` notice is keyed by `usageScope` (`import:<id>`). It is cleared on `closed`, on an
-  ended row and on an `opened`/`resumed` answer, now inside `conversationServer` rather than
-  in the importer's adapter, so every role gets the same rule.
+  `lost` notice is keyed by `usageScope` (`import:<id>`), which the binding names as
+  `connectionKey`. It is cleared on `closed` (the app's frame dispatch), on an `opened`/
+  `resumed` answer and an ended replay (inside `conversationServer`, so every role gets the
+  same rule), and on an ended index row. That last one stays in the owner's list read in
+  `app.svelte.ts` (`loadImporterSessions`): it forgets on any `endedReason`, and the generic
+  session carries only the operator's end (`ended`), so moving it would need a new session
+  field. A goal's list read does the same in one loop, through its binding's key.
 - **Turn control.** `urgency` (Send now or queued), taken/carried marks, Stop, Stop all,
   sub-agent Stop, activity for turns the harness opens itself, a lost reply (`unanswered`,
   parked words, the confirm loop) and a refused open (a refusal that keeps the words) are
@@ -1064,10 +1068,22 @@ the importer's proof. The routes stay where they are.
 
 - **A frame's period on a multi-session owner.** Frames name `goalId`, `roundId` or
   `attemptId`, not a session. A goal with several sessions (H2b), or a round with several
-  stages (H3), cannot route a frame to one of them by those alone. `routeOf` is the seam.
+  stages (H3), cannot route a frame to one of them by those alone.
   _Recommendation:_ the goal binding publishes under a per-period subject and the frame
   carries an optional `conversationId` (and a stage index for a round).
-  Not added now: nothing would set it.
+  Not added now: nothing would set it. `routeOf` is **not** the only place such a field
+  lands. Each of these reads a frame's ids and must learn it:
+  - `routeOf` on the web binding (`conversationSessions.svelte.ts`), and the read-only
+    mount's `routeOf` (`readOnlyConversation.ts`): which session's thread a frame is in;
+  - `usageScope` (`chat.ts`): the key the app keeps `lost`/`reconnecting` notices
+    (`liveConnection`) and model calls (`liveUsage`, the context meter's live figure) under.
+    Today it is `goal:<goalId>`, one per goal, so two sessions of a goal share one notice;
+  - the binding's `connectionKey`, which must stay equal to `usageScope` of that owner's
+    frames: `#forgetConnection` in `app.svelte.ts` forgets by it, and the chat's
+    connection note reads by it (a test checks both owners);
+  - the app's frame dispatch (`App` in `app.svelte.ts`): `noteTaken`, `noteActivity`,
+    `noteConnection`, `noteQuestion` and `noteUsage` go to `this.importer` only. A goal's
+    `ConversationSessions` has to be called there as well.
 - **Needs your attention clears on answer.** The server's `waiting` set is per narration
   subject. It already clears on `questionSettled`. A goal binding publishing under the goal
   subject gets it.

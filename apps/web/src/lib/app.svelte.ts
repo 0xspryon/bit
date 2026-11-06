@@ -2779,13 +2779,18 @@ export class App {
     // An ended import has no narration stream to be cut off: what was said about its
     // connection is over with it (U13 review 6).
     for (const view of call.value.sessions) {
-      if (view.endedReason !== null) this.#forgetConnection(view.importId);
+      if (view.endedReason !== null) {
+        this.#forgetConnection(
+          this.importer.binding.connectionKey(view.importId),
+        );
+      }
     }
     if (this.importerOpen) this.importer.syncIndexed(this.#indexedSessions());
   }
 
   /**
-   * Drops what the server last said about one import's narration connection (U13 review 6).
+   * Drops what the server last said about one period's narration connection (U13 review
+   * 6), by its key: the owner's binding names it (`ConversationBinding.connectionKey`).
    *
    * A `lost` or `reconnecting` frame is cleared by a later `restored` on the same stream, and
    * otherwise stood until a reload: after the session ended, when nothing is retrying, and
@@ -2794,8 +2799,7 @@ export class App {
    * index row or an `import_ended` replay, and an accepted message that `opened` or
    * `resumed` the session — and each clears the entry here.
    */
-  #forgetConnection(importId: string) {
-    const scope = `import:${importId}`;
+  #forgetConnection(scope: string) {
     if (!(scope in this.liveConnection)) return;
     this.liveConnection = Object.fromEntries(
       Object.entries(this.liveConnection).filter(([key]) => key !== scope),
@@ -2837,7 +2841,8 @@ export class App {
         signOut: () => this.signOut("expired"),
         refusalText: (error, fallback) => this.#refusalText(error, fallback),
         moved: () => this.#agentSessionsMoved(targetId),
-        forgetConnection: (importId) => this.#forgetConnection(importId),
+        forgetConnection: (importId) =>
+          this.#forgetConnection(this.importer.binding.connectionKey(importId)),
         highWater: () => this.#activityHighWater() ?? 0,
         reread: () => this.loadImporterSessions(targetId),
         wait: (ms) =>

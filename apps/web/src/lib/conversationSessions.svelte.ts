@@ -128,6 +128,12 @@ export interface ConversationBinding<S extends ConversationSession> {
     readonly goalId: string | null;
     readonly importId: string | null;
   }) => string | null;
+  /**
+   * The key the app files one period's narration connection and model calls under: what
+   * `usageScope` (`chat.ts`) makes of this owner's frames, `import:<id>` for the importer.
+   * The `lost` notice is read and forgotten by it, and the context meter's live figure.
+   */
+  readonly connectionKey: (conversationId: string) => string;
   /** The agent, as the turns' notes and the switch line name it: `importer`. */
   readonly agent: string;
   /** The page's own empty session, to type a first message into. */
@@ -174,6 +180,7 @@ export const abilitiesOf = (
 /** A binding nothing is routed to, until the constructor installs the real one. */
 const UNBOUND: ConversationBinding<ConversationSession> = {
   routeOf: () => null,
+  connectionKey: (conversationId) => `unbound:${conversationId}`,
   agent: "agent",
   emptySession: () => {
     throw new Error(

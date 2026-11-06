@@ -108,6 +108,8 @@ export const STAND_IN_REPLY =
  */
 export const IMPORTER_BINDING: ConversationBinding<ImporterSession> = {
   routeOf: (frame) => frame.importId,
+  // `usageScope` of a frame naming only `importId`.
+  connectionKey: (importId) => `import:${importId}`,
   agent: IMPORTER_AGENT_NOUN,
   emptySession: (now, id) => mockNewSession(now, id),
   standIn: { headline: "Importer", body: STAND_IN_REPLY },
