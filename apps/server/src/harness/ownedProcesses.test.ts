@@ -17,8 +17,10 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -43,6 +45,82 @@ import {
 /** The approved scratch root for harness probes. */
 const SCRATCH_ROOT = "/tmp/opencode/bit-harness";
 mkdirSync(SCRATCH_ROOT, { recursive: true });
+
+/**
+ * `reap-*` folders a run killed from outside left behind, older than a day, are removed
+ * before this run makes its own (A7-S review 3: as the probes' are in
+ * `openCodeServer.test.ts`). A day, so a run still going in another process keeps its own;
+ * a folder that will not go is left for the next run.
+ */
+const STALE_SCRATCH_AGE = 24 * 60 * 60 * 1000;
+for (const name of readdirSync(SCRATCH_ROOT)) {
+  if (!name.startsWith("reap-")) continue;
+  const folder = join(SCRATCH_ROOT, name);
+  try {
+    if (Date.now() - statSync(folder).mtimeMs > STALE_SCRATCH_AGE) {
+      rmSync(folder, { recursive: true, force: true });
+    }
+  } catch {
+    // Gone already, or not ours to remove.
+  }
+}
+
+/**
+ * A detached watcher that removes `root` once the process `runner` is gone — or is another
+ * process under the same number, told by its start time — polling every 0.2 s, then exits.
+ * What a run killed from outside (`timeout`, an OOM kill) cannot do for itself: it runs no
+ * teardown (A7-S review 3: twelve `reap-*` folders were left). The probes remove their own
+ * folders the same way (`openCodeServer.test.ts`'s `PID_PRELUDE`).
+ */
+const JANITOR = `
+import { readFileSync, rmSync } from "node:fs";
+const arg = (name) => (Bun.argv.find((a) => a.startsWith("--" + name + "=")) ?? "").slice(name.length + 3);
+const root = arg("root");
+const runner = Number(arg("runner"));
+const startOf = (pid) => {
+  try {
+    const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+};
+const started = startOf(runner);
+setInterval(() => {
+  const now = startOf(runner);
+  if (now !== undefined && now === started) return;
+  try { rmSync(root, { recursive: true, force: true }); } catch {}
+  process.exit(0);
+}, 200);
+`;
+
+/** Starts a {@link JANITOR} for `root` and `runner`, outliving the caller. */
+const startJanitor = (root: string, runner: number) => {
+  const janitor = Bun.spawn({
+    // `--` or `bun -e` keeps the arguments for itself (bun 1.4.3).
+    cmd: [
+      process.execPath,
+      "-e",
+      JANITOR,
+      "--",
+      `--root=${root}`,
+      `--runner=${String(runner)}`,
+    ],
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    detached: true,
+  });
+  janitor.unref();
+  return janitor;
+};
+
+/**
+ * This run's own folder, under which every test's scratch is made: removed by its janitor
+ * when this run ends, however it ends.
+ */
+const RUN_ROOT = mkdtempSync(join(SCRATCH_ROOT, "reap-"));
+startJanitor(RUN_ROOT, process.pid);
 
 /** Short enough that escalation is exercised in well under a second. */
 const BOUNDS: ReapBounds = { terminateGrace: 400, killGrace: 1_500, poll: 10 };
@@ -70,7 +148,7 @@ const LOOP_WHILE_RUNNER = `while kill -0 ${String(process.pid)} 2>/dev/null; do 
 const TOOL_WHILE_RUNNER = `sh -c '${LOOP_WHILE_RUNNER}'`;
 
 const scratch = (): string => {
-  const directory = mkdtempSync(join(SCRATCH_ROOT, "reap-"));
+  const directory = mkdtempSync(join(RUN_ROOT, "reap-"));
   scratches.push(directory);
   return directory;
 };
@@ -188,6 +266,30 @@ afterEach(async () => {
   for (const directory of scratches.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+describe("scratch folders (A7-S review 3)", () => {
+  test("a run's folder goes when its runner does, though no teardown ran", async () => {
+    const root = mkdtempSync(join(RUN_ROOT, "janitor-"));
+    writeFileSync(join(root, "ready"), "ready\n");
+    mkdirSync(join(root, "nested"));
+    // A runner that dies without a word, as a run killed from outside does.
+    const runner = Bun.spawn({
+      cmd: ["sh", "-c", "sleep 0.5"],
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    own(runner.pid);
+    const janitor = startJanitor(root, runner.pid);
+    own(janitor.pid);
+    await Bun.sleep(250);
+    // Not while the runner lives.
+    expect(existsSync(root)).toBe(true);
+    await runner.exited;
+    expect(await waitUntil(() => !existsSync(root))).toBe(true);
+    expect(await waitUntil(() => !alive(janitor.pid))).toBe(true);
+  });
 });
 
 describe("ownedProcessDirectory", () => {
