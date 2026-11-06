@@ -866,6 +866,19 @@ interface SessionRecord {
    * answer "nothing was running" while it acts. See {@link trackTask}.
    */
   readonly tasks: Map<string, TrackedTask>;
+  /**
+   * The background sub-agents this process stopped on their own (`stopSubagent`, a card's
+   * Stop), by task id, until the CLI next opens a turn of its own: the turn it opens to tell
+   * the agent (A7-S Step 0). What Stop all reads to arm {@link quellUntil}.
+   */
+  readonly stoppedHere: Set<string>;
+  /**
+   * Until when, in `Date.now()` milliseconds, a turn the CLI opens on its own is stopped as
+   * it opens; 0 when not armed. Armed by Stop all (`stopSubagents`) while
+   * {@link stoppedHere} holds a sub-agent (A7-S review 1): its notification turn was still
+   * to come after the Stop all, ~2.5 s later, and the agent answered about it.
+   */
+  quellUntil: number;
   /** The query has been closed; nothing more will arrive. */
   closed: boolean;
   /**
@@ -954,6 +967,12 @@ export interface ClaudeCodeHarnessOptions {
    */
   readonly cliTreeRefresh?: number;
   /**
+   * How long after a Stop all, in milliseconds, a turn the CLI opens on its own about a
+   * sub-agent a card's Stop stopped is stopped too. Defaults to
+   * {@link DEFAULT_NOTIFICATION_QUELL_MILLIS}; tests shorten it.
+   */
+  readonly notificationQuellMillis?: number;
+  /**
    * How long one `stopTask` may take when a Stop asks it of a background task. Defaults to
    * {@link DEFAULT_TASK_STOP_TIMEOUT}; tests shorten it.
    */
@@ -1024,6 +1043,17 @@ export const DEFAULT_CLI_STOP_BOUNDS: StopBounds = {
  * the A6 breakdown.
  */
 const DEFAULT_CLI_TREE_REFRESH = 1_000;
+
+/**
+ * How long a Stop all keeps stopping the turns the CLI opens on its own, when a card's Stop
+ * had stopped a background sub-agent before it (A7-S review 1). Measured on 2.1.310
+ * (haiku, review 1): a card Stop during a running turn, then Stop all, and the CLI opened
+ * the stopped task's notification turn ~2.5 s after the Stop all. Four times that: a turn
+ * opened later than this runs. The operator's own message is never stopped by it (see
+ * `pump`), and nothing else is left to notify — Stop all stopped every task — so a longer
+ * window costs nothing but a wider bound.
+ */
+const DEFAULT_NOTIFICATION_QUELL_MILLIS = 10_000;
 
 /**
  * How long `switchModel` waits, after a control request **failed** (not timed out), for
@@ -3321,6 +3351,8 @@ export const claudeCodeHarness = (
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
       const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
       const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
+      const notificationQuellMillis =
+        options.notificationQuellMillis ?? DEFAULT_NOTIFICATION_QUELL_MILLIS;
       const taskStopTimeout =
         options.taskStopTimeout ?? DEFAULT_TASK_STOP_TIMEOUT;
       const interruptTimeout =
@@ -3682,6 +3714,37 @@ export const claudeCodeHarness = (
        * reads as `waitFailed`: our stream losing its answer says nothing about what the
        * session did (DECISIONS.md §15), and the prompt is never resubmitted.
        */
+      /**
+       * A turn the CLI opened on its own (no message of the operator's is waiting for an
+       * answer), at its first frame: the notification turn of a sub-agent a card's Stop
+       * stopped, which is that Stop's to tell the agent, so {@link SessionRecord.stoppedHere}
+       * is emptied; and **stopped at once** while a Stop all's window is open
+       * ({@link SessionRecord.quellUntil}), since the operator stopped everything after it.
+       *
+       * The `interrupt()` is the one a Stop sends, marked the same way, so the turn's
+       * `result` reads `interrupted`; it is not waited for, since this is the pump's own
+       * loop, and one the CLI refuses is logged and leaves the turn to run.
+       *
+       * V2(chat): told apart by having no operator message waiting, not by what the turn
+       * is about — the SDK names neither the task nor the notification at the turn's
+       * `system/init`. Inside the window nothing else can open one: Stop all stopped every
+       * task, so none is left to finish and notify.
+       */
+      const quell = (record: SessionRecord, live: HarnessQuery): void => {
+        record.stoppedHere.clear();
+        if (Date.now() >= record.quellUntil) return;
+        record.interrupted = true;
+        record.interruptMoved = false;
+        live.interrupt().catch((cause: unknown) => {
+          void Effect.runPromise(
+            Effect.logWarning(
+              "a Claude Code session would not stop the turn it opened about a sub-agent stopped before a Stop all; the turn runs",
+              { sessionId: record.sessionId, detail: String(cause) },
+            ),
+          ).catch(() => undefined);
+        });
+      };
+
       const pump = (record: SessionRecord): Effect.Effect<void> =>
         Effect.gen(function* () {
           const live = record.query;
@@ -3719,6 +3782,7 @@ export const claudeCodeHarness = (
                     ) {
                       record.idle = Deferred.makeUnsafe<void, HarnessFailure>();
                     }
+                    if (record.unanswered.size === 0) quell(record, live);
                   }
                   if (message.type === "result") {
                     record.outcome = outcome;
@@ -4177,6 +4241,8 @@ export const claudeCodeHarness = (
           interrupted: false,
           interruptMoved: false,
           tasks: new Map<string, TrackedTask>(),
+          stoppedHere: new Set<string>(),
+          quellUntil: 0,
           closed: false,
           cli: undefined,
           stderrTail: "",
@@ -5285,6 +5351,8 @@ export const claudeCodeHarness = (
           return "not_running" as const;
         }
         const live = record.query;
+        // Before asking: the notification turn can open before the answer is read.
+        record.stoppedHere.add(taskId);
         yield* Effect.tryPromise({
           try: () => live.stopTask(taskId),
           catch: (cause) =>
@@ -5307,12 +5375,30 @@ export const claudeCodeHarness = (
       });
 
       /*
-       * Nothing of its own: the turn's Stop asks `interrupt()`, which stops every background
-       * sub-agent with no turn opened after it (A6 F5, measured), where a `stopTask` each
-       * would make the CLI open one per sub-agent. A foreground one goes with its turn.
+       * Nothing stopped of its own: the turn's Stop asks `interrupt()`, which stops every
+       * background sub-agent with no turn opened after it (A6 F5, measured), where a
+       * `stopTask` each would make the CLI open one per sub-agent. A foreground one goes with
+       * its turn.
+       *
+       * **But a sub-agent a card's Stop already stopped has its notification turn still to
+       * come** (A7-S review 1, measured: ~2.5 s after the Stop all, and haiku answered it).
+       * So Stop all arms {@link SessionRecord.quellUntil}, and the pump stops that turn as it
+       * opens ({@link quell}).
        */
-      const stopSubagents: AgentHarness["Service"]["stopSubagents"] = () =>
-        Effect.succeed([]);
+      const stopSubagents: AgentHarness["Service"]["stopSubagents"] = (
+        sessionId,
+      ) =>
+        Effect.sync(() => {
+          const record = sessions.get(sessionId);
+          if (
+            record !== undefined &&
+            !record.closed &&
+            record.stoppedHere.size > 0
+          ) {
+            record.quellUntil = Date.now() + notificationQuellMillis;
+          }
+          return [];
+        });
 
       /*
        * The query is closed, then the CLI and its process group are stopped and waited for:

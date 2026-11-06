@@ -9094,6 +9094,105 @@ describe("sub-agent cards: lines, activity, count and Stop (A7-S)", () => {
     });
   });
 
+  test("A7-S review 1: after a card's Stop, Stop all stops the turn the CLI opens about it; the operator's own turn, and one after the window, run", async () => {
+    const counts = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: ID,
+            multiTurn: true,
+          });
+          yield* harness.prompt(ID, "go");
+          yield* Effect.promise(() => driver.pulled(1));
+          driver.emit(agentCall(BG, true, "Sleep, then read."));
+          driver.emit(taskStarted(BG, "a_bg", true));
+          yield* Effect.sleep("20 millis");
+          // The card's Stop, while the turn runs: the CLI ends the task at once, and its
+          // notification turn is still to come.
+          const card = yield* harness.stopSubagent(ID, BG);
+          driver.emit(
+            frame({
+              type: "system",
+              subtype: "task_notification",
+              task_id: "a_bg",
+              tool_use_id: BG,
+              status: "stopped",
+              output_file: "",
+              summary: "Sleep then read",
+            }),
+          );
+          // Stop all: the sub-agents (nothing of its own here), then the turn.
+          yield* harness.stopSubagents(ID);
+          yield* harness.interruptSession(ID);
+          driver.emitResult();
+          yield* Effect.sleep("20 millis");
+          const afterStopAll = driver.seen.interrupts;
+          // The CLI's own turn about the stopped task, inside the window: stopped as it opens.
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const quelled = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          // The operator's own message inside the window runs.
+          yield* harness.prompt(ID, "and now?", {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+          });
+          yield* Effect.promise(() => driver.pulled(2));
+          yield* Effect.sleep("20 millis");
+          const operator = driver.seen.interrupts;
+          driver.emitResult();
+          // A turn of the CLI's own after the window runs too.
+          yield* Effect.sleep("400 millis");
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const later = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          return { card, afterStopAll, quelled, operator, later };
+        }),
+      { notificationQuellMillis: 300 },
+    );
+    expect(counts).toEqual({
+      card: "stopped",
+      afterStopAll: 1,
+      quelled: 2,
+      operator: 2,
+      later: 2,
+    });
+  });
+
+  test("A7-S review 1: Stop all with no card's Stop before it arms nothing: a turn the CLI opens after it runs", async () => {
+    const interrupts = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: ID,
+            multiTurn: true,
+          });
+          yield* harness.prompt(ID, "go");
+          yield* Effect.promise(() => driver.pulled(1));
+          yield* harness.stopSubagents(ID);
+          yield* harness.interruptSession(ID);
+          driver.emitResult();
+          yield* Effect.sleep("20 millis");
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const seen = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          return seen;
+        }),
+      { notificationQuellMillis: 300 },
+    );
+    expect(interrupts).toBe(1);
+  });
+
   test("live: a stopped sub-agent's call in flight takes the CLI's rejection after the end, as the replay reads it", async () => {
     const lines = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
