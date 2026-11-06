@@ -687,6 +687,20 @@ describe("the generic chat state through a goal-shaped owner", () => {
     expect(blocked).toEqual([false, false]);
   });
 
+  test("the state's dismissal without the ability asks the server nothing, not even a Stop", async () => {
+    const probe = world({ leaveOut: ["dismissQuestion"] });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.state.noteQuestion(asked());
+    const before = probe.calls.length;
+    await probe.state.dismissQuestion();
+    await settle();
+    expect(probe.calls.slice(before)).toEqual([]);
+    expect(probe.state.questionBusy).toBe(false);
+    expect(probe.state.question?.questionId).toBe("q_1");
+  });
+
   test("an owner without a meter or a switch leaves them out", async () => {
     const probe = world({ leaveOut: ["context", "switchModel"] });
     probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
