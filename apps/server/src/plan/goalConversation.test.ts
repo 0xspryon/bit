@@ -57,7 +57,6 @@ import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { operatorScope } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
-import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
 import { GoalConversations } from "./goalConversation";
@@ -94,7 +93,6 @@ interface Recorder {
   /** Every `switchModel`, as the stub's `recordModelSwitches` records it (A6 F4). */
   readonly switches: readonly RecordedModelSwitch[];
   readonly recordSwitch: AgentHarness["Service"]["switchModel"];
-  readonly gated: string[];
   readonly registrations: { name: string; url: string; bearer: string }[];
   readonly unregistrations: { sessionId: string; name: string }[];
   /** Sessions the spine ended (`AgentHarness.endSession`), in order. */
@@ -117,7 +115,6 @@ const emptyRecorder = (): Recorder => {
     created: [],
     switches: recorded.switches,
     recordSwitch: recorded.switchModel,
-    gated: [],
     registrations: [],
     unregistrations: [],
     ended: [],
@@ -191,10 +188,6 @@ const fakeHarness = (
 ): AgentHarness["Service"] =>
   stubHarness({
     newSessionId: mint,
-    installGate: (input) =>
-      Effect.sync(() => {
-        recorder.gated.push(input.workspace);
-      }),
     createSession: (input) =>
       Effect.gen(function* () {
         if (options?.createEntered !== undefined) {
@@ -336,7 +329,7 @@ const world = (options?: {
 }) => {
   const scratch = newScratch();
   const root = join(scratch, "fleet");
-  // Outside the fleet root, like a real engagement's folder: `gatedRoleDirectory` refuses a
+  // Outside the fleet root, like a real engagement's folder: `roleDirectory` refuses a
   // role directory inside the workspace, and a test whose workspace *was* the fleet root
   // would be asserting against a layout nobody has.
   const workspace = join(scratch, "work");
@@ -386,7 +379,6 @@ const world = (options?: {
         Layer.provide(fleet),
         Layer.provide(credentials),
         Layer.provide(RunNarrations.layer),
-        Layer.provide(PolicyDecisions.layer),
         Layer.provide(
           Layer.succeed(
             WorkerEndpoints,
@@ -461,7 +453,7 @@ const replaying = (runtime: ChatRuntime) =>
 /* ── The first message ───────────────────────────────────────────────────────── */
 
 describe("the first message on a goal", () => {
-  test("opens a session in the goal's own gated directory, on the goal endpoint", async () => {
+  test("opens a session in the goal's own directory, on the goal endpoint", async () => {
     const { root, workspace, first, ready } = world();
     await ready;
 
@@ -479,9 +471,10 @@ describe("the first message on a goal", () => {
     // goal session in the workers' folder would see every `bit-<attemptId>` registered
     // there — which is the whole reason the layout exists.
     expect(first.recorder.created[0]?.directory).toBe(goalDirectory);
-    expect(first.recorder.gated).toEqual([goalDirectory]);
     expect(
-      first.recorder.gated.some((entry) => entry.includes(workspace)),
+      first.recorder.created.some((entry) =>
+        entry.directory.includes(workspace),
+      ),
     ).toBe(false);
     // Multi-turn, which is what keeps the session answerable from the operator's second
     // message. On Claude Code a session closed when it idled could not take one.
@@ -768,10 +761,10 @@ describe("a restart with a goal conversation live", () => {
    * **resuming** its session.
    *
    * The restart case above is the same world with the harness answering that it no longer
-   * resolves the session anywhere we gate — which is still the honest default. This is the
+   * resolves the session anywhere we made — which is still the honest default. This is the
    * case the drivers actually produce after a restart: the conversation is on disk (Claude
    * Code) or a row in the harness's own store (OpenCode), and it resolves in the goal's own
-   * directory, which this server gated when it opened it.
+   * directory, which this server made when it opened it.
    *
    * What the assertions are about, in order: the session id does not change, so the words on
    * the operator's screen stay this conversation's; the create was a *continue* and not a
@@ -788,7 +781,7 @@ describe("a restart with a goal conversation live", () => {
     const second = make({
       continuation: {
         _tag: "resumable",
-        // The goal's own gated directory, which is where this server opened it.
+        // The goal's own directory, which is where this server opened it.
         directory: join(root, "targets", TARGET, "goal", GOAL),
         detail: "the transcript is still on disk",
       },
@@ -800,14 +793,11 @@ describe("a restart with a goal conversation live", () => {
     // already on screen is still about the session that is now live.
     expect(after.harnessSessionId).toBe(before.harnessSessionId);
     expect(second.recorder.created[0]?.resumed).toBe(before.harnessSessionId);
-    // And it is gated and run in the goal's own directory, which is the half of the
+    // And it is run in the goal's own directory, which is the half of the
     // decision that is about authority rather than about resuming.
     expect(second.recorder.created[0]?.directory).toBe(
       join(root, "targets", TARGET, "goal", GOAL),
     );
-    expect(second.recorder.gated).toEqual([
-      join(root, "targets", TARGET, "goal", GOAL),
-    ]);
     // The resume framing, not the preamble: the rules and the objective are in the
     // conversation the agent is reading.
     const prompt = second.recorder.prompts[0]?.text ?? "";

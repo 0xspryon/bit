@@ -49,7 +49,6 @@ import {
 import {
   ENDED_STOP_NOTE,
   liveTranscript,
-  projectDecision,
   projectEvent,
   projectNarration,
   projectReplay,
@@ -66,7 +65,6 @@ import {
   type MessageEntry,
   type NarrationDetail,
 } from "../harness/agentHarness";
-import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import { FleetStore } from "../persistence/fleet";
 import { AWKWARD_TEXT, multiCaseInput } from "../persistence/fixtures";
 import { TargetStores } from "../persistence/targetStores";
@@ -185,20 +183,7 @@ const narrationsFrom = (items: readonly RunNarration[]) =>
     waiting: () => Effect.succeed(undefined),
   }) satisfies RunNarrations["Service"];
 
-/** A decision bus that answers from a list, for the same reason. */
-const decisionsFrom = (answered: readonly AnsweredDecision[]) =>
-  ({
-    record: () => Effect.void,
-    all: Effect.succeed([]),
-    answered: Stream.fromArray(answered),
-    subscriberCount: Effect.succeed(0),
-    holdSession: () => Effect.void,
-    endSession: () => Effect.void,
-    sessionEnded: () => Effect.succeed(false),
-  }) satisfies PolicyDecisions["Service"];
-
 const NO_NARRATION = narrationsFrom([]);
-const NO_DECISIONS = decisionsFrom([]);
 
 const narration = (
   detail: NarrationDetail,
@@ -217,21 +202,6 @@ const narration = (
     outcome: undefined,
     detail,
   },
-});
-
-const denial = (over: Partial<AnsweredDecision> = {}): AnsweredDecision => ({
-  id: 1,
-  at: 1_700_000_000_500,
-  request: {
-    sessionId: "ses_abc",
-    tool: "bash",
-    input: { command: "curl -s https://out-of-scope.test/" },
-  },
-  decision: {
-    effect: "deny",
-    reason: "host 'out-of-scope.test' is not in scope",
-  },
-  ...over,
 });
 
 /* ── Driving the stream ──────────────────────────────────────────────────────── */
@@ -287,8 +257,6 @@ const over = (
     events: (after, limit) => Effect.orDie(store.eventsAfter(after, limit)),
     latestSequence: Effect.orDie(store.currentEventSequence),
     narrations: NO_NARRATION,
-    decisions: NO_DECISIONS,
-    attemptForSession: () => Effect.succeed("attempt-1"),
     sweep: "5 millis",
     heartbeat: "10 seconds",
     ...options,
@@ -1098,10 +1066,6 @@ describe("projecting live activity", () => {
     expect(
       projectedItem(narration({ _tag: "reply", text: "hello" }))?.callId,
     ).toBeNull();
-    // A refusal cannot carry one: the gate's request has a session id, a tool name and the
-    // arguments, and no call id — the hook is a plugin inside the harness and the harness
-    // does not tell it which of its own calls this is.
-    expect(projectDecision(denial(), "attempt-1")?.callId).toBeNull();
     expect(projectEvent(event()).callId).toBeNull();
   });
 
@@ -1602,29 +1566,6 @@ describe("projecting live activity", () => {
     expect(frame.model).toBeNull();
     expect(frame.promptTokens).toBe(21_388);
   });
-
-  test("a denied action reads as denied, with the gate's own reason", () => {
-    const item = projectDecision(denial(), "attempt-1");
-    expect(item?.kind).toBe("action.denied");
-    expect(item?.headline).toBe("Denied");
-    expect(item?.outcome).toBe("denied");
-    expect(item?.tool).toBe("bash");
-    // The gate's sentence, unsoftened: it is the only description of this refusal there is.
-    expect(item?.body).toBe("host 'out-of-scope.test' is not in scope");
-    expect(item?.input).toContain("out-of-scope.test");
-    expect(item?.sequence).toBeNull();
-  });
-
-  test("an allowed action is not projected at all", () => {
-    // Not an omission: a permitted call is already on this stream as `tool.call`, carrying
-    // the same tool and the same arguments from the harness's own narration, so the gate's
-    // agreement beside it would show one tool call as two items.
-    const allowed = projectDecision(
-      denial({ decision: { effect: "allow", basis: "unrestricted" } }),
-      "attempt-1",
-    );
-    expect(allowed).toBeUndefined();
-  });
 });
 
 /* ── 2. Ordered delivery behind a cursor, on a real file ─────────────────────── */
@@ -2114,78 +2055,6 @@ describe("the record and live activity, together", () => {
     expect(bodies).toEqual(["mine", "also mine"]);
   });
 
-  test("a refused action appears, attributed to the attempt holding its session", async () => {
-    const path = newDatabasePath();
-    const frames = await withStore(path, (store) =>
-      Effect.gen(function* () {
-        yield* seed(store);
-        return yield* Effect.promise(() =>
-          framesUntil(
-            over(store, {
-              cursor: 0,
-              decisions: decisionsFrom([denial()]),
-              attemptForSession: (sessionId) =>
-                Effect.succeed(
-                  sessionId === "ses_abc" ? "attempt-1" : undefined,
-                ),
-            }),
-            (collected) =>
-              items(collected).some((item) => item.kind === "action.denied"),
-          ),
-        );
-      }),
-    );
-    const denied = items(frames).find((item) => item.kind === "action.denied");
-    expect(denied?.attemptId).toBe("attempt-1");
-    expect(denied?.origin).toBe("activity");
-  });
-
-  test("a decision whose session cannot be placed is dropped, not guessed at", async () => {
-    const path = newDatabasePath();
-    const frames = await withStore(path, (store) =>
-      Effect.gen(function* () {
-        yield* seed(store);
-        return yield* Effect.promise(() =>
-          framesUntil(
-            over(store, {
-              cursor: 0,
-              decisions: decisionsFrom([
-                denial({
-                  id: 1,
-                  request: {
-                    sessionId: "ses_elsewhere",
-                    tool: "bash",
-                    input: {},
-                  },
-                }),
-                // A placeable one behind it, so reaching the second proves the first was
-                // reached and refused rather than merely not pulled yet.
-                denial({ id: 2 }),
-              ]),
-              attemptForSession: (sessionId) =>
-                // This target holds `ses_abc` and nothing else, which is what a decision for
-                // another engagement — or for an attempt that has already settled and left
-                // the supervisor's map — looks like from here.
-                Effect.succeed(
-                  sessionId === "ses_abc" ? "attempt-1" : undefined,
-                ),
-            }),
-            (collected) =>
-              items(collected).some((item) => item.kind === "action.denied"),
-          ),
-        );
-      }),
-    );
-    // Showing one target's refused action under another target would be worse than not
-    // showing it, so the unplaceable one does not appear at all — and the one that follows
-    // it does, which is what proves it was dropped rather than still in flight.
-    const denials = items(frames).filter(
-      (item) => item.kind === "action.denied",
-    );
-    expect(denials).toHaveLength(1);
-    expect(denials[0]?.id).toBe("activity:decision:2");
-  });
-
   test("the real narration bus reaches a watching transcript", async () => {
     const path = newDatabasePath();
     const bodies = await Effect.runPromise(
@@ -2204,8 +2073,6 @@ describe("the record and live activity, together", () => {
                   Effect.orDie(store.eventsAfter(after, limit)),
                 latestSequence: Effect.orDie(store.currentEventSequence),
                 narrations,
-                decisions: NO_DECISIONS,
-                attemptForSession: () => Effect.succeed("attempt-1"),
                 cursor: 0,
                 sweep: "5 millis",
               }),
@@ -2337,8 +2204,6 @@ describe("what a live connection borrows", () => {
             Effect.orDie(store.eventsAfter(after, limit)),
           latestSequence: Effect.orDie(store.currentEventSequence),
           narrations: NO_NARRATION,
-          decisions: NO_DECISIONS,
-          attemptForSession: () => Effect.succeed(undefined),
           cursor: 0,
           sweep: "5 millis",
         }),

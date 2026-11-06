@@ -47,6 +47,42 @@ makes it. `grep -rn "V2(chat):" apps packages` lists them.
   forgery, the sealed block cost about 400 tokens per message, and neither T3 nor OpenCode
   guards against look-alikes. The block's design is a `V2(chat):` note in
   `harness/attachments.ts`.
+- **Policy gate removed 2026-11-06 at the operator's request, to be redone later.** Both
+  harnesses' pre-execution gates are gone: Claude Code's `PreToolUse` hook
+  (`policy/claudeCodeGate.ts`, `plugins/claudeCodeGate.ts`), OpenCode's policy plugin
+  (`policy/install.ts`, `plugins/policyHook.ts`), the policy service with its unauthenticated
+  `/api/v1/policy/decide` route and audit file (`policy/service.ts`), `AgentHarness.installGate`,
+  the live transcript's `action.denied` items, the `*_ungated` refusals (`import_ungated`,
+  `goal_ungated`, `planning_ungated`, `workspace_ungated`), the Claude Code 2.1.295 build
+  floor that existed for the hook's `onFailure: "block"`, and the spikes that only proved the
+  gate (`policyDemo.ts`, `milestoneProof.ts`). **The last commit with the gate is `635c1fc`**
+  (F12, which also made the built server find it); read the old implementation back with
+  `git show 635c1fc:apps/server/src/policy/install.ts` and its siblings. Each driver has a
+  `V2(chat):` note where the gate was installed, as do `liveAgentSessions.ts`,
+  `planSupervisor.ts`, `run/supervisor.ts` and `harness/roleDirectory.ts`.
+
+  Kept, because they are not the policy: the rule that a non-worker session's directory is
+  outside the workspace (now `harness/roleDirectory.ts`, refused as `*_directory_unusable`;
+  it also guards OpenCode's per-directory MCP set) and the `isWithin` and
+  `resolveThroughSymlinks` checks that `createTarget` and the upload store share; A7-Q's
+  `AskUserQuestion` setup; bit's MCP endpoint and its credentials; and the session, recovery
+  and OpenCode location code.
+
+  **Permissions now** follow the operator's rule, "run OC/CC as if I launched it". Claude
+  Code keeps `permissionMode: "dontAsk"` and the operator's `user`/`project`/`local`
+  settings, and bit pre-approves only its own MCP servers (`allowedTools: mcp__<name>`)
+  and, for the importer alone (`fetchesPages`), `WebFetch`. This was measured with
+  `spike/permissionProbe.ts` on haiku under the operator's real settings. With `dontAsk`
+  alone, Read, Glob and a read-only `echo` ran, while Write, WebFetch (including inside the
+  `web-fetch` sub-agent) and an MCP tool were refused. With the two pre-approvals, the MCP
+  tool and the page read ran and Write was still refused. An operator deny rule still
+  removes a pre-approved tool. `bypassPermissions` was not taken.
+
+  **Consequence:** a worker can no longer write files or run commands that are not
+  read-only unless the operator's settings allow them. The gate's permissive policy used to
+  allow every call. OpenCode follows the operator's `opencode.json`: bit writes no config
+  and sets no `permission`, and the serve child inherits `HOME` but no `OPENCODE_*`
+  variable.
 
 ## Tasks
 
@@ -609,49 +645,20 @@ the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harnes
   as the End's; at 768×1024, 820, 900, 1024×768 and 1440×900 the page never scrolls sideways,
   panel open or closed. Shots in `/run/media/hbt/work/a7sf3-shots/`.
 
-**F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
-refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
-`apps/plugins/claudeCodeGate.ts`, which does not exist (`bun src/main.ts` works). Fix the
-resolution so the built server finds the gate. **Remind the operator when the plan is done.**
+**F12 — Built server cannot open Claude Code sessions (S), last.** Superseded: policy
+removed on 2026-11-06. It was fixed first (`635c1fc`): each hook source had been counted two
+folders up from `import.meta.dir`, which is right from `src/policy/` but not from the
+bundle's `dist/`. So `bun dist/main.js` refused Claude Code (`ENOENT
+apps/plugins/claudeCodeGate.ts`) and OpenCode (`apps/plugins/policyHook.ts`) alike, as
+`import_ungated`. The fix walked up to the `@bit/server` package. The operator then removed
+the gate (see "Policy gate removed" under the decisions), so the built server installs
+nothing, and there is no hook source left to find.
 
-**Done (2026-11-06).** Both harnesses were affected: each hook source was
-`join(import.meta.dir, "..", "..", "plugins", …)`, right from `src/policy/` and two folders
-too high from the bundle's `dist/`. Live on the old build, Claude Code was refused with
-`ENOENT … apps/plugins/claudeCodeGate.ts` and OpenCode with `… apps/plugins/policyHook.ts`,
-both as `import_ungated`. Now `policy/install.ts` has `hookSourcePath`, which walks up from
-the module's folder to the nearest `package.json` named `@bit/server` and takes that
-package's `plugins/<file>`. `readHookSource` reads it, or throws `PolicyHookNotInstalled`
-when it is missing, which an import still reports as `import_ungated`. Both installers read
-the source before they write anything, so a refused install leaves the workspace untouched.
-`claudeCodeGateInstaller(from)` and `openCodeGateInstaller(from)` take the start folder;
-only tests pass it. The hooks themselves did not change.
-
-We considered copying `plugins/` beside `dist/` during the build, or embedding the sources
-in the bundle as text. Both would make the built gate a snapshot that could drift from the
-file the dev server installs. Copying would also add a build step the gate depends on.
-Embedding would turn a missing source into a crash at load instead of a refused run, and
-TypeScript types a `.ts` text import as a module. The walk needs no build change, and the
-bundle already has to run inside the package (`--packages=external`).
-
-Tests: either layout's folder (the real package's `src/policy` and `dist`, and a copy of
-the package), walking past another package's manifest, a `plugins/` folder in a package that
-is not the server's, a missing file, and a refused install on each harness that writes
-nothing. An importer conversation whose real Claude Code installer finds no gate is refused
-`import_ungated` before a session exists. The installed files are byte for byte the package's.
-
-Live, with the built server (`bun run build`, then `bun dist/main.js`, using `HUNT_ROOT`,
-`WORKSPACE_ROOT`, `PORT`, `BIT_PASSWORD` and `HARNESS=claude-code,opencode`): a Claude Code
-importer on `claude-haiku-4-5` ran `echo` through Bash. The target's `policy-audit.log`
-recorded `Bash allowed unrestricted`, and the CLI transcript has a `PreToolUse:Bash`
-`hook_success` with "allowed by bit policy (unrestricted)". An OpenCode importer on
-`zai-coding-plan/glm-5.3-flash` ran `shell`, and the log recorded `shell allowed
-unrestricted`. Logs: `/run/media/hbt/work/f12-logs/live/`.
-
-The built server does not serve the web app. Serve the web build with
-`cd apps/web && BIT_SERVER_URL=http://127.0.0.1:<port> bunx vite preview`; its `/api` proxy
-is the dev server's (checked: `/api/v1/health` and a deep link both answer). A server that
-serves the built app itself, as the `browserApi.ts` header assumes, is deployment work and
-was not done here.
+The built server was checked live after the removal, as was the dev server. The built
+server does not serve the web app. Serve the web build with
+`cd apps/web && BIT_SERVER_URL=http://127.0.0.1:<port> bunx vite preview`; its `/api`
+proxy is the dev server's (checked: `/api/v1/health` and a deep link both answer). Logs are
+in `/run/media/hbt/work/f12-logs/`.
 
 ### Chat shell for goal/planner/worker (prep)
 

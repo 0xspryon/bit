@@ -43,7 +43,6 @@ import { McpCredentials } from "./credentials";
 import { PlannerHarnesses } from "./plannerTools";
 import { McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-planner-tools-"));
 const databaseFile = join(directory, "hunt.sqlite");
@@ -221,16 +220,14 @@ class Seeded extends Context.Service<
 }
 
 const testLayer = Layer.mergeAll(
-  ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY, harnesses: HARNESSES }),
+  ControlPlaneEndpoint.layer({ harnesses: HARNESSES }),
   Seeded.layer,
   McpCredentials.layer,
   McpCallCounter.layer,
-  PolicyDecisions.layer,
   ObservationStore.layer(databaseFile),
 ).pipe(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   Layer.provideMerge(ObservationStore.layer(databaseFile)),
   Layer.provideMerge(
     TargetStores.ofStore(TARGET).pipe(

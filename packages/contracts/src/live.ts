@@ -12,11 +12,9 @@
  *   so the order on the wire *is* the order the store assigned, every item has a position
  *   that can be resumed from, and an item delivered twice is recognisable because its
  *   sequence is one already seen. {@link LiveOrigin} `record`.
- * - **Live activity.** What the harness is narrating and what the policy gate is deciding,
- *   in this process, right now. Neither is written to the event log — `run/narration.ts`
- *   records why narration is not, and reading the gate's decisions back as a persisted log
- *   is its own later day — so neither has a store-assigned position, and this contract
- *   does not give them one: {@link LiveItem.sequence} is `null` on every activity item.
+ * - **Live activity.** What the harness is narrating, in this process, right now. It is
+ *   not written to the event log — `run/narration.ts` records why — so it has no
+ *   store-assigned position, and this contract does not give it one: {@link LiveItem.sequence} is `null` on every activity item.
  *   {@link LiveOrigin} `activity`.
  *
  * **What that costs is stated rather than hidden.** An activity item is not durable, is
@@ -167,49 +165,6 @@ export type LiveOrigin = typeof LiveOrigin.Type;
  * and a gap in the sequence a reader would be right to read as a lost item. There is no
  * counterpart on the activity channel: an unrenderable narration entry is simply dropped,
  * which is sound there precisely because that channel makes no completeness claim.
- *
- * ## The policy gate's *allowed* decisions are deliberately not here
- *
- * The gate answers every tool call, allow or deny, and only the denials are projected.
- * That is not an omission, it is the day's "nothing appears twice": a permitted call is
- * already on this stream as `tool.call`, carrying the same tool and the same arguments
- * from the harness's own narration, and adding the gate's agreement beside it would show
- * one tool call as two items. A **denial** is the opposite case — the one thing narration
- * cannot tell you, because the gate refuses before the tool runs, so without the gate's
- * own word a refused action would be invisible. What the allow *basis* says about how
- * little constrains a run today is worth a screen of its own, and that screen is not this
- * one.
- *
- * ## `action.denied` is **not** every refused action, and here is exactly which ones
- *
- * This is worth stating plainly rather than leaving a reader to infer completeness from a
- * kind called `action.denied`. A screen showing no denials means "none of *these*", not
- * "nothing was refused".
- *
- * **What does appear:** a refusal the control plane decided — the host boundary or a
- * forbidden path fragment — for a session this server can place against a running attempt.
- *
- * **What does not, and why each one cannot:**
- *
- * - **A fail-closed denial.** When the policy service cannot be reached, answers badly or
- *   times out, the harness-side hook denies *on its own*, writes `denied_failclosed` to the
- *   engagement's audit file, and never gets an answer from the control plane — so there is
- *   no decision here to project. That is the correct ordering (the gate must not depend on
- *   this feed existing) and it means **the audit file is the only place a fail-closed
- *   denial is recorded.** It is also the case most worth seeing on a screen, which is why
- *   reading that file back is its own day's work rather than something to half-do here.
- * - **A malformed request.** The decide route refuses an undecodable body with a `400` and
- *   deliberately records nothing about a request it never understood, so it cannot reach
- *   this feed either.
- * - **A denial whose session cannot be placed.** The hook sends a harness session id and
- *   nothing else; a decision answered after its attempt has settled and left the
- *   supervisor's map has no attempt to attribute it to, and is dropped rather than guessed
- *   at. The window is small and the audit file still has it.
- *
- * And one more thing an operator has to know about today's deployment specifically: a
- * browser-started run is gated by a config that **records and permits**, so a real run
- * through this screen produces no denials at all. That is the perimeter boundary the
- * compose-box slice accepted on purpose, not a gap in this one.
  */
 export const LIVE_ITEM_KINDS = [
   /* The record. */
@@ -390,7 +345,6 @@ export const LIVE_ITEM_KINDS = [
    * compaction) still carries the notification's summary or status alone.
    */
   "subagent",
-  "action.denied",
 ] as const;
 
 export const LiveItemKind = Schema.Literals(LIVE_ITEM_KINDS);
@@ -408,7 +362,7 @@ export type LiveItemKind = typeof LiveItemKind.Type;
  *
  * `headline` and `body` are the server's own words. They are here, rather than being
  * composed in the browser, because the server is where the sentence can be accurate: it
- * has the policy gate's reason, the resolver's words for a harness, and the store's
+ * has the resolver's words for a harness, the harness's own, and the store's
  * payload. A browser that rephrased them would be inventing wording for states it cannot
  * see.
  */
@@ -439,8 +393,7 @@ export const LiveItem = Schema.Struct({
    * When it happened, in epoch milliseconds.
    *
    * For a `record` item this is the store's `recordedAt`, written in the same transaction
-   * as the row. For an activity item it is when the harness said it or when this process
-   * answered the gate. **Not an ordering key**: `sequence` is, and only on the record
+   * as the row. For an activity item it is when the harness said it. **Not an ordering key**: `sequence` is, and only on the record
    * channel. Two items can share a millisecond and a run's clocks are not all the same
    * clock, which is why ordering is never taken from this field.
    */
@@ -525,9 +478,9 @@ export const LiveItem = Schema.Struct({
    * the Scope tab, whose scope is `<targetId>/operator`.
    */
   importId: Schema.NullOr(Schema.String),
-  /** A short label: the tool's name, `Denied`, `Observation recorded`. */
+  /** A short label: the tool's name, `Observation recorded`. */
   headline: Schema.String,
-  /** A sentence for the operator. The gate's reason, the store's claim, the reply's text. */
+  /** A sentence for the operator. The store's claim, the reply's text. */
   body: Schema.String,
   /**
    * The tool a `tool.*` or `action.*` item is about, **as the harness named it**.
@@ -581,8 +534,7 @@ export const LiveItem = Schema.Struct({
    * How it turned out, in the vocabulary of this item's own kind.
    *
    * `positive` / `negative` / `inconclusive` for an observation; the attempt's terminal
-   * status for `run.settled`; `failed` or `ok` for a tool result; `denied` for a refused
-   * action. Deliberately not normalised into one scale: those are not comparable, and a
+   * status for `run.settled`; `failed` or `ok` for a tool result. Deliberately not normalised into one scale: those are not comparable, and a
    * shared vocabulary would have to flatten "the tool errored" and "the test found
    * nothing" into the same word.
    */

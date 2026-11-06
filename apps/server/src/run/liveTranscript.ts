@@ -54,49 +54,20 @@
  *
  * ## The activity channel: in-process, lossy, and labelled as such
  *
- * Two in-process buses, both `PubSub.sliding`, merged in beside the record channel:
- *
- * - {@link RunNarrations} — what the harness is saying. `run/narration.ts` records why this
- *   is not written to the event log and what that costs.
- * - {@link PolicyDecisions} — what the gate decided. Only **denials** are projected; the
- *   contract's `LIVE_ITEM_KINDS` says why the allow side is not.
+ * One in-process bus, {@link RunNarrations} (`PubSub.sliding`), merged in beside the record
+ * channel: what the harness is saying. `run/narration.ts` records why this is not written
+ * to the event log and what that costs. (It had a second until 2026-11-06: the policy
+ * gate's denials, removed with the gate at the operator's request.)
  *
  * Every activity item carries `sequence: null`, so no item on this stream claims a position
  * it does not have. An entry dropped by a sliding buffer is gone and nothing reconciles
  * against it, which is the accepted cost of a browser tab being unable to slow a running
  * agent down.
  *
- * ## Attribution is by the keys this process owns, and an unattributable item is dropped
+ * ## Attribution is by the keys this process owns
  *
  * Narration is published by the supervisor under the attempt whose session it opened, so a
- * narration item's target is not in question. A policy decision is different: the gate's
- * request carries a harness session id and nothing else, because the hook that calls it is
- * a plugin inside the harness process with no idea which engagement it belongs to. So a
- * decision is attributed by asking the supervisor which attempt holds that session, and a
- * decision whose session cannot be placed is **dropped rather than guessed at** — the same
- * rule `harness/openCodeClient.ts` applies to an event with no session id on it, for the
- * same reason: showing one target's refused action under another target would be worse
- * than not showing it.
- *
- * The honest consequence: a decision answered after its attempt has settled and left the
- * supervisor's map is unattributable and does not appear. The gate's audit file beside the
- * engagement still has it.
- *
- * ## `action.denied` is not every refused action
- *
- * Two refusals never reach this module at all, and neither is a bug here:
- *
- * - **Fail-closed.** `plugins/policyHook.ts` denies on its own when the policy service
- *   cannot be reached, answers badly or times out — it writes `denied_failclosed` to the
- *   engagement's audit file and the control plane is never asked, so `PolicyDecisions` has
- *   nothing to publish. That ordering is deliberate and must not change: a gate that needed
- *   this feed to exist would be a gate that fails open when the feed is down.
- * - **An undecodable request.** `policy/service.ts` answers `400` and records nothing about
- *   a request it never understood.
- *
- * So the audit file is the only record of a fail-closed denial, and a screen showing no
- * denials means "none of the kind this channel carries". `@bit/contracts`'s `live.ts` says
- * the same thing where a client reads it.
+ * narration item's target is not in question.
  */
 import {
   LIVE_HEARTBEAT_SECONDS,
@@ -111,23 +82,13 @@ import {
   type SubagentView,
 } from "@bit/contracts";
 import type { RecordedEvent } from "@bit/contracts";
-import {
-  Clock,
-  Duration,
-  Effect,
-  Filter,
-  Option,
-  Result,
-  Schema,
-  Stream,
-} from "effect";
+import { Clock, Duration, Effect, Option, Schema, Stream } from "effect";
 
 import {
   goalIdFromScope,
   importIdFromScope,
   roundIdFromScope,
 } from "../persistence/store";
-import type { AnsweredDecision, PolicyDecisions } from "../policy/service";
 import {
   truncateNarration,
   truncateReply,
@@ -1326,75 +1287,6 @@ export const turnEndedFrame = (item: RunNarration): LiveFrame | undefined =>
         at: item.entry.at,
       };
 
-/**
- * One refused action as one transcript item.
- *
- * Only called for a denial; see the contract on why an allowed decision is not projected.
- * `attemptId` is what the supervisor said holds this session, and a decision that could not
- * be placed never reaches here.
- */
-export const projectDecision = (
-  decision: AnsweredDecision,
-  attemptId: string,
-): LiveItem | undefined => {
-  if (decision.decision.effect !== "deny") return undefined;
-  const input = ((): string | null => {
-    try {
-      return JSON.stringify(decision.request.input) ?? null;
-    } catch {
-      // A tool input the hook sent that will not round-trip. The refusal is the thing that
-      // matters and it still appears; the arguments are simply unavailable.
-      return null;
-    }
-  })();
-  return {
-    _tag: "item",
-    id: `activity:decision:${String(decision.id)}`,
-    origin: "activity",
-    sequence: null,
-    kind: "action.denied",
-    at: decision.at,
-    attemptId,
-    // Null for the reason `roundId` below is null: the hook sends a harness session id and
-    // nothing else, so there is nothing here that names a goal conversation either — nor an
-    // importer's, whose sessions are not in the attempt map this denial was placed against.
-    goalId: null,
-    importId: null,
-    /**
-     * Null, and that is a gap worth naming rather than papering over.
-     *
-     * A denial is placed by **harness session id** against the attempt supervisor's map
-     * (see {@link projectDecision}'s caller), and a planner round's session is not in that
-     * map — so a tool call the gate refuses inside a planning directory does not reach this
-     * feed at all, and nothing reaches it with a round on it. The gate still writes it to
-     * the engagement's audit file, which the contract already names as the only complete
-     * record of refusals. Reading that file back is its own day's work; what must not happen
-     * meanwhile is a round's denial arriving filed under no round and looking like a
-     * worker's.
-     */
-    roundId: null,
-    headline: "Denied",
-    // The gate's own sentence, unsoftened. It is the only description of this refusal that
-    // exists, and a handler that rephrased it would be describing a rule it cannot read.
-    body: decision.decision.reason,
-    tool: decision.request.tool,
-    // Reduced against the attempt's own registration, which is the only one a decision this
-    // feed can place could have come through. A gate denial of a *round's* tool never
-    // reaches here at all — see `roundId` above.
-    toolName:
-      bareToolName(decision.request.tool, bitMcpServerName(attemptId)) ?? null,
-    input,
-    output: null,
-    // The gate's request carries a session id, a tool name and the arguments, and no call
-    // id: the hook is a plugin inside the harness process and the harness does not tell it
-    // which of its own calls this is. So a refusal cannot be paired with the `tool.call`
-    // item beside it, and claiming otherwise by matching on the tool name would pair it
-    // with the wrong one of two concurrent calls.
-    callId: null,
-    outcome: "denied",
-  };
-};
-
 /* ── The stream ──────────────────────────────────────────────────────────────── */
 
 /** What the record reader carries between pages. */
@@ -1443,17 +1335,6 @@ export interface LiveTranscriptInput {
    */
   readonly latestSequence: Effect.Effect<number>;
   readonly narrations: RunNarrations["Service"];
-  readonly decisions: PolicyDecisions["Service"];
-  /**
-   * Which attempt of *this* target holds a harness session, or `undefined`.
-   *
-   * The only way a policy decision is attributed. Returning `undefined` for a session that
-   * belongs to another target is what keeps one engagement's refusals off another's
-   * screen, so this must answer about this target and not about the process.
-   */
-  readonly attemptForSession: (
-    harnessSessionId: string,
-  ) => Effect.Effect<string | undefined>;
   /** Where to resume. Absent means {@link LIVE_REPLAY_BUDGET} back from the end. */
   readonly cursor?: number | undefined;
   /**
@@ -1496,8 +1377,9 @@ export const liveTranscript = (
   const heartbeat = input.heartbeat ?? LIVE_HEARTBEAT;
   const partials = input.partials === true;
 
-  const activity = Stream.merge(
-    input.narrations.subscribe({ targetId: input.targetId }).pipe(
+  const activity = input.narrations
+    .subscribe({ targetId: input.targetId })
+    .pipe(
       Stream.map((item: RunNarration): readonly LiveFrame[] => {
         const projected = projectNarration(item);
         const shown =
@@ -1512,24 +1394,7 @@ export const liveTranscript = (
         return ended === undefined ? shown : [...shown, ended];
       }),
       Stream.flattenIterable,
-    ),
-    input.decisions.answered.pipe(
-      Stream.filterMapEffect(
-        Filter.makeEffect((decision: AnsweredDecision) =>
-          Effect.map(
-            input.attemptForSession(decision.request.sessionId),
-            (attemptId) => {
-              if (attemptId === undefined) return Result.fail(decision);
-              const projected = projectDecision(decision, attemptId);
-              return projected === undefined
-                ? Result.fail(decision)
-                : Result.succeed(projected);
-            },
-          ),
-        ),
-      ),
-    ),
-  );
+    );
 
   return Stream.unwrap(
     Effect.gen(function* () {

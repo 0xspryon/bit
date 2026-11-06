@@ -93,9 +93,8 @@ export type RoundDisposition = typeof RoundDisposition.Type;
  *   because one can be true without the other — a row left by a dead process is
  *   `round_conflict` with nothing running.
  * - `goal_not_found`, `goal_not_active` — the goal is not this target's, or it has ended.
- * - `planning_directory_unusable` — the round's own directory could not be made.
- * - `planning_ungated` — the directory exists and the policy gate would not install into
- *   it. A round is refused rather than run ungated, exactly as a worker is.
+ * - `planning_directory_unusable` — the round's own directory could not be made, or sits
+ *   inside the workspace where workers run.
  * - `target_unavailable`, `store_unavailable` — the target's database.
  * - `unknown_round` — nothing is running under that id *in this process*.
  *
@@ -120,7 +119,6 @@ export class PlanRefused extends Schema.TaggedError<PlanRefused>()(
       "goal_not_found",
       "goal_not_active",
       "planning_directory_unusable",
-      "planning_ungated",
       "target_unavailable",
       "store_unavailable",
       "unknown_round",

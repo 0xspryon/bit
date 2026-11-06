@@ -307,9 +307,6 @@ export const stubHarness = (
             modelId: model.slice(slash + 1),
           };
     },
-    // Nothing on disk: a test that wants the real gate installed passes a real installer,
-    // which `run/supervisor.test.ts` does for both harnesses' gates.
-    installGate: () => Effect.void,
     // A resume names the session it continues, as the seam says: the id comes back
     // unchanged, which is what keeps the conversation's identity.
     createSession: (input) =>

@@ -2653,7 +2653,8 @@ describe("the live transcript", () => {
     // own and neither is invented here.
     expect(byKind.get("tool.call")?.input).toContain("curl");
     expect(byKind.get("tool.result")?.output).toContain("429");
-    // A denied action reads as denied, with the gate's reason.
+    // A kind this build no longer sends (the policy gate's `action.denied`, removed
+    // 2026-11-06) still arrives with its own words: a client tolerates kinds it does not know.
     expect(byKind.get("action.denied")?.outcome).toBe("denied");
     expect(byKind.get("action.denied")?.body).toContain("out-of-scope.test");
     // A recorded observation reads as recorded, and a negative result is still a result.

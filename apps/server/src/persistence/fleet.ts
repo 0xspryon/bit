@@ -131,30 +131,32 @@ export const isRoleDirectoryId = (value: string): boolean =>
   /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value);
 
 /**
- * A planner or goal directory that exists and has **not** had the policy gate installed.
+ * A planner, goal or import directory that exists and has **not** been checked against
+ * the workspace yet.
  *
  * **Why this is an object and not a string.** The rule is that a session is never created
- * in a role directory the gate is not in, and a comment saying so is not a boundary: a
- * `string` can be handed to `createSession` as readily as any other. So
- * {@link FleetStore.ensurePlanningDirectory} and {@link FleetStore.ensureGoalDirectory}
- * return this instead. It has no string coercion and is not accepted anywhere a path is,
- * so using it as a directory is a type error, and the one thing that turns it into a path
- * is `gatedRoleDirectory` (`policy/install.ts`), which installs the gate first and returns
- * the path branded as gated.
+ * in a role directory inside the workspace where workers run, and a comment saying so is
+ * not a boundary: a `string` can be handed to `createSession` as readily as any other. So
+ * {@link FleetStore.ensurePlanningDirectory}, {@link FleetStore.ensureGoalDirectory} and
+ * {@link FleetStore.ensureImportDirectory} return this instead. It has no string coercion
+ * and is not accepted anywhere a path is, so using it as a directory is a type error, and
+ * the one thing that turns it into a path is `roleDirectory` (`harness/roleDirectory.ts`),
+ * which checks it first and returns the path branded. (Until 2026-11-06 that function also
+ * installed the policy gate, and this was `UngatedRoleDirectory`.)
  *
- * What this does not do: {@link UngatedRoleDirectory.unsafePath} exists, because the gate
- * installer and the tests must read the path, and a caller determined to bypass the gate
- * can call it. The guarantee is that bypassing is a visible, greppable act named `unsafe`,
+ * What this does not do: {@link UncheckedRoleDirectory.unsafePath} exists, because the
+ * check and the tests must read the path, and a caller determined to bypass the check can
+ * call it. The guarantee is that bypassing is a visible, greppable act named `unsafe`,
  * and never an accident of passing the return value along. The path can also still be
  * rebuilt from {@link FleetPaths}, as it always could; that is why `FleetPaths` is not
  * handed to session code.
  */
-export class UngatedRoleDirectory {
+export class UncheckedRoleDirectory {
   readonly #path: string;
   constructor(path: string) {
     this.#path = path;
   }
-  /** The directory, without the gate. Read by `gatedRoleDirectory` and by tests only. */
+  /** The directory, unchecked. Read by `roleDirectory` and by tests only. */
   unsafePath(): string {
     return this.#path;
   }
@@ -186,14 +188,14 @@ export interface FleetPaths {
    * workspace is never also a planner's.
    *
    * The second rule is the one `evidence/` already follows: a worker must not be able to
-   * read the machinery that supervises it. The gate, its configuration and the harness's
-   * own per-directory state live in the directory a session runs in, so a planner
+   * read the machinery that supervises it. The harness's configuration and its own
+   * per-directory state live in the directory a session runs in, so a planner
    * directory inside the workspace would put them where the worker can read them.
    *
    * What the spike did **not** establish: it compared a shared directory with a *sibling*,
    * not with a nested one, and it did not try a symlink or a differently spelled path to
    * the same directory. So no role's directory here is nested inside another's, and
-   * `policy/install.ts` refuses a role directory inside the workspace rather than
+   * `harness/roleDirectory.ts` refuses a role directory inside the workspace rather than
    * trusting the harness to treat a child as separate. Claude Code, by contrast, kept two
    * live sessions in one directory apart (the second found no tool for the first's
    * server); that is a property of its session-scoped registration, and this layout does
@@ -218,13 +220,13 @@ export interface FleetPaths {
    * A fourth sibling, outside the workspace and distinct from every round's and every
    * goal's directory, for the reasons on {@link planningDirectory}. The importer is the
    * role with the least business acting in a directory at all — it fetches a page and
-   * calls three tools — and that is exactly why it gets its own gated one: the policy hook
-   * lives in the directory a session runs in, so a session with no directory of its own is
-   * a session whose tool calls are audited somewhere else or not at all.
+   * calls three tools — and it still gets its own: the harness's per-directory state (its
+   * MCP registration under OpenCode) lives in the directory a session runs in, so a session
+   * sharing one would share that too.
    *
    * Under `targets/<id>/` rather than anywhere global, so `DECISIONS.md` §3's deletion
    * property survives: removing a target is still `rm -rf targets/<id>/`, and an import's
-   * audit log and harness state go with it.
+   * harness state goes with it.
    */
   readonly importDirectory: (targetId: string, importId: string) => string;
 }
@@ -755,7 +757,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
   });
 
   /**
-   * Creates one role's directory on demand and returns it, ungated.
+   * Creates one role's directory on demand and returns it, unchecked.
    *
    * Idempotent: `mkdir -p`, so creating a round's directory twice is not an error and
    * leaves whatever the first creation put there. The registry is consulted first so a
@@ -763,11 +765,10 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
    * exist, and the id is checked here so a bad one is a typed refusal where
    * {@link fleetPaths} would throw.
    *
-   * **This makes the directory and does nothing else. It does not install the policy
-   * gate, and so it does not return a path**: it returns an {@link UngatedRoleDirectory},
-   * which nothing that creates a session accepts. The one conversion is
-   * `gatedRoleDirectory` (`policy/install.ts`), which installs the gate and only then
-   * yields a path. The gate is a harness concern and this module knows no harness.
+   * **This makes the directory and does nothing else, and so it does not return a path**:
+   * it returns an {@link UncheckedRoleDirectory}, which nothing that creates a session
+   * accepts. The one conversion is `roleDirectory` (`harness/roleDirectory.ts`), which
+   * checks it against the workspace and only then yields a path.
    *
    * Outside every transaction, like {@link ensureDirectory} it calls.
    */
@@ -805,7 +806,7 @@ const makeFleet = Effect.fnUntraced(function* (root: string) {
           ? paths.goalDirectory(targetId, id)
           : paths.importDirectory(targetId, id);
     yield* ensureDirectory(path, targetId);
-    return new UngatedRoleDirectory(path);
+    return new UncheckedRoleDirectory(path);
   });
 
   const ensurePlanningDirectory = Effect.fn(
@@ -895,25 +896,22 @@ export class FleetStore extends Context.Service<
     readonly ensurePlanningDirectory: (
       targetId: string,
       roundId: string,
-    ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
+    ) => Effect.Effect<UncheckedRoleDirectory, FleetError | DatabaseError>;
     readonly ensureGoalDirectory: (
       targetId: string,
       goalId: string,
-    ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
+    ) => Effect.Effect<UncheckedRoleDirectory, FleetError | DatabaseError>;
     /**
      * Makes the directory one scope import will run in, and nothing else.
      *
      * {@link ensureGoalDirectory}'s sibling, and it returns an
-     * {@link UngatedRoleDirectory} for the same reason: nothing that creates a session
-     * accepts one, so the only way to a usable path is `gatedRoleDirectory`, which
-     * installs the policy gate first. The importer's page fetches go through that gate
-     * (D13) — it is the only thing auditing them, because the fetch is the harness's tool
-     * and not ours.
+     * {@link UncheckedRoleDirectory} for the same reason: nothing that creates a session
+     * accepts one, so the only way to a usable path is `roleDirectory`.
      */
     readonly ensureImportDirectory: (
       targetId: string,
       importId: string,
-    ) => Effect.Effect<UngatedRoleDirectory, FleetError | DatabaseError>;
+    ) => Effect.Effect<UncheckedRoleDirectory, FleetError | DatabaseError>;
     readonly setting: (
       key: string,
     ) => Effect.Effect<string | undefined, DatabaseError>;

@@ -49,7 +49,6 @@ import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials, type IssuedCredential } from "./credentials";
 import { McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import { RecordAsset } from "./tools";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-record-asset-"));
@@ -80,12 +79,11 @@ class TestCredential extends Context.Service<
 }
 
 const testLayer = Layer.mergeAll(
-  ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY }),
+  ControlPlaneEndpoint.layer({}),
   TestCredential.layer,
 ).pipe(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   Layer.provideMerge(
     TargetStores.ofStore(BINDING.targetId).pipe(
       Layer.provide(ObservationStore.layer(databaseFile)),

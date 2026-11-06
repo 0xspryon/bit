@@ -429,9 +429,10 @@ const generatePassword = (): string => {
  *   of those names are secrets (`OPENCODE_API_KEY`, `OPENCODE_SSH_ASKPASS_TOKEN`,
  *   `OPENCODE_SERVER_USERNAME` beside the two passwords), and one of them is worse than
  *   a secret: an inherited `OPENCODE_CONFIG_PROJECT_DISABLE` would stop the server
- *   reading the project configuration that loads our pre-execution policy gate
- *   (`policy/install.ts`), turning a boundary off from outside with no sign in the run.
- *   The harness's OpenCode configuration is ours, not the ambient shell's.
+ *   reading project configuration, changed from outside with no sign in the run. (It
+ *   once guarded the policy gate's plugin, removed 2026-11-06.) The operator's own
+ *   `opencode.json` is still read: OpenCode finds it under the inherited `HOME`; only a
+ *   config chosen by an `OPENCODE_*` variable in the server's shell is not.
  * - **Our own variables** — `HUNT_ROOT`, `PORT`, `WORKSPACE_ROOT`, `HARNESS`,
  *   `TARGET_ID` — are this process's configuration and mean nothing to the child, and
  *   `PORT` in particular is a name OpenCode also reads.

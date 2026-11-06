@@ -66,7 +66,7 @@ import {
   IMPORT_DIRECTORY,
   isRoleDirectoryId,
 } from "../persistence/fleet";
-import { resolveThroughSymlinks } from "../policy/install";
+import { resolveThroughSymlinks } from "../harness/roleDirectory";
 
 /** The folder, inside a session's working directory, that every upload is stored in. */
 export const UPLOADS_FOLDER = "uploads";

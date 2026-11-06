@@ -652,8 +652,8 @@ export class ImporterModelUnavailable extends Schema.TaggedError<ImporterModelUn
  * rather than about the registry, and it is a refusal at creation because the
  * alternative is a target that cannot do anything. Every non-worker session on a target
  * — planner round, goal agent, scope importer — runs in a directory under this server's
- * fleet root, and the policy gate refuses to install into a directory inside the folder
- * where that target's workers run. So a workspace folder that *contains* the fleet root
+ * fleet root, and a directory inside the folder where that target's workers run is
+ * refused. So a workspace folder that *contains* the fleet root
  * is a target whose first planner round, first conversation and first import are all
  * refused for the same reason, discovered one at a time. `targetId` is the id that would
  * have been registered: there is nothing to open instead.
@@ -859,11 +859,6 @@ export type RunStopped = typeof RunStopped.Type;
  *   would not boot.
  * - `target_unavailable` — that target's own database could not be opened. The same
  *   condition {@link TargetUnavailable} describes, reached from the write side.
- * - `workspace_ungated` — the pre-execution policy gate could not be installed into the
- *   engagement's folder, usually because it already holds an `opencode.json` this server
- *   will not overwrite. The run is refused rather than started ungated: a worker running
- *   against somebody's systems with no record of what it was allowed to do is worse than
- *   a run that did not start.
  * - `harness_not_ready` — the instance the run named is not configured on this server, or
  *   is configured and would not start. Nothing at all was written: not a folder claim, not
  *   a row. The operator picks a different harness, or installs the one they picked.
@@ -888,22 +883,19 @@ export class RunRefused extends Schema.TaggedError<RunRefused>()(
     reason: Schema.Literals([
       "no_harness",
       "target_unavailable",
-      "workspace_ungated",
       /**
        * Another run is already going in this engagement's folder.
        *
        * **Refused rather than queued, and refused rather than permitted**, because two
-       * workers in one directory can misattribute each other's writes. Both harnesses
-       * configure their pre-execution gate *per workspace*, so a second run's gate
-       * installation repoints the first run's audit at a different target's file; and
-       * OpenCode registers an MCP server per *directory*, so each worker would see the
+       * workers in one directory can misattribute each other's writes. OpenCode registers
+       * an MCP server per *directory*, so each worker would see the
        * other's `bit-<attemptId>` server and a call through the wrong one would record an
        * observation under an attempt that never made it. Provenance is the thing this
        * system exists to get right, so a path that can silently misattribute a write is
        * worse than one that refuses.
        *
-       * Two workers cooperating on one engagement is later work. Until the gate and the
-       * MCP registration are per attempt, this is the honest answer.
+       * Two workers cooperating on one engagement is later work. Until the MCP
+       * registration is per attempt, this is the honest answer.
        */
       "workspace_busy",
       /**
@@ -2195,8 +2187,7 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      * Opens one planner round on a goal, and answers without waiting for it.
      *
      * **No payload at all, and that is the interesting part of this endpoint.** A round's
-     * directory, the audit path its policy gate writes to, and the engagement folder it
-     * must not sit inside are facts about this installation's filesystem layout; a browser
+     * directory and the engagement folder it must not sit inside are facts about this installation's filesystem layout; a browser
      * that could name any of them would be choosing where an agent runs. Even the harness
      * and the model are absent, unlike `startRun`: nothing but the operator has an opinion
      * about where planning happens, and that opinion is server configuration today rather
@@ -2452,8 +2443,8 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
      * are not interchangeable.** That one answers with the artefact a *settled* attempt
      * left behind — our content-hashed file, or the harness's own copy while it lasts —
      * and it answers once, after the fact. This one is the target's event log being read
-     * in store-assigned order behind a cursor, with what the harness and the policy gate
-     * are saying right now merged alongside it. One is a document; this is a position in a
+     * in store-assigned order behind a cursor, with what the harness is saying right now
+     * merged alongside it. One is a document; this is a position in a
      * log plus a live feed. `@bit/contracts`'s `live.ts` is where the two channels and
      * what each promises are written down.
      *

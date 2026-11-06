@@ -11,12 +11,10 @@
  *
  * ## What this demands
  *
- * Nine operations, and `run/supervisor.ts` is the only consumer that matters — what it
- * calls *is* this interface. In the order a run uses them:
+ * `run/supervisor.ts` is the only consumer that matters — what it calls *is* this
+ * interface. In the order a run uses them (step 1, `installGate`, was the pre-execution
+ * policy gate, removed on 2026-11-06 at the operator's request; the numbers are kept):
  *
- * 1. {@link AgentHarness.installGate} — put a pre-execution policy gate into the workspace
- *    the session will run in. **Load-bearing: a workspace this cannot gate refuses the
- *    run.** See the section below.
  * 2. {@link AgentHarness.newSessionId} — mint a session id *we* choose, in the harness's
  *    own format, so the attempt row can name the session before the session exists.
  * 3. {@link AgentHarness.modelProvenance} — split a model name into the provider and model
@@ -74,19 +72,14 @@
  *   failed" and "nobody could tell us", which the supervisor settles differently
  *   (DECISIONS.md §15).
  *
- * ## The gate is part of the seam, not a module beside it
+ * ## The policy gate was part of the seam, and is gone
  *
- * `installGate` sits here because the gate is the one thing that *must* be harness-shaped
- * and must not be harness-specific at the call site. OpenCode loads a plugin named in
- * `.opencode/opencode.json`; Claude Code runs a `PreToolUse` command hook named in
- * `.claude/settings.local.json`, with a different payload, a different way of saying
- * "deny", and a different failure default. Those are three incompatible file formats and
- * one identical requirement — consult `policy/service.ts` before the tool runs, fail
- * closed, write an audit line outside the workspace — so the *decision* stays where it
- * was and only the installation varies.
- *
- * Had this been a free function the supervisor chose between, the supervisor would branch
- * on driver kind, which is the one thing this slice is trying to make impossible.
+ * `installGate` sat here, because the gate was the one thing that had to be harness-shaped
+ * and must not be harness-specific at the call site: an OpenCode plugin in
+ * `.opencode/opencode.json`, a Claude Code `PreToolUse` command hook in
+ * `.claude/settings.local.json`. It was removed on 2026-11-06 at the operator's request, to
+ * be redone; the plan's "Policy gate removed" entry names the last commit that had it.
+ * V2(chat): a redone gate belongs back on this seam, for the same reason.
  */
 import type {
   ContextBreakdown,
@@ -112,7 +105,6 @@ import type {
   QuestionNotPending,
 } from "./errors";
 import type { HarnessInstance, ModelProvenance } from "./identity";
-import type { GateInstaller } from "../policy/install";
 
 /** Anything an operation on this seam can fail with as an expected condition. */
 export type HarnessFailure = HarnessTransportError | HarnessDecodeError;
@@ -275,10 +267,10 @@ export interface SessionRef {
  * `directory` is where the harness itself will resolve the session's work, and the caller
  * has to care about it for two reasons rather than one. OpenCode resolves a prompt through
  * the session's *stored* directory and answers `LocationNotFoundError` if it is gone; Claude
- * Code finds a transcript under the project its `cwd` hashes to. And the pre-execution
- * policy gate lives *in* that directory, so a resume into a directory we did not gate is an
- * ungated agent. A caller that cannot match this against the directory it is about to gate
- * must open a fresh session instead of resuming.
+ * Code finds a transcript under the project its `cwd` hashes to. And that directory is the
+ * one the role-directory check is asked about, so a resume into a directory we did not make
+ * is an unchecked agent. A caller that cannot match this against the directory it is about
+ * to check must open a fresh session instead of resuming.
  *
  * `undefined` is "the harness did not say", which is not permission to guess.
  */
@@ -526,7 +518,8 @@ export {
  *
  * **`toolResult.output` is the tool's own output, not a verdict about it.** `failed` is set
  * when the harness says the call failed; it says nothing about whether the action was
- * *allowed*, which is the policy gate's answer and arrives on a different channel.
+ * *allowed*, which is the harness's own permission answer (a refusal reads as a failed
+ * call).
  */
 export type NarrationDetail =
   | {
@@ -1207,13 +1200,6 @@ export class AgentHarness extends Context.Service<
      */
     readonly modelProvenance: (model: string) => ModelProvenance;
     /**
-     * Installs the pre-execution policy gate into a workspace.
-     *
-     * A failure **refuses the run**. See this module's header, and
-     * `policy/install.ts` for what every implementation of this has to preserve.
-     */
-    readonly installGate: GateInstaller;
-    /**
      * Opens a session, optionally inside an existing session's lineage.
      *
      * `parentSessionId` exists for provider prompt caching and nothing else, and a harness
@@ -1271,6 +1257,14 @@ export class AgentHarness extends Context.Service<
        * cannot see is the V2 note on the goal chat (`plan/goalConversation.ts`).
        */
       readonly operatorQuestions?: boolean | undefined;
+      /**
+       * Whether the session's role reads web pages with the harness's own fetch tool (the
+       * importer). **Claude Code**: `WebFetch` is pre-approved for it, as bit's MCP tools
+       * are for every session; everything else is the operator's settings
+       * (`claudeCodeClient.ts`, `preapprovedTools`). **OpenCode**: nothing, since bit sets
+       * no permission there and the operator's `opencode.json` decides.
+       */
+      readonly fetchesPages?: boolean | undefined;
       /**
        * Continue this existing session of this harness instead of creating one.
        *
@@ -1766,7 +1760,7 @@ export class AgentHarness extends Context.Service<
      * round's session ends itself when its single turn does, which is why this seam went
      * without one until the conversations (A6 F5). A conversation's session ends only when
      * it is told to, and revoking its credential is not telling it — the agent keeps running
-     * on its own authority (its shell, the policy gate's allowances) until the harness is.
+     * on its own authority (its shell, whatever its settings allow) until the harness is.
      *
      * **Takes the {@link SessionRef} `createSession` returned, not an id**, and ends that
      * opening only: see {@link SessionRef}. A ref this harness did not hand out, or one whose

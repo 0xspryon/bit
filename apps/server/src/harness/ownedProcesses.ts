@@ -45,9 +45,7 @@
  * 3. **It must not refuse to boot.** Every filesystem and signalling step is fallible and
  *    every one of them is contained: a missing directory reaps nothing, an unreadable
  *    record is reported and dropped, a process that will not die is reported and its
- *    record kept for the next boot. This is housekeeping, not a safety property — unlike
- *    `policy/install.ts`, which refuses the run it cannot gate, because a worker running
- *    past an unenforced boundary is worse than no worker.
+ *    record kept for the next boot. This is housekeeping, not a safety property.
  *
  * The process-inspection primitives live here rather than in `openCodeServer.ts` because
  * both callers need exactly the same kernel checks and a safety check that exists twice

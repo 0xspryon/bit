@@ -71,14 +71,30 @@
  *
  * ## What is pinned, and why
  *
- * - `permissionMode: "dontAsk"` — denies anything not pre-approved. There is no operator
- *   at a prompt, so `default` would stall on the first tool call, and `bypassPermissions`
- *   would make the gate advisory. Under `dontAsk` an allow from our `PreToolUse` gate is
- *   what pre-approves a call, so the gate is the authority and a gate that cannot answer
- *   is a worker that cannot act. See `policy/claudeCodeGate.ts`.
+ * - `permissionMode: "dontAsk"` — denies anything not pre-approved, without a prompt. There
+ *   is no operator at a prompt, so `default` would stall on the first tool call that needs
+ *   one. What pre-approves a call is **the operator's own settings** (their allow and deny
+ *   rules, as if they had launched the CLI themselves) plus {@link preapprovedTools}: bit's
+ *   own MCP servers, which every role needs to do its job, and `WebFetch` for a role that
+ *   reads pages (`fetchesPages`, the importer). Nothing else is bit's to allow.
+ *   `bypassPermissions` was weighed and not taken: it would allow every tool for every
+ *   role whatever the operator's settings say.
+ *
+ *   Measured 2026-11-06 under the operator's real settings (`src/spike/permissionProbe.ts`,
+ *   haiku-4-5, CLI 2.1.310): with `dontAsk` alone, Read, Glob and a read-only Bash `echo`
+ *   ran; Write, WebFetch (also inside the `web-fetch` sub-agent, which is how this build
+ *   offers it) and an MCP tool were refused. With bit's MCP server and `WebFetch` in
+ *   `allowedTools`, the MCP tool and the sub-agent's WebFetch ran and Write was still
+ *   refused; an operator's deny rule for the MCP tool still removed it.
+ *
+ *   V2(chat): until 2026-11-06 an `allow` from bit's `PreToolUse` policy gate pre-approved
+ *   every call it permitted, which with the permissive policy was every call. The gate was
+ *   removed at the operator's request, to be redone. Without it a **worker** can no longer
+ *   write files or run commands that are not read-only unless the operator's settings
+ *   allow them.
  * - `settingSources: ["user", "project", "local"]` — stated rather than defaulted, because
- *   `.claude/settings.local.json` is where the gate lives and a future default of `[]`
- *   would silently un-gate every run.
+ *   those settings are what decide every tool call bit does not pre-approve, and a future
+ *   default of `[]` would silently change what every session may do.
  * - `forwardSubagentText: true` — without it a subagent's text and thinking never reach the
  *   stream (`--forward-subagent-text`, Claude Code 2.1.211+). `narrate` narrates none of a
  *   subagent's frames as the caller's rows (A6 U14); since A7-S they are read into its card
@@ -133,11 +149,6 @@ import {
   type Duration,
 } from "effect";
 
-import {
-  CLAUDE_CODE_MINIMUM,
-  compareVersions,
-  installClaudeCodeGate,
-} from "../policy/claudeCodeGate";
 import {
   AgentHarness,
   OPEN_PROMPT,
@@ -601,6 +612,8 @@ interface SessionRecord {
   readonly multiTurn: boolean;
   /** From `createSession`'s `operatorQuestions`: whether {@link answerHook} is installed (A7-Q). */
   readonly operatorQuestions: boolean;
+  /** From `createSession`'s `fetchesPages`: whether `WebFetch` is pre-approved. */
+  readonly fetchesPages: boolean;
   /**
    * Whether this record stands for a session the CLI already has, to be **resumed**.
    *
@@ -3400,40 +3413,15 @@ export const claudeCodeHarness = (
       /** The layer's own scope, so the pump below outlives the fiber that started it. */
       const harnessScope = yield* Effect.scope;
 
-      /**
-       * The build floor, enforced before anything else in this layer.
-       *
-       * The gate's outer fail-closed guarantee is `onFailure: "block"` on the hook entry,
-       * which an older Claude Code **silently ignores** — so a hook that could not start
-       * would let its tool call through, and the only trace would be an audit file missing
-       * a line nobody knew to look for. A guarantee that silently is not there is worse
-       * than one that was never claimed, so this refuses the harness instead of offering a
-       * quietly weaker one. `main.ts` catches it, says so at startup, and serves without
-       * an agent — the same disposition as a `HARNESS` nobody recognises.
-       *
-       * An unreadable version refuses too. `version` is otherwise a diagnostic and would
-       * degrade to `"unknown"`, but here it is the evidence for a safety property, and
-       * "we could not tell" is not a basis for claiming it.
-       *
-       * The version is the CLI build the SDK carries and spawns — we never set
-       * `pathToClaudeCodeExecutable` — so this is deterministic rather than a guess about
-       * whatever `claude` happens to be on the PATH.
+      /*
+       * The CLI build the SDK carries and spawns — we never set `pathToClaudeCodeExecutable`
+       * — read as a diagnostic, `"unknown"` when it cannot be. V2(chat): it was a floor until
+       * 2026-11-06 (Claude Code 2.1.295, the build that honours `onFailure: "block"` on a
+       * `PreToolUse` hook), enforced for the policy gate's fail-closed guarantee; the gate
+       * went at the operator's request and the floor with it. A redone gate that relies on
+       * a CLI feature brings its floor back here.
        */
       const version = yield* sdkClaudeCodeVersion;
-      if (version === "unknown") {
-        return yield* new HarnessProcessError({
-          operation: "version",
-          detail: `could not read which Claude Code build the Agent SDK carries, so it cannot be established that this one honours 'onFailure' on a PreToolUse hook (${CLAUDE_CODE_MINIMUM} or newer); refusing to offer a harness whose policy gate might fail open`,
-          diagnostics: "",
-        });
-      }
-      if (compareVersions(version, CLAUDE_CODE_MINIMUM) < 0) {
-        return yield* new HarnessProcessError({
-          operation: "version",
-          detail: `the Claude Agent SDK carries Claude Code ${version}, which silently ignores 'onFailure' on a PreToolUse hook; the policy gate needs ${CLAUDE_CODE_MINIMUM} or newer to fail closed when the hook itself cannot run. Upgrade @anthropic-ai/claude-agent-sdk, or run with HARNESS=opencode.`,
-          diagnostics: "",
-        });
-      }
 
       const instance: HarnessInstance = {
         instanceId: defaultInstanceIdForDriver(CLAUDE_CODE_DRIVER),
@@ -4115,15 +4103,17 @@ export const claudeCodeHarness = (
                   ...(record.effort === undefined
                     ? {}
                     : { effort: record.effort }),
-                  // The gate lives in `.claude/settings.local.json` in `cwd`; stated
-                  // rather than defaulted so a future default cannot un-gate a run.
+                  // The operator's settings decide what bit does not pre-approve; stated
+                  // rather than defaulted so a future default cannot change that.
                   settingSources: ["user", "project", "local"],
-                  // Our `PreToolUse` gate is the permission authority; see the header.
+                  // No prompt, and the operator's settings plus `preapprovedTools` are
+                  // what allow a call; see the header.
                   permissionMode: "dontAsk",
+                  allowedTools: preapprovedTools(record),
                   /*
                    * The operator's answers to `AskUserQuestion`, for a conversation only (A7-Q).
-                   * See `answerHook` for what was measured and why neither the gate nor the
-                   * permission mode moves.
+                   * See `answerHook` for what was measured and why the permission mode
+                   * does not move.
                    *
                    * Only for a session opened with `operatorQuestions` — today the importer's.
                    *
@@ -4275,6 +4265,7 @@ export const claudeCodeHarness = (
           narration,
           multiTurn: input.multiTurn === true,
           operatorQuestions: input.operatorQuestions === true,
+          fetchesPages: input.fetchesPages === true,
           resumed: input.resume !== undefined,
           idle,
           ended: yield* Deferred.make<void>(),
@@ -5597,7 +5588,13 @@ export const claudeCodeHarness = (
         instance,
         newSessionId: newClaudeCodeSessionId,
         modelProvenance: claudeCodeModelProvenance,
-        installGate: installClaudeCodeGate,
+        /*
+         * V2(chat): `installGate: installClaudeCodeGate` was here — bit's `PreToolUse` policy
+         * hook, written into each session's `.claude/settings.local.json` with its script
+         * under `.claude/bit-policy/` (removed 2026-11-06 at the operator's request, to be
+         * redone). Nothing is written into a session's directory now; see the header on
+         * what allows a call instead.
+         */
         createSession,
         switchModel,
         registerMcpServer,
@@ -5662,17 +5659,46 @@ interface HeldQuestion {
 const QUESTION_HOOK_TIMEOUT_SECONDS = 86_400;
 
 /**
+ * What bit pre-approves for a session (`allowedTools`), on top of the operator's settings.
+ *
+ * - **bit's own MCP servers**, as registered on the record before the query starts
+ *   (`registerMcpServer` comes before the first prompt, and `launch` reads the record): a
+ *   server-wide rule, `mcp__<name>`, for each. A worker that cannot call
+ *   `record_observation`, or an importer that cannot call `add_scope_entry`, is not doing
+ *   its job, and these are bit's tools rather than the operator's.
+ * - **`WebFetch`**, only for a session whose role reads pages (`fetchesPages`): the
+ *   importer's whole job is reading the program's pages, and under `dontAsk` with no allow
+ *   rule it cannot (measured; see the header).
+ *
+ * Allow rules, so the operator's deny rules still win: a denied tool is not even offered
+ * (measured). The SDK warns that a bare entry here means `canUseTool` is never asked about
+ * these tools, which is what is meant: {@link refuseEveryPrompt} would refuse them.
+ *
+ * V2(chat): a server registered after the query started (none is today) is not in this
+ * list, and its tools would be refused unless the operator's settings allow them.
+ */
+export const preapprovedTools = (record: {
+  readonly mcpServers: Record<string, unknown>;
+  readonly fetchesPages: boolean;
+}): string[] => [
+  ...Object.keys(record.mcpServers).map((name) => `mcp__${name}`),
+  ...(record.fetchesPages ? ["WebFetch"] : []),
+];
+
+/**
  * The tools a question session is not offered, though registering {@link refuseEveryPrompt}
  * makes the CLI offer them: plan mode's way in and out.
  *
  * Measured on CLI 2.1.310 (A7-Q review 1, the init tool lists diffed): registering
  * `canUseTool` adds `AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` to a session's
- * tools, and nothing else. Plan mode cannot work under bit's `dontAsk` + gate regime: the
- * gate allows `EnterPlanMode`, the session's mode moves from `dontAsk` to `plan`, and from
- * then on every gate-allowed Write and MCP call is put to `canUseTool` — which refuses it,
- * as it must, since bit asks no one to approve a call — and `ExitPlanMode` is refused the
- * same way, so the session stays stuck there. Disallowing both (measured) removes them,
- * keeps `AskUserQuestion`, keeps the mode `dontAsk`, and `canUseTool` is then never called.
+ * tools, and nothing else. Plan mode cannot work under bit's `dontAsk`: measured with the
+ * policy gate (which allowed `EnterPlanMode`; removed 2026-11-06), the session's mode moved
+ * from `dontAsk` to `plan`, and from then on every pre-approved Write and MCP call was put
+ * to `canUseTool` — which refuses it, as it must, since bit asks no one to approve a call —
+ * and `ExitPlanMode` was refused the same way, so the session stayed stuck there. An
+ * operator's allow rule for `EnterPlanMode` would do the same today. Disallowing both
+ * (measured) removes them, keeps `AskUserQuestion`, keeps the mode `dontAsk`, and
+ * `canUseTool` is then never called.
  *
  * This is no departure from running the CLI as the operator would: a session without
  * `operatorQuestions` registers no `canUseTool`, is offered neither tool already, and is
@@ -5695,9 +5721,11 @@ const QUESTION_SESSION_DISALLOWED_TOOLS = [
  * **It is never asked, and it would refuse if it were.** Under `dontAsk` the CLI denies a
  * call that was not pre-approved without asking the host (measured: the `AskUserQuestion`
  * call was denied "because Claude Code is running in don't ask mode" and this was not
- * called, though the policy gate had answered `allow`). So it loosens nothing: the gate
- * stays the only thing that pre-approves a call, as `permissionMode: "dontAsk"` demands, and
- * a call the gate did not allow is refused here too rather than becoming a prompt.
+ * called, though the policy gate of the time had answered `allow`; measured again without a
+ * gate on 2026-11-06, `src/spike/permissionProbe.ts`: never called). So it loosens nothing:
+ * the operator's settings and {@link preapprovedTools} stay the only things that pre-approve
+ * a call, as `permissionMode: "dontAsk"` demands, and a call they did not allow is refused
+ * here too rather than becoming a prompt.
  *
  * Nothing may rely on it beyond making `AskUserQuestion` offered. The one way measured to
  * reach it is plan mode (the session leaves `dontAsk`), which
@@ -5707,16 +5735,17 @@ const QUESTION_SESSION_DISALLOWED_TOOLS = [
 const refuseEveryPrompt: CanUseTool = (toolName) =>
   Promise.resolve({
     behavior: "deny",
-    message: `${toolName} was not pre-approved by bit's policy gate, and bit asks no one to approve tool calls.`,
+    message: `${toolName} was not pre-approved by the operator's Claude Code settings or by bit, and bit asks no one to approve tool calls.`,
   });
 
 /**
  * The narrowly scoped hook that answers `AskUserQuestion` with the operator's answers, and
  * the one change A7-Q makes to a Claude Code session's permissions.
  *
- * ## Why a second hook, and not the gate or the mode
+ * ## Why a hook, and not the mode
  *
- * Measured on CLI 2.1.310 (the probe above, each leg a real `claude-haiku-4-5` run):
+ * Measured on CLI 2.1.310 (the probe above, each leg a real `claude-haiku-4-5` run, with
+ * the policy gate bit had until 2026-11-06):
  *
  * - **The gate's `allow` is not an answer.** `AskUserQuestion` is a tool that needs the
  *   user; an `allow` from a `PreToolUse` hook does not stand in for one, so under `dontAsk`
@@ -5727,24 +5756,23 @@ const refuseEveryPrompt: CanUseTool = (toolName) =>
  *   multi-select comma-joined), which is T3 Code's `updatedInput` from another door.
  * - **Hooks run side by side and every one is waited for, and a `deny` wins.** With the
  *   gate answering `deny` and this hook `allow` 10 s later, the call was refused with the
- *   gate's reason at 10 s. So this hook cannot overrule the gate: a question the gate refuses
- *   (an out-of-scope host in its text, say) stays refused, after the operator has answered.
+ *   gate's reason at 10 s. So this hook cannot overrule another `PreToolUse` hook of the
+ *   operator's that refuses the question.
  * - **A Stop aborts the wait.** `interrupt()` while this hook waited aborted its signal
  *   within 20 ms, the CLI stored "The user doesn't want to proceed with this tool use…" as
  *   the call's result and the turn ended `aborted_tools`. Settled `withdrawn` here.
  * - **A `deny` is how a dismissal reaches the model**: it read the hook's reason as the
  *   tool's error and answered "You declined to answer the questions."
  *
- * So the policy gate is unchanged, the permission mode is unchanged, and the gate is still
- * asked about and can still refuse every call this answers. What is added is an in-process
+ * So the permission mode is unchanged. What is added is an in-process
  * `PreToolUse` callback whose matcher is `AskUserQuestion` alone, which parks the call
  * until the operator answers or dismisses it, the no-op {@link refuseEveryPrompt}, and
  * plan mode kept out ({@link QUESTION_SESSION_DISALLOWED_TOOLS}), which registering it
  * would otherwise offer.
  *
- * V2(chat): the gate is asked at the same moment as this hook, and its answer is not known
- * here, so a question the gate refuses is still shown and can be answered, and only then does
- * the agent get the gate's refusal. Proper V2 asks the policy service first, from here.
+ * V2(chat): when the policy gate was there, it was asked at the same moment as this hook and
+ * its answer was not known here, so a question it refused was still shown. A redone gate
+ * should be asked first, from here.
  */
 const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
   matcher: CLAUDE_CODE_QUESTION_TOOL,

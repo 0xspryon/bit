@@ -93,7 +93,7 @@
  * `persistence/fleet.ts` lays out is `targets/<id>/planning/<roundId>/` and
  * `targets/<id>/goal/<goalId>/` — siblings of each other and of `evidence/` — while the
  * workspace a worker runs in is the operator's own folder (`workspace_path`) and is not
- * under that tree at all; `policy/install.ts` refuses a role directory inside it. Three
+ * under that tree at all; `harness/roleDirectory.ts` refuses a role directory inside it. Three
  * roles, three places, and no role's directory nested inside another's, which is the
  * shape the spike actually tested (siblings, never nesting).
  *

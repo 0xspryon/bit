@@ -8,7 +8,7 @@
  * the importer is built on, with an importer credential and the importer endpoint — the
  * same descriptor `import/scopeImporter.ts` passes.
  *
- * Real: the fleet layout and its gate installer, the credential registry. Faked: the
+ * Real: the fleet layout and its role-directory check, the credential registry. Faked: the
  * harness, because what is under test is the seam around it.
  */
 import { afterEach, describe, expect, test } from "bun:test";
@@ -35,7 +35,6 @@ import { recordModelSwitches, recordPrompts, stubHarness } from "./stubHarness";
 import { turnStopped } from "./turnStop";
 import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
-import { PolicyDecisions } from "../policy/service";
 import type { WorkerUrls } from "../run/supervisor";
 
 const TARGET = "acme-corp";
@@ -46,7 +45,6 @@ const URLS: WorkerUrls = {
   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
   goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
   importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-  policy: "http://127.0.0.1:9/api/v1/policy/decide",
 };
 
 const scratches: string[] = [];
@@ -94,7 +92,6 @@ const gatedHarness = (
       minted += 1;
       return `ses_${String(minted)}`;
     },
-    installGate: () => Effect.void,
     createSession: (input) =>
       Effect.gen(function* () {
         if (gates.createEntered !== undefined) {
@@ -168,7 +165,6 @@ const withImporterSessions = async <A>(
     readonly sessions: LiveAgentSessions<undefined>;
     readonly plan: OpenPlan<undefined>;
     readonly credentials: McpCredentials["Service"];
-    readonly decisions: PolicyDecisions["Service"];
   }) => Effect.Effect<A, unknown, Scope.Scope>,
 ) => {
   const scratch = mkdtempSync(join(tmpdir(), "bit-live-sessions-"));
@@ -180,7 +176,6 @@ const withImporterSessions = async <A>(
     Effect.gen(function* () {
       const fleet = yield* FleetStore;
       const credentials = yield* McpCredentials;
-      const decisions = yield* PolicyDecisions;
       yield* fleet.register({
         targetId: TARGET,
         name: "Acme Corp",
@@ -192,7 +187,7 @@ const withImporterSessions = async <A>(
       // The layer's scope, closed by hand so the finalizer is observable.
       const layerScope = yield* Scope.make();
       const sessions = yield* makeLiveAgentSessions<undefined>(
-        { fleet, endpoints: { urls: Effect.succeed(URLS) }, gate: decisions },
+        { endpoints: { urls: Effect.succeed(URLS) } },
         {
           endpoint: (urls) => urls.importerMcp,
           issue: (input) =>
@@ -226,7 +221,7 @@ const withImporterSessions = async <A>(
         openingPrompt: () => "read these pages",
         meta: undefined,
       };
-      const result = yield* body({ sessions, plan, credentials, decisions });
+      const result = yield* body({ sessions, plan, credentials });
       yield* Scope.close(layerScope, Exit.void);
       return {
         result,
@@ -240,7 +235,6 @@ const withImporterSessions = async <A>(
         Layer.mergeAll(
           FleetStore.layer(join(scratch, "fleet")),
           McpCredentials.layer,
-          PolicyDecisions.layer,
         ),
       ),
     ),
@@ -1481,105 +1475,59 @@ describe("closing, against a resume and against a hung harness (A6 F5, second re
           );
         }),
     });
-    const outcome = await withImporterSessions(
-      harness,
-      ({ sessions, plan, decisions }) =>
-        Effect.gen(function* () {
-          const openWith = (each: OpenPlan<undefined>) =>
-            sessions.open<"opened" | "joined", unknown, never>({
-              id: IMPORT,
-              joined: () => Effect.succeed("joined" as const),
-              refuse: (failure) => failure,
-              prepare: Effect.succeed(each),
-              opened: () => Effect.succeed("opened" as const),
-            });
-          // The first opening's narrator holds its interruption, which parks its close
-          // after the entry has left the map and before the harness session is ended.
-          yield* openWith({
-            ...plan,
-            narrate: () =>
-              Effect.never.pipe(
-                Effect.onInterrupt(() =>
-                  Effect.andThen(
-                    Deferred.succeed(narratorInterrupted, undefined),
-                    Deferred.await(narratorGo),
-                  ),
+    const outcome = await withImporterSessions(harness, ({ sessions, plan }) =>
+      Effect.gen(function* () {
+        const openWith = (each: OpenPlan<undefined>) =>
+          sessions.open<"opened" | "joined", unknown, never>({
+            id: IMPORT,
+            joined: () => Effect.succeed("joined" as const),
+            refuse: (failure) => failure,
+            prepare: Effect.succeed(each),
+            opened: () => Effect.succeed("opened" as const),
+          });
+        // The first opening's narrator holds its interruption, which parks its close
+        // after the entry has left the map and before the harness session is ended.
+        yield* openWith({
+          ...plan,
+          narrate: () =>
+            Effect.never.pipe(
+              Effect.onInterrupt(() =>
+                Effect.andThen(
+                  Deferred.succeed(narratorInterrupted, undefined),
+                  Deferred.await(narratorGo),
                 ),
               ),
-          });
-          for (let step = 0; step < 10; step += 1) yield* Effect.yieldNow;
-          const closing = yield* Effect.forkChild(
-            sessions.close(IMPORT, "operator"),
-          );
-          yield* Deferred.await(narratorInterrupted);
-          // The resume: same session, a fresh opening, parked before it publishes.
-          const reopening = yield* Effect.forkChild(
-            openWith({ ...plan, resume: plan.sessionId }),
-          );
-          yield* Deferred.await(secondRegistering);
-          yield* Deferred.succeed(narratorGo, undefined);
-          yield* Fiber.join(closing);
-          const endedByClose = [...endedRefs];
-          const refusedWhileReopening = yield* decisions.sessionEnded(
-            plan.sessionId,
-          );
-          yield* Deferred.succeed(secondGo, undefined);
-          const reopened = yield* Fiber.join(reopening);
-          return {
-            endedByClose,
-            refusedWhileReopening,
-            reopened,
-            held: sessions.ready(IMPORT) !== undefined,
-          };
-        }),
+            ),
+        });
+        for (let step = 0; step < 10; step += 1) yield* Effect.yieldNow;
+        const closing = yield* Effect.forkChild(
+          sessions.close(IMPORT, "operator"),
+        );
+        yield* Deferred.await(narratorInterrupted);
+        // The resume: same session, a fresh opening, parked before it publishes.
+        const reopening = yield* Effect.forkChild(
+          openWith({ ...plan, resume: plan.sessionId }),
+        );
+        yield* Deferred.await(secondRegistering);
+        yield* Deferred.succeed(narratorGo, undefined);
+        yield* Fiber.join(closing);
+        const endedByClose = [...endedRefs];
+        yield* Deferred.succeed(secondGo, undefined);
+        const reopened = yield* Fiber.join(reopening);
+        return {
+          endedByClose,
+          reopened,
+          held: sessions.ready(IMPORT) !== undefined,
+        };
+      }),
     );
     expect(outcome.result).toEqual({
       endedByClose: ["first"],
-      refusedWhileReopening: false,
       reopened: "opened",
       held: true,
     });
     // The second opening is ended by the layer's finalizer, by its own ref.
     expect(endedRefs).toEqual(["first", "second"]);
-  });
-
-  test("a closed session is refused by the gate, and an open one is not", async () => {
-    const outcome = await withImporterSessions(
-      stubHarness(),
-      ({ sessions, plan, decisions }) =>
-        Effect.gen(function* () {
-          yield* opening(sessions, plan);
-          const sessionId = sessions.ready(IMPORT)?.sessionId ?? "";
-          const open = yield* decisions.sessionEnded(sessionId);
-          yield* sessions.close(IMPORT, "operator");
-          const closed = yield* decisions.sessionEnded(sessionId);
-          return { open, closed };
-        }),
-    );
-    expect(outcome.result).toEqual({ open: false, closed: true });
-  });
-
-  test("the gate refuses the session before the harness has been asked to end it", async () => {
-    // The order that makes the backstop worth having: a harness that takes its time to stop
-    // the agent, or never answers, has its session's tool calls refused meanwhile.
-    let refusedWhenAsked: boolean | undefined;
-    let decisionsSeen: PolicyDecisions["Service"] | undefined;
-    const harness = stubHarness({
-      endSession: (ref) =>
-        Effect.gen(function* () {
-          if (decisionsSeen !== undefined) {
-            refusedWhenAsked = yield* decisionsSeen.sessionEnded(ref.id);
-          }
-        }),
-    });
-    await withImporterSessions(harness, ({ sessions, plan, decisions }) =>
-      Effect.gen(function* () {
-        decisionsSeen = decisions;
-        yield* opening(sessions, plan);
-        yield* sessions.close(IMPORT, "operator");
-      }),
-    );
-    expect(refusedWhenAsked).toBe(true);
   });
 
   test("the layer's finalizer closes its sessions at once, not one control timeout after another", async () => {

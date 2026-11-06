@@ -770,9 +770,9 @@ describe("role directories", () => {
       existsSync(join(outcome.first.unsafePath(), "left-by-the-first")),
     ).toBe(true);
 
-    // The ungated directory is not a path. Handing it to anything that wants a string
+    // The unchecked directory is not a path. Handing it to anything that wants a string
     // (a session's `directory`, say) is a compile error, which `tsc` checks here.
-    // @ts-expect-error an UngatedRoleDirectory is not assignable to string
+    // @ts-expect-error an UncheckedRoleDirectory is not assignable to string
     const asString: string = outcome.first;
     expect(typeof asString).toBe("object");
     expect(

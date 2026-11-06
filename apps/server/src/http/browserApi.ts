@@ -26,9 +26,8 @@
  * **No CORS, deliberately.** The browser reaches these routes same-origin: in
  * development through the Vite dev server's `/api` proxy, and in a packaged deployment
  * from a server that also serves the built app. The alternative — `HttpRouter.cors` — is
- * `{ global: true }` and would apply to `/api/v1/mcp` and `/api/v1/policy/decide` as
- * well, changing what two routes with deliberately chosen postures will answer to a
- * cross-origin caller. A browser pointed at a different origin therefore fails as
+ * `{ global: true }` and would apply to `/api/v1/mcp` as well, changing what a route
+ * with a deliberately chosen posture will answer to a cross-origin caller. A browser pointed at a different origin therefore fails as
  * unreachable, which is visible and honest, rather than being quietly permitted.
  */
 import {
@@ -130,7 +129,7 @@ import {
 } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { renderScopeBlock } from "../scope/scopePrompt";
-import { isWithin, POLICY_AUDIT_FILE } from "../policy/install";
+import { isWithin } from "../harness/roleDirectory";
 import { HarnessResolver, isReady } from "../harness/resolver";
 import {
   AGENTS,
@@ -155,7 +154,6 @@ import { activityKey } from "../run/sessionActivity";
 import { waitingWords } from "../harness/questions";
 import { RunSupervisor } from "../run/supervisor";
 import { readTranscript } from "../run/transcript";
-import { PolicyDecisions } from "../policy/service";
 import {
   DEFAULT_UPLOAD_LIMITS,
   readStoredUpload,
@@ -989,14 +987,12 @@ const fleetHandlers = HttpApiBuilder.group(
     // inside the router's own memo map — which would be a second credential registry and a
     // round whose bearer the MCP endpoint rejects.
     const planner = yield* PlanSupervisor;
-    // The two in-process buses the live transcript's activity channel reads. Same place,
-    // same reason — and for these two it is load-bearing beyond tidiness: each is a single
-    // `PubSub` that the supervisor and the policy route publish into, so a second instance
-    // would be a bus with a publisher and no subscriber on one side and a subscriber and no
-    // publisher on the other. `main.ts` records how instances are handed across the
-    // router's own memo map, and this is the second pair that depends on it.
+    // The in-process bus the live transcript's activity channel reads. Same place, same
+    // reason — and for this one it is load-bearing beyond tidiness: it is a single `PubSub`
+    // that the supervisor publishes into, so a second instance would be a bus with a
+    // publisher and no subscriber on one side and a subscriber and no publisher on the
+    // other. `main.ts` records how instances are handed across the router's own memo map.
     const narrations = yield* RunNarrations;
-    const decisions = yield* PolicyDecisions;
     // The goal conversations, for the reason `PlanSupervisor` is here: it holds every live
     // goal session in this process, each with a credential that has no clock expiry, and a
     // second instance built inside the router's memo map would be a second set of sessions
@@ -1221,15 +1217,15 @@ const fleetHandlers = HttpApiBuilder.group(
          * **Refused here because every session on such a target is refused later.** The
          * target's data lives at `fleet.paths.targetDirectory(targetId)`, and every
          * non-worker role directory — a planner round's, a goal agent's, a scope
-         * import's — is made under it. `gatedRoleDirectory` (`policy/install.ts`) refuses
-         * to install the gate into a role directory inside the workspace, for the reason
-         * recorded there: a worker that can reach a planner's directory can tamper with
-         * what constrains it. So a folder that contains this target's fleet directory
+         * import's — is made under it. `roleDirectory` (`harness/roleDirectory.ts`) refuses
+         * a role directory inside the workspace, for the reason recorded there: a worker
+         * that can reach a planner's directory can read and tamper with its machinery, and
+         * OpenCode keeps one MCP set per directory. So a folder that contains this target's fleet directory
          * produces a target that cannot plan, cannot converse and cannot import — the
          * operator finds out one session at a time, starting with whichever they open
          * first, and nothing they do on the target changes the answer.
          *
-         * **The containment test is `isWithin`, imported from the installer**, not a
+         * **The containment test is `isWithin`, imported from `harness/roleDirectory.ts`**, not a
          * prefix comparison written here. The two checks are one question asked at two
          * moments, and the failure mode of two implementations is a folder that passes
          * creation and fails every session — exactly what this refusal exists to stop.
@@ -1261,8 +1257,8 @@ const fleetHandlers = HttpApiBuilder.group(
         const dataDirectory = fleet.paths.targetDirectory(targetId);
         const fleetInside = yield* Effect.try({
           try: () => isWithin(workspacePath, dataDirectory),
-          // A path that cannot be resolved refuses rather than permits, as it does in the
-          // installer: "cannot tell whether it is inside" must not read as "is not".
+          // A path that cannot be resolved refuses rather than permits, as it does for a
+          // role directory: "cannot tell whether it is inside" must not read as "is not".
           catch: (cause) =>
             new TargetRefused({
               reason: "workspace_contains_fleet_root",
@@ -1292,7 +1288,7 @@ const fleetHandlers = HttpApiBuilder.group(
           return yield* new TargetRefused({
             reason: "workspace_contains_fleet_root",
             targetId,
-            detail: `${workspacePath} is ${dataDirectory} — the directory this server would record this target in — or one of the folders above it, so that directory would sit inside the very folder where this target's workers run. Every planner, goal and import session runs in a directory under ${dataDirectory}, and the policy gate refuses to install into one that sits inside the workspace, so the target could be created and then do nothing. Pick a folder that is neither ${dataDirectory} nor one of the folders above it — a folder elsewhere inside ${fleet.paths.root}, such as ${fleet.paths.root}/workspaces/${targetId}, is fine — or restart this server with HUNT_ROOT set outside the folder you want to use`,
+            detail: `${workspacePath} is ${dataDirectory} — the directory this server would record this target in — or one of the folders above it, so that directory would sit inside the very folder where this target's workers run. Every planner, goal and import session runs in a directory under ${dataDirectory}, and one that sits inside the workspace is refused, so the target could be created and then do nothing. Pick a folder that is neither ${dataDirectory} nor one of the folders above it — a folder elsewhere inside ${fleet.paths.root}, such as ${fleet.paths.root}/workspaces/${targetId}, is fine — or restart this server with HUNT_ROOT set outside the folder you want to use`,
           });
         }
 
@@ -1415,7 +1411,7 @@ const fleetHandlers = HttpApiBuilder.group(
        * been told it may look at.
        *
        * Everything after that belongs to {@link RunSupervisor}: by the time it returns,
-       * the pre-execution policy gate is installed in the workspace, and the attempt row,
+       * the attempt row,
        * the harness session, the credential and the prompt are all in place, with a fiber
        * in the server's own scope owning the rest. This handler has no part in how the
        * run ends.
@@ -1453,11 +1449,6 @@ const fleetHandlers = HttpApiBuilder.group(
           ...(payload.modelOptions === undefined
             ? {}
             : { modelOptions: payload.modelOptions }),
-          // The target's own `evidence/` directory, which the registry already creates
-          // for things that are not database rows — and which is deliberately *outside*
-          // the workspace the worker runs in, so the worker cannot read the record of
-          // what it was allowed to do.
-          auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
           title: `bit: ${row.name}`,
         });
         return started;
@@ -2783,7 +2774,6 @@ const fleetHandlers = HttpApiBuilder.group(
             targetId: row.targetId,
             goalId: params.goalId,
             workspace: row.workspacePath ?? undefined,
-            auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
             title: `bit planner: ${row.name}`,
             briefingMaxChars:
               config.goalBriefingMaxChars ?? DEFAULT_GOAL_BRIEFING_MAX_CHARS,
@@ -2926,7 +2916,7 @@ const fleetHandlers = HttpApiBuilder.group(
        *
        * **The first message is the one that does the work**, and all of it is
        * {@link GoalConversations}: the goal's own directory under
-       * `targets/<id>/goal/<goalId>/`, the policy gate installed into it, a session on the
+       * `targets/<id>/goal/<goalId>/`, a session on the
        * default harness, a credential with **no clock expiry** (the spec's decision 4), the
        * goal MCP endpoint registered under that credential, and the operator's words below
        * a preamble. A later message is a second prompt into the same session, queued behind
@@ -3069,14 +3059,6 @@ const fleetHandlers = HttpApiBuilder.group(
        * by the time a frame could say so the response is a 200 with an open stream, and a
        * transcript that reported a resolver race as though it were the run's own news would
        * be worse than a connection that fails.
-       *
-       * **Attribution for the policy gate's decisions is done here**, because this is where
-       * the target is known. The gate's request carries a harness session id and nothing
-       * else — the hook is a plugin inside the harness process — so a decision is matched
-       * against the runs this supervisor is holding *for this target*, and one whose
-       * session does not appear there is dropped rather than attributed to a guess. That
-       * also means a decision answered after its attempt settled does not appear; the
-       * audit file beside the engagement still has it.
        */
       live: Effect.fn(function* ({ params, query }) {
         const row = yield* openableTarget(fleet, params.targetId);
@@ -3098,17 +3080,6 @@ const fleetHandlers = HttpApiBuilder.group(
                 // would report the record as ending wherever the observations do.
                 latestSequence: Effect.orDie(store.currentEventSequence),
                 narrations,
-                decisions,
-                attemptForSession: (harnessSessionId) =>
-                  Effect.map(
-                    supervisor.running,
-                    (running) =>
-                      running.find(
-                        (held) =>
-                          held.targetId === row.targetId &&
-                          held.harnessSessionId === harnessSessionId,
-                      )?.attemptId,
-                  ),
                 ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
                 // Only a client that asked: `live.ts`, "Partial items".
                 partials: query.partials === "1",

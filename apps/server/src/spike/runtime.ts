@@ -31,12 +31,6 @@ import { OpenCodeServer } from "../harness/openCodeServer";
 import { HarnessResolver } from "../harness/resolver";
 import { McpCredentials } from "../mcp/credentials";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { installOpenCodeGate } from "../policy/install";
-import {
-  DEFAULT_POLICY,
-  PolicyDecisions,
-  type PolicyConfig,
-} from "../policy/service";
 import { McpCallCounter } from "../mcp/server";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
@@ -66,8 +60,6 @@ export class SpikePaths extends Context.Service<
   {
     readonly workspace: string;
     readonly databaseFile: string;
-    /** Where the harness-side hook appends its decisions. Outside the workspace. */
-    readonly auditFile: string;
   }
 >()("bit/spike/SpikePaths") {}
 
@@ -88,48 +80,18 @@ export interface SpikeOptions {
   readonly timeouts?: ClientTimeouts;
   /** Extra files to drop into the workspace before the harness starts. */
   readonly workspaceFiles?: Readonly<Record<string, string>>;
-  /** Boundaries the policy route enforces. Defaults to {@link DEFAULT_POLICY}. */
-  readonly policy?: PolicyConfig;
-  /**
-   * Load the pre-execution policy hook into the worker's workspace.
-   *
-   * On by default, which is the change this milestone makes: the policy gate used to be
-   * exercised only by a dedicated probe, so the worker demo ran *unenforced* while the
-   * endpoint it would have consulted sat there answering nobody. A run with the hook off
-   * is a run with no pre-execution boundary, and has to say so.
-   */
-  readonly policyHook?: boolean;
-  /**
-   * Empty the policy audit file when the workspace is prepared. Defaults to `true`.
-   *
-   * A program that builds this layer more than once — once per phase, in separate
-   * scopes — must pass `false`, or each phase starts by deleting the record of the
-   * previous one.
-   */
-  readonly freshAudit?: boolean;
 }
 
 /**
- * Lays out the worker's workspace, including the policy hook when one is wanted.
+ * Lays out the worker's workspace: the spike's own fixture files, written into a scratch
+ * directory. A server must never write them into a folder an operator picked.
  *
- * The hook-installing half moved to `policy/install.ts`, because a browser-started run
- * needs exactly that and needs none of this: the fixture files below are the spike's own,
- * written into a scratch directory, and a server must never write them into a folder an
- * operator picked. What is left here is the spike's part, with the shared part delegated.
- *
- * The audit file is written *outside* the workspace on purpose: it records what the
- * worker was allowed and denied, and a worker that can read its own audit trail can read
- * the shape of the boundary it is inside.
+ * It also installed the pre-execution policy hook until that gate was removed
+ * (2026-11-06, at the operator's request).
  */
 export const prepareWorkspace = Effect.fnUntraced(function* (input: {
   readonly workspace: string;
   readonly files: Readonly<Record<string, string>>;
-  readonly hook?: {
-    readonly policyUrl: string;
-    readonly auditPath: string;
-    /** Empty the audit file first. See `policy/install.ts` for why this is required. */
-    readonly freshAudit: boolean;
-  };
 }) {
   yield* Effect.sync(() => {
     mkdirSync(input.workspace, { recursive: true });
@@ -141,26 +103,13 @@ export const prepareWorkspace = Effect.fnUntraced(function* (input: {
       await Bun.write(target, content);
     }),
   );
-  const hook = input.hook;
-  if (hook === undefined) return;
-  // `orDie` here and not in the server: a demo whose workspace it created cannot have an
-  // `opencode.json` it did not write, so a refusal would be a defect in this file.
-  yield* Effect.orDie(
-    installOpenCodeGate({
-      workspace: input.workspace,
-      policyUrl: hook.policyUrl,
-      auditPath: hook.auditPath,
-      freshAudit: hook.freshAudit,
-    }),
-  );
 });
 
 /**
  * The spike's application layer.
  *
  * The ordering constraints here are real, which is why this is a layer graph and not a
- * `bootstrap` function: the control plane must exist before the workspace can be written
- * (the hook's config has to carry the live policy URL), the workspace must exist before
+ * `bootstrap` function: the workspace must exist before
  * the harness spawns into it, the store must exist before the MCP endpoint can serve a
  * tool that writes to it, and *all* of it must come down in reverse order on any exit.
  *
@@ -172,41 +121,26 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
   const name = options.workspaceName ?? "workspace";
   const workspace = join(RUNTIME_DIR, name);
   const databaseFile = join(RUNTIME_DIR, options.databaseName ?? "hunt.sqlite");
-  const auditFile = join(RUNTIME_DIR, `${name}-policy-audit.log`);
 
   const store = ObservationStore.layer(databaseFile);
   const resolver = TargetStores.ofStore(
     options.targetId ?? "fixture-local",
   ).pipe(Layer.provide(store));
 
-  // One listener for all three control-plane surfaces: health, the MCP route the worker
-  // calls back into, and the policy route the harness-side hook consults.
-  const endpoint = ControlPlaneEndpoint.layer({
-    policy: options.policy ?? DEFAULT_POLICY,
-  }).pipe(
+  // One listener for both control-plane surfaces: health and the MCP route the worker
+  // calls back into.
+  const endpoint = ControlPlaneEndpoint.layer({}).pipe(
     Layer.provideMerge(McpCredentials.layer),
     Layer.provideMerge(McpCallCounter.layer),
-    Layer.provideMerge(PolicyDecisions.layer),
     Layer.provide(resolver),
   );
 
   const workspaceReady = Layer.effectDiscard(
-    Effect.flatMap(ControlPlaneEndpoint, (control) =>
-      prepareWorkspace({
-        workspace,
-        files: options.workspaceFiles ?? {},
-        ...(options.policyHook === false
-          ? {}
-          : {
-              hook: {
-                policyUrl: control.policyUrl,
-                auditPath: auditFile,
-                freshAudit: options.freshAudit ?? true,
-              },
-            }),
-      }),
-    ),
-  ).pipe(Layer.provide(endpoint));
+    prepareWorkspace({
+      workspace,
+      files: options.workspaceFiles ?? {},
+    }),
+  );
 
   const harness = openCodeHarness(
     options.timeouts === undefined ? {} : { timeouts: options.timeouts },
@@ -228,7 +162,7 @@ export const spikeLayer = (options: SpikeOptions = {}) => {
       Layer.provide(HarnessResolver.single),
       Layer.provide(harness),
     ),
-    Layer.succeed(SpikePaths, { workspace, databaseFile, auditFile }),
+    Layer.succeed(SpikePaths, { workspace, databaseFile }),
   );
 };
 

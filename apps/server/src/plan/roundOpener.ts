@@ -36,7 +36,6 @@ import { Context, Effect, Layer } from "effect";
 import { DEFAULT_GOAL_BRIEFING_MAX_CHARS } from "../briefing/goalBriefing";
 import type { GoalBriefingTooLarge } from "../briefing/goalBriefing";
 import { FleetStore } from "../persistence/fleet";
-import { POLICY_AUDIT_FILE } from "../policy/install";
 import { PlanRefused, PlanSupervisor } from "./planSupervisor";
 import type { PlanRoundStarted } from "./planSupervisor";
 
@@ -97,7 +96,7 @@ export class RoundOpener extends Context.Service<
              * directory *inside* the engagement folder, and `undefined` says this target
              * has no folder — a statement rather than an omission, because the check does
              * not run for a caller who leaves the field out
-             * (`policy/install.ts`'s `GatedRoleDirectory.workspace`).
+             * (`harness/roleDirectory.ts`'s `RoleDirectoryInput.workspace`).
              *
              * A row that has gone missing between the caller's own checks and here is
              * `target_unavailable`: the supervisor would say the same thing a moment later
@@ -117,10 +116,6 @@ export class RoundOpener extends Context.Service<
               targetId: row.targetId,
               goalId: request.goalId,
               workspace: row.workspacePath ?? undefined,
-              // Outside the planning directory on purpose: the gate's own record must not
-              // be somewhere the gated agent can read or rewrite. `gatedRoleDirectory`
-              // checks that rather than trusting it.
-              auditPath: `${fleet.paths.evidenceDirectory(row.targetId)}/${POLICY_AUDIT_FILE}`,
               title: `bit planner: ${row.name}`,
               briefingMaxChars,
               ...(request.directive === undefined

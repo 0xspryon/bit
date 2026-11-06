@@ -5,7 +5,7 @@
  * are the ones that are *different* rather than a second pass over the ones that are not:
  *
  * 1. **A start returns before the round finishes**, and what it returns is a round that is
- *    already durable, gated, sessioned, credentialed and prompted.
+ *    already durable, sessioned, credentialed and prompted.
  * 2. **One round per goal, claimed before the fork.** Two starts in the same tick: one
  *    wins and the other is refused naming the round that holds the goal. This is the half
  *    `openRound`'s own check cannot make, because both fibers would be past it.
@@ -14,8 +14,7 @@
  *    the row, the credential registry and the harness recorder rather than taken from the
  *    response.
  * 5. **Shutdown settles a round in flight**, read off the file after the runtime is gone.
- * 6. **The session is created in the gated planning directory**, which is not the
- *    workspace, and the gate goes in before the session exists.
+ * 6. **The session is created in the planning directory**, which is not the workspace.
  * 7. **The lineage** is opened by a goal's first round and continued by its second.
  *
  * The sweep's side of this — a round a dead process left `running`, reconciled to
@@ -29,7 +28,7 @@
  * was opened in. A real harness would make each of those wait on a model and a provider
  * login, and would make "the harness cannot answer" a state a test could not produce on
  * demand. What is **not** faked: the fleet, the target database, the credential registry,
- * the policy gate's own `gatedRoleDirectory`, and the supervisor itself. The round rows
+ * `harness/roleDirectory.ts`'s `roleDirectory`, and the supervisor itself. The round rows
  * these tests read are rows in a file on disk, which is why this suite is part of
  * `test:persistence`.
  */
@@ -63,7 +62,6 @@ import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
 import { FleetStore } from "../persistence/fleet";
 import { ObservationStore, operatorScope } from "../persistence/store";
-import { PolicyHookNotInstalled } from "../policy/install";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { RunNarrations, type RunNarration } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
@@ -135,7 +133,7 @@ interface Recorder {
    * Every call the supervisor made, in order, as `kind:detail`.
    *
    * One ordered list rather than a field per call, because the **order** is half of what
-   * this suite asserts: the gate before the session, the session before the registration,
+   * this suite asserts: the session before the registration,
    * the registration before the prompt. Separate arrays could each be right while the
    * sequence between them was wrong.
    */
@@ -216,19 +214,17 @@ const transport = (operation: string, detail: string) =>
  * freed" from "the second attempt failed the same way".
  */
 interface Faults {
-  /** How many `installGate` calls fail with `PolicyHookNotInstalled` before one succeeds. */
-  readonly gate?: number;
   /** How many `createSession` calls fail with a transport error before one succeeds. */
   readonly createSession?: number;
   /**
-   * How many `installGate` calls **die** before one succeeds.
+   * How many `createSession` calls **die** before one succeeds.
    *
    * A defect, not a typed failure, and the distinction is the whole point of the test that
    * uses it: `Effect.result` absorbs the second and not the first, so a defect used to
    * reach the finalizer with `ending` still at its `stopped` default and be written down as
    * `interrupted`.
    */
-  readonly gateDefect?: number;
+  readonly createDefect?: number;
 }
 
 const fakeClient = (
@@ -236,8 +232,7 @@ const fakeClient = (
   recorder: Recorder,
   faults: Faults = {},
 ): Layer.Layer<AgentHarness> => {
-  let gateFailures = faults.gate ?? 0;
-  let gateDefects = faults.gateDefect ?? 0;
+  let createDefects = faults.createDefect ?? 0;
   let createFailures = faults.createSession ?? 0;
   /**
    * The sessions this fake actually created.
@@ -251,34 +246,15 @@ const fakeClient = (
   return Layer.succeed(
     AgentHarness,
     stubHarness({
-      // Records the directory it was asked to gate and writes nothing. The gate has its
-      // own suite (`policy/install.test.ts`), and what this suite is about is *which*
-      // directory the supervisor routed through it, and when.
-      installGate: (input) =>
+      createSession: (input) =>
         Effect.suspend(() => {
-          if (gateDefects > 0) {
-            gateDefects -= 1;
+          if (createDefects > 0) {
+            createDefects -= 1;
             // `die`, not `fail`: this is the shape of a bug in a seam — a thrown
             // `TypeError`, a broken invariant — rather than an outcome the supervisor
             // declared it could receive.
-            return Effect.die(
-              new Error("scripted: the gate installer has a bug"),
-            );
+            return Effect.die(new Error("scripted: the harness has a bug"));
           }
-          if (gateFailures > 0) {
-            gateFailures -= 1;
-            return Effect.fail(
-              new PolicyHookNotInstalled({
-                workspace: input.workspace,
-                detail: "scripted: this directory's gate will not install",
-              }),
-            );
-          }
-          recorder.order.push(`gate:${input.workspace}`);
-          return Effect.void;
-        }),
-      createSession: (input) =>
-        Effect.suspend(() => {
           if (createFailures > 0) {
             createFailures -= 1;
             return Effect.fail(
@@ -452,7 +428,7 @@ const world = (
   const scratch = newScratch();
   const root = join(scratch, "fleet");
   // Outside the fleet root, like a real engagement's folder: the containment check in
-  // `gatedRoleDirectory` refuses a planning directory inside the workspace, and a test
+  // `roleDirectory` refuses a planning directory inside the workspace, and a test
   // whose workspace *was* the fleet root would be asserting against a layout nobody has.
   const workspace = join(scratch, "work");
   mkdirSync(workspace, { recursive: true });
@@ -583,10 +559,6 @@ const goal = (
       targetId: TARGET,
       goalId,
       workspace,
-      // Inside the target's own `evidence/`, which is a sibling of `planning/` — so it is
-      // outside the directory it records, which `gatedRoleDirectory` checks rather than
-      // trusts.
-      auditPath: join(root, "targets", TARGET, "evidence", "policy-audit.log"),
       title: `bit planner: ${goalId}`,
     } satisfies PlanInput;
   });
@@ -967,7 +939,7 @@ describe("the prompt a round is opened with", () => {
   test("a goal this target does not hold is refused goal_not_found, from the briefing read", async () => {
     const recorder = emptyRecorder();
     const { scriptFor } = scripts({ narration: [], status: undefined });
-    const { root, workspace, runtime, ready } = world(scriptFor, recorder, {});
+    const { workspace, runtime, ready } = world(scriptFor, recorder, {});
     await ready;
 
     const refused = await runtime.runPromise(
@@ -978,13 +950,6 @@ describe("the prompt a round is opened with", () => {
             targetId: TARGET,
             goalId: "goal_absent",
             workspace,
-            auditPath: join(
-              root,
-              "targets",
-              TARGET,
-              "evidence",
-              "policy-audit.log",
-            ),
             title: "bit planner: absent",
           }),
         );
@@ -1041,17 +1006,15 @@ describe("opening a planner round", () => {
     expect(started.budget).toBe(7);
     expect(started.lineage).toBe("opened");
 
-    // Gate, then session, then registration, then prompt. The order is the claim: a
-    // session created before its directory was gated is an ungated planner, and a prompt
-    // sent before the registration is a planner with no endpoint to call.
+    // Session, then registration, then prompt. The order is the claim: a prompt sent
+    // before the registration is a planner with no endpoint to call.
     const planning = join(root, "targets", TARGET, "planning", started.roundId);
     expect(recorder.order).toEqual([
-      `gate:${planning}`,
       `create:${planning}`,
       `register:bit-${started.roundId}`,
       // The real prompt now: the round's framing with the goal briefing pasted in. The
       // assertion rebuilds it from the same assembler rather than restating the text,
-      // because what is being checked here is the *order* — gate, session, registration,
+      // because what is being checked here is the *order* — session, registration,
       // then prompt — and a literal would make this test about the wording.
       "prompt",
     ]);
@@ -1392,7 +1355,7 @@ describe("a refused round", () => {
    * The finding this slice was sent back for.
    *
    * `openRound` writes the row as its last step and four things after it can fail: the
-   * gate, the session, the lineage write, the credential and the registration. If the
+   * directory, the session, the lineage write, the credential and the registration. If the
    * settling finalizer is registered after all of them — which is how this was first
    * written — any of those failing leaves the row `running` forever: the goal is then
    * refused `round_conflict` by a row nothing is driving, with no `plan.round.settled` in
@@ -1401,20 +1364,14 @@ describe("a refused round", () => {
    *
    * So the assertion is not "the start was refused" — that always held — but the three
    * things that did not: the row is **settled**, the log carries the **pair**, and the goal
-   * **takes another round in the same process**. Two faults, because the first failing step
-   * and a later one are different distances from the finalizer.
+   * **takes another round in the same process**. (There were two faults until the policy
+   * gate went, 2026-11-06: its install was the first step after the row.)
    */
   for (const fault of [
     {
-      what: "the policy gate will not install",
-      faults: { gate: 1 },
-      // The gate is the first step after the row, so nothing else ran at all.
-      reason: "planning_ungated",
-    },
-    {
       what: "the harness will not create the session",
       faults: { createSession: 1 },
-      // One step further in: the directory was made and gated before this failed.
+      // The directory was made and checked before this failed.
       reason: "harness_unreachable",
     },
   ] as const) {
@@ -1502,7 +1459,7 @@ describe("a refused round", () => {
     const { scriptFor } = scripts({ narration: [], status: undefined });
     const { root, workspace, runtime, ready } = world(scriptFor, recorder, {
       askTimeout: "10 millis",
-      faults: { gateDefect: 1 },
+      faults: { createDefect: 1 },
     });
     await ready;
 

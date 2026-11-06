@@ -3,8 +3,8 @@
  *
  * There were two listeners and, in a separate process, a third hand-written one: the MCP
  * endpoint the worker calls back into, the policy endpoint the harness-side hook
- * consults before a tool runs, and `main.ts`'s own `Bun.serve` answering the health
- * route out of a bare `fetch` callback. They are one listener now — one port, one origin
+ * consulted before a tool ran (removed with the gate on 2026-11-06), and `main.ts`'s own
+ * `Bun.serve` answering the health route out of a bare `fetch` callback. They are one listener now — one port, one origin
  * policy, one shutdown path, one base URL to hand out — and `main.ts` serves *this*
  * rather than a second composition of its own.
  *
@@ -14,8 +14,6 @@
  *
  * - `/api/v1/mcp` fails closed. No credential, an unknown one or an expired one is a
  *   `401` before any protocol handling, tool list or dispatch.
- * - `/api/v1/policy/decide` is deliberately unauthenticated, at the operator's
- *   direction. The reasoning and its cost are recorded on `policyRoutes` itself.
  * - `/api/v1/health` is unauthenticated and says one word. It is a liveness answer for
  *   the browser app and a proxy, and it deliberately reports nothing about the store,
  *   the harness or any attempt: a health endpoint that leaks internal state is a
@@ -68,14 +66,6 @@ import type { ScopeImportProgress } from "../import/progress";
 import type { GoalBriefingCeiling, GoalPlanning } from "../mcp/goalTools";
 import type { PlannerHarnesses } from "../mcp/plannerTools";
 import { TargetStores } from "../persistence/targetStores";
-import {
-  POLICY_DECIDE_PATH,
-  PolicyDecisions,
-  policyRoutes,
-  type PolicyConfig,
-  type PolicyDecision,
-  type PolicyRequest,
-} from "../policy/service";
 
 /** The one path the health route answers on, under the shared API prefix. */
 export const HEALTH_PATH = apiPath("health");
@@ -112,21 +102,11 @@ const healthRoutes = Layer.effectDiscard(
  * this file has always served, which is what keeps the merge from changing what was
  * already here.
  *
- * The layer must already have everything resolved except the router and
- * {@link PolicyDecisions}. Whatever it registers carries its own admission posture;
- * nothing here wraps it, and it cannot wrap the three routes below.
+ * The layer must already have everything resolved except the router. Whatever it
+ * registers carries its own admission posture; nothing here wraps it, and it cannot wrap
+ * the routes below.
  *
- * **Why {@link PolicyDecisions} is in this requirement and the other three are not.** This
- * endpoint passes four services across the router's own memo-map boundary with
- * `Layer.succeed` — see the body of {@link ControlPlaneEndpoint.layer} and `main.ts` on why
- * that boundary exists at all — and any of them *could* be left unprovided by a caller. Only
- * this one is declared, because only this one a caller has no other way to get: the
- * policy route and the browser API are the two halves of the gate's decisions, the route
- * publishes and the API subscribes, and they must be the same instance or one of them is
- * talking to a bus nobody is listening to. The other three are things a caller holds for
- * its own reasons anyway, and a caller that provides its own gets the one it meant.
- *
- * Anything else a route set needs — the narration bus, for one — is the caller's to hand in
+ * Anything a route set needs — the narration bus, for one — is the caller's to hand in
  * the same way, with `Layer.succeedContext` over an instance read out of its own graph.
  * This endpoint does not know about those services and must not grow a list of them.
  */
@@ -148,7 +128,7 @@ const healthRoutes = Layer.effectDiscard(
  * drift: three times the heartbeat leaves room for a heartbeat to be late without the
  * listener giving up, and `LIVE_HEARTBEAT_SECONDS` is the contract's constant that the
  * stream itself also derives from. The floor of 30 keeps the ordinary request paths —
- * MCP, policy, the browser API — from inheriting a short timeout if the heartbeat is ever
+ * MCP, the browser API — from inheriting a short timeout if the heartbeat is ever
  * shortened, and `Bun.serve` caps `idleTimeout` at 255 seconds, which is the other clamp.
  *
  * The invariant that matters, asserted in `browserApi.test.ts`:
@@ -162,7 +142,7 @@ export const CONTROL_PLANE_IDLE_TIMEOUT = Math.min(
 export type ControlPlaneRoutes = Layer.Layer<
   never,
   never,
-  HttpRouter.HttpRouter | PolicyDecisions
+  HttpRouter.HttpRouter
 >;
 
 export interface ControlPlaneHandle {
@@ -195,16 +175,10 @@ export interface ControlPlaneHandle {
    * credential is accepted at (D13).
    */
   readonly importerMcpUrl: string;
-  /** Where the harness-side policy hook posts. */
-  readonly policyUrl: string;
   /** Liveness, on the same origin as the other two. */
   readonly healthUrl: string;
   /** Authenticated MCP requests served, for asserting the worker really reached us. */
   readonly callCount: Effect.Effect<number>;
-  /** Policy decisions answered, in order. */
-  readonly decisions: Effect.Effect<
-    readonly (PolicyRequest & PolicyDecision)[]
-  >;
 }
 
 /**
@@ -218,7 +192,6 @@ export class ControlPlaneEndpoint extends Context.Service<
   ControlPlaneHandle
 >()("bit/http/ControlPlaneEndpoint") {
   static readonly layer = (options: {
-    readonly policy: PolicyConfig;
     readonly port?: number;
     /** Merged onto the same router. See {@link ControlPlaneRoutes}. */
     readonly extraRoutes?: ControlPlaneRoutes | undefined;
@@ -289,7 +262,6 @@ export class ControlPlaneEndpoint extends Context.Service<
         // store here was what made this process serve one target.
         const stores = yield* TargetStores;
         const credentials = yield* McpCredentials;
-        const decisions = yield* PolicyDecisions;
 
         // Both route sets are built into one router, so `toWebHandler` returns a single
         // handler for the single listener below. Services are passed in rather than
@@ -310,14 +282,12 @@ export class ControlPlaneEndpoint extends Context.Service<
               ? {}
               : { scopeImports: options.scopeImports }),
           }),
-          policyRoutes(options.policy),
           healthRoutes,
           options.extraRoutes ?? Layer.empty,
         ).pipe(
           Layer.provideMerge(Layer.succeed(TargetStores, stores)),
           Layer.provideMerge(Layer.succeed(McpCredentials, credentials)),
           Layer.provideMerge(Layer.succeed(McpCallCounter, counter)),
-          Layer.provideMerge(Layer.succeed(PolicyDecisions, decisions)),
         );
 
         const web = yield* Effect.acquireRelease(
@@ -351,10 +321,8 @@ export class ControlPlaneEndpoint extends Context.Service<
           plannerMcpUrl: `${origin}${PLANNER_MCP_PATH}`,
           goalMcpUrl: `${origin}${GOAL_MCP_PATH}`,
           importerMcpUrl: `${origin}${IMPORTER_MCP_PATH}`,
-          policyUrl: `${origin}${POLICY_DECIDE_PATH}`,
           healthUrl: `${origin}${HEALTH_PATH}`,
           callCount: counter.count,
-          decisions: decisions.all,
         });
       }),
     );

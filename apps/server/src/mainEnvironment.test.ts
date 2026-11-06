@@ -25,9 +25,9 @@
  *
  * It read `main.ts` alone, which is the composition root and *nearly* the only place this
  * process reads its environment — and the exception is the one that proves the point.
- * `policy/claudeCodeGate.ts` reads `CLAUDE_CONFIG_DIR`, which is absent from
- * `passThroughEnv` and was therefore invisible to exactly the test written to make that
- * class of gap visible. A variable read in an imported module is as unreachable under
+ * `policy/claudeCodeGate.ts` read `CLAUDE_CONFIG_DIR` (until the policy gate was removed,
+ * 2026-11-06), which is absent from `passThroughEnv` and was therefore invisible to exactly
+ * the test written to make that class of gap visible. A variable read in an imported module is as unreachable under
  * `bun run dev` as one read here, so the enumeration is over the modules rather than over
  * one file, and what the test guarantees now matches what its name claims.
  *
@@ -93,8 +93,6 @@ const turboConfig = JSON.parse(
  */
 const NOT_PASSED_THROUGH: Readonly<Record<string, string>> = {
   HOME: "turbo passes HOME through by default, and main.ts reads it only as the last fallback for WORKSPACE_ROOT, which is itself in the list",
-  CLAUDE_CONFIG_DIR:
-    "read by policy/claudeCodeGate.ts to find the settings file the gate is installed into, and deliberately left out of passThroughEnv: it is not a fail-open, because the harness child inherits the same stripped environment, so this process and Claude Code agree on ~/.claude either way. The cost, stated: an operator who relocates their Claude config cannot do so under `bun run dev`. A review ruled the variable may stand and this test's blindness to it may not — which is why it is here by name rather than unseen.",
 };
 
 /**
@@ -172,11 +170,15 @@ describe("the dev command can set everything main.ts configures from", () => {
      */
     const everywhere = serverReads();
     expect(serverModules().length).toBeGreaterThan(20);
-    expect(everywhere.map((read) => read.name)).toContain("CLAUDE_CONFIG_DIR");
-    // And it really is somewhere other than the entrypoint, which is the whole finding.
+    // A read somewhere other than the entrypoint, which is the whole finding. It was
+    // `CLAUDE_CONFIG_DIR` in the policy gate's module until the gate went (2026-11-06);
+    // the scope fixture's `HUNT_ROOT` is one today.
     expect(
-      everywhere.find((read) => read.name === "CLAUDE_CONFIG_DIR")?.where,
-    ).not.toContain("main.ts");
+      everywhere.some(
+        (read) =>
+          read.name === "HUNT_ROOT" && read.where.includes("scopeFixture.ts"),
+      ),
+    ).toBe(true);
   });
 
   test("every variable the server reads anywhere is accounted for", () => {

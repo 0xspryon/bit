@@ -99,9 +99,6 @@ import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import type { DatabaseError } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
-import { claudeCodeGateInstaller } from "../policy/claudeCodeGate";
-import type { GateInstaller } from "../policy/install";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import { projectNarration } from "../run/liveTranscript";
 import { RunNarrations, type RunNarration } from "../run/narration";
 import { WorkerEndpoints } from "../run/supervisor";
@@ -109,7 +106,7 @@ import type { ReadUpload } from "../upload/uploads";
 
 const base = mkdtempSync(join(tmpdir(), "bit-scope-importer-"));
 const fleetRoot = join(base, "fleet");
-// Outside the fleet root, like a real engagement's folder: `gatedRoleDirectory` refuses a
+// Outside the fleet root, like a real engagement's folder: `roleDirectory` refuses a
 // role directory inside the workspace, and a test whose workspace *was* the fleet root
 // would be asserting against a layout nobody has.
 const workspace = join(base, "work");
@@ -237,8 +234,10 @@ interface Script {
     multiTurn: boolean;
     /** The session continued rather than created, when this was a resume (S6). */
     resume: string | undefined;
-    /** Where the session runs, which is where the gate went. */
+    /** Where the session runs. */
     directory: string;
+    /** Whether the harness pre-approves its page fetch (Claude Code's `WebFetch`). */
+    fetchesPages: boolean;
     /** The model the session is opened on: a reopen after a switch opens on the new one. */
     model: string;
     options: readonly ModelOptionSelection[] | undefined;
@@ -315,8 +314,6 @@ interface Script {
   done: Promise<void>;
   /** Makes `createSession` fail, for a session that never opens. */
   failCreate: boolean;
-  /** The harness's gate installer; none when unset, as most tests want (A6 F12). */
-  installGate: GateInstaller | undefined;
   /** Makes the opening prompt fail, for a session the harness refuses to start. */
   failPrompt: boolean;
   /** Makes a later (steered) prompt fail, for a session that refuses a second message. */
@@ -403,7 +400,6 @@ const newScript = (readable: readonly string[]): Script => {
     streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
-    installGate: undefined,
     failPrompt: false,
     failSteer: false,
     failInterrupt: false,
@@ -438,10 +434,6 @@ const scriptedHarness = (script: Script) => {
       minted += 1;
       return minted === 1 ? "ses_import" : `ses_import_${String(minted)}`;
     },
-    installGate: (input) =>
-      script.installGate === undefined
-        ? Effect.void
-        : script.installGate(input),
     // What the agent is waiting on the operator for (A7-Q): `script.questions.ask`.
     ...script.questions.members,
     /*
@@ -494,6 +486,7 @@ const scriptedHarness = (script: Script) => {
               multiTurn: input.multiTurn === true,
               resume: input.resume,
               directory: input.directory,
+              fetchesPages: input.fetchesPages === true,
               model: input.model,
               options: input.options,
             });
@@ -817,7 +810,6 @@ const world = (readable: readonly string[]) => {
     heldSettle(script),
     McpCredentials.layer,
     McpCallCounter.layer,
-    PolicyDecisions.layer,
     // The one narration bus, so a test can subscribe to what the importer publishes (S4).
     RunNarrations.layer,
   );
@@ -827,7 +819,6 @@ const world = (readable: readonly string[]) => {
   const endpoint = Layer.unwrap(
     Effect.map(Effect.context<ScopeImportProgress>(), (shared) =>
       ControlPlaneEndpoint.layer({
-        policy: DEFAULT_POLICY,
         // The one registry across the router's memo-map boundary. See
         // `mcp/importerTools.test.ts` on what a second one would look like.
         scopeImports: Layer.succeed(
@@ -1272,6 +1263,9 @@ describe("nothing is started but the import", () => {
     // a session with a different toolkit, which `mcp/importerTools.test.ts` covers from
     // the other side.
     expect(built.script.registrations[0]?.url).toContain("/importer/mcp");
+    // And it reads pages with the harness's own fetch, so that is pre-approved for it
+    // (Claude Code's `WebFetch`) whatever the operator's settings allow otherwise.
+    expect(built.script.created[0]?.fetchesPages).toBe(true);
     await runtime.dispose();
   });
 
@@ -2514,16 +2508,14 @@ describe("a conversation opened with no links", () => {
 });
 
 /**
- * A6 F12: the built server could not find its gate, and refused every import. A gate that
- * genuinely cannot be found must still refuse, as `import_ungated`, before a session exists.
+ * A role directory inside the workspace is refused before a session exists (the layout's
+ * rule, `harness/roleDirectory.ts`). It was `import_ungated` while the policy gate's
+ * installer made the check; since the gate was removed (2026-11-06) it is the directory's
+ * own reason, `import_directory_unusable`.
  */
-describe("a harness whose gate cannot be found", () => {
-  test("a conversation is refused import_ungated, and no session is created or indexed", async () => {
+describe("an import directory inside the workspace", () => {
+  test("a conversation is refused import_directory_unusable, and no session is created or indexed", async () => {
     const built = world([PAGE_GOOD]);
-    // The real Claude Code installer, looking from a folder no server package is above.
-    const nowhere = join(base, "no-server-package-here");
-    mkdirSync(nowhere, { recursive: true });
-    built.script.installGate = claudeCodeGateInstaller(nowhere);
     const runtime = ManagedRuntime.make(built.layer);
     const opened = await runtime.runPromise(
       Effect.gen(function* () {
@@ -2539,7 +2531,8 @@ describe("a harness whose gate cannot be found", () => {
           (yield* ScopeImporter).converse({
             targetId: TARGET,
             targetName: "Acme Corp",
-            workspacePath: workspace,
+            // The folder above the fleet root, so every import directory is inside it.
+            workspacePath: base,
             text: "Read the program page.",
           }),
         );
@@ -2548,9 +2541,11 @@ describe("a harness whose gate cannot be found", () => {
     expect(opened._tag).toBe("Failure");
     if (opened._tag !== "Failure") return;
     expect(opened.failure._tag).toBe("ImporterConversationRefused");
-    expect(opened.failure).toMatchObject({ reason: "import_ungated" });
+    expect(opened.failure).toMatchObject({
+      reason: "import_directory_unusable",
+    });
     expect(String((opened.failure as { detail: string }).detail)).toContain(
-      "plugins/claudeCodeGate.ts was not found",
+      "a session that is not a worker must run outside it",
     );
     expect(built.script.created).toEqual([]);
     expect(built.script.prompts).toEqual([]);

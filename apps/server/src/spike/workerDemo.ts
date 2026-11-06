@@ -8,16 +8,14 @@
  * What this proves, and nothing more:
  * 1. We spawn `opencode serve`, create a host-controlled session, submit a task and
  *    read its terminal status.
- * 2. The worker investigates the local fixture inside a bounded request budget, **with
- *    the pre-execution policy hook loaded**, so every tool call it makes is decided by
- *    our control plane before it runs. Until this milestone that was true only of a
- *    dedicated probe, and this demo ran unenforced.
+ * 2. The worker investigates the local fixture inside a bounded request budget. (Until
+ *    2026-11-06 with the pre-execution policy hook loaded; the gate was removed at the
+ *    operator's request.)
  * 3. It records observations through our own MCP tool, authenticated and bound to the
  *    attempt, which survive in SQLite.
  *
  * The work itself is {@link runWorkerPhase}; this file is the binding, the boundaries and
- * the printing. `milestoneProof.ts` drives the same function, which is what keeps the
- * demo and the proof from describing two different systems.
+ * the printing.
  *
  * **Nothing may import this module.** `runMain` is called at module scope, so an import
  * *runs the demo* — which is how a first attempt at `milestoneProof.ts` silently ran a
@@ -34,12 +32,7 @@ import { Effect } from "effect";
 
 import { FixtureEndpoint } from "../fixture/server";
 import { runMain } from "./main";
-import {
-  reportObservations,
-  reportPolicy,
-  runWorkerPhase,
-  WORKER_POLICY,
-} from "./phases";
+import { reportObservations, runWorkerPhase } from "./phases";
 import { workerPrompt } from "./prompts";
 import { spikeLayer, WORKER_MODEL } from "./runtime";
 
@@ -97,7 +90,6 @@ const program = Effect.gen(function* () {
   console.log("\n-- fixture traffic actually seen --");
   console.log(JSON.stringify(result.fixtureTraffic, null, 2));
 
-  reportPolicy(result);
   reportObservations(result);
 
   if (result.harnessStderrTail.length > 0) {
@@ -110,7 +102,7 @@ const program = Effect.gen(function* () {
 runMain(
   Effect.scoped(
     program.pipe(
-      Effect.provide(spikeLayer({ policy: WORKER_POLICY })),
+      Effect.provide(spikeLayer()),
       Effect.tap((status) =>
         Effect.sync(() => {
           console.log(`\nattempt terminal status: ${status}`);

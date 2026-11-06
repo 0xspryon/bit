@@ -35,7 +35,7 @@
 import type { ModelOptionSelection } from "@bit/contracts";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -73,12 +73,6 @@ import { FleetStore } from "../persistence/fleet";
 import { operatorScope, type ObservationStore } from "../persistence/store";
 import * as identifier from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
-import {
-  CLAUDE_SETTINGS_PATH,
-  installClaudeCodeGate,
-} from "../policy/claudeCodeGate";
-import { installOpenCodeGate, POLICY_PLUGIN_PACKAGE } from "../policy/install";
-import { PERMISSIVE_POLICY, PolicyDecisions } from "../policy/service";
 import { RunNarrations, type RunNarration } from "./narration";
 import {
   settlementFor,
@@ -202,15 +196,6 @@ const fakeClient = (
   scriptFor: (sessionId: string) => Script,
   recorder: Recorder,
   options?: {
-    /**
-     * The gate installer to use, and the only thing these tests vary per harness.
-     *
-     * Defaults to the stub's no-op, which is what most of this file wants: the gate has
-     * its own suite and a filesystem write per test would be noise. The
-     * "same supervisor, both harnesses" block below passes the two **real** installers,
-     * which is how the claim that neither needs a branch here is actually checked.
-     */
-    readonly installGate?: AgentHarness["Service"]["installGate"];
     /** Mints ids in a given harness's format, so a test can see which one ran. */
     readonly newSessionId?: () => string;
   },
@@ -218,9 +203,6 @@ const fakeClient = (
   Layer.succeed(
     AgentHarness,
     stubHarness({
-      ...(options?.installGate === undefined
-        ? {}
-        : { installGate: options.installGate }),
       ...(options?.newSessionId === undefined
         ? {}
         : { newSessionId: options.newSessionId }),
@@ -360,7 +342,6 @@ const world = (
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
           ),
@@ -448,15 +429,9 @@ const readAfterShutdown = (root: string, targetId: string) => {
 /**
  * One run's input, with a scratch workspace of its own.
  *
- * The workspace is real and per-target because starting a run now *writes* to it — the
- * pre-execution policy gate is installed there before the session is created — so a
- * shared `/tmp` would have every test in this file installing over every other, and
- * would leave a `.opencode` directory behind on the machine. `afterEach` removes the
- * whole temp root.
- *
- * The audit path sits beside the workspace rather than inside it, which is the same
- * arrangement the server uses for a real run and the same reason: a worker that can read
- * its own audit trail can read the shape of the boundary it is inside.
+ * The workspace is real and per-target because a run claims its folder, and two tests
+ * sharing one would refuse each other. (Until 2026-11-06 starting a run also installed
+ * the policy gate into it.) `afterEach` removes the whole temp root.
  */
 const draft = (
   root: string,
@@ -499,7 +474,6 @@ const draft = (
       targetId,
       intentId,
       workspace: base,
-      auditPath: join(root, "..", "work", `${targetId}-policy-audit.log`),
       title: `bit: ${targetId}`,
     } satisfies RunInput;
   });
@@ -918,7 +892,6 @@ describe("starting a run", () => {
                   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                   goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                   importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                  policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
             ),
@@ -1003,7 +976,6 @@ describe("starting a run", () => {
                   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                   goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                   importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                  policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
             ),
@@ -1366,7 +1338,6 @@ describe("carrying an interrupted attempt on", () => {
           targetId: "alpha",
           replacesAttemptId: first.attemptId,
           workspace: input.workspace,
-          auditPath: input.auditPath,
           title: input.title,
           note,
         });
@@ -1466,7 +1437,6 @@ describe("carrying an interrupted attempt on", () => {
             targetId: "alpha",
             replacesAttemptId: first.attemptId,
             workspace: input.workspace,
-            auditPath: input.auditPath,
             title: input.title,
             note: "",
           }),
@@ -1512,7 +1482,6 @@ describe("carrying an interrupted attempt on", () => {
             targetId: "alpha",
             replacesAttemptId: "ats_never_existed",
             workspace: input.workspace,
-            auditPath: input.auditPath,
             title: input.title,
             note: "",
           }),
@@ -1701,7 +1670,6 @@ describe("when the harness stops being readable", () => {
                   plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                   goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                   importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                  policy: "http://127.0.0.1:9/api/v1/policy/decide",
                 }),
               }),
             ),
@@ -2202,36 +2170,26 @@ const fakeHarnessShape = (
  * set, no `switch` to exercise and no driver kind reachable from it — the supervisor's
  * requirement is one service, so a branch on driver would have had nothing to branch on.
  *
- * Each run is asserted end to end, and the chain is the point:
- *
- * 1. the supervisor calls `installGate`, and that harness's real installer writes its real
- *    artefacts into the workspace — an OpenCode plugin plus `.opencode/opencode.json`, or a
- *    Claude Code hook script plus `.claude/settings.local.json`;
- * 2. the gate is then **invoked the way that harness invokes it** — an imported plugin
- *    module for one, a spawned process for the other — against the **real policy route on
- *    a real listener**;
- * 3. the control plane records a decision, which is what proves the gate was consulted
- *    rather than merely configured;
- * 4. the run settles, and the attempt row says `succeeded` and names the instance it ran
- *    on.
- *
- * The session id is minted by each harness in its own format, so the row also shows which
- * one ran: `ses_…` for OpenCode, a UUID for Claude Code.
+ * Each run is asserted end to end: the session id is minted by each harness in its own
+ * format, so the row shows which one ran (`ses_…` for OpenCode, a UUID for Claude Code),
+ * the run settles and the attempt row names the instance it ran on, and **nothing is
+ * written into the workspace**. Until 2026-11-06 each harness's real policy gate was
+ * installed there and invoked against a real policy route; the gate was removed at the
+ * operator's request, so the absence is what is asserted now.
  */
 describe("one supervisor, two harnesses", () => {
   /**
-   * A world with a real control plane, so the policy URL the gate is handed works.
+   * A world with a real control plane, so the MCP URLs a run is handed are real.
    *
    * Separate from {@link world} above, which has no listener because nothing else in this
    * file needs one — and a listener per test in a suite this size would be a port per
    * test for no assertion.
    */
-  const gatedWorld = (
+  const listenerWorld = (
     targetId: string,
     scriptFor: (sessionId: string) => Script,
     recorder: Recorder,
     harness: {
-      readonly installGate: AgentHarness["Service"]["installGate"];
       readonly newSessionId: () => string;
     },
   ) => {
@@ -2239,12 +2197,9 @@ describe("one supervisor, two harnesses", () => {
     const fleet = FleetStore.layer(root);
     const stores = TargetStores.layer.pipe(Layer.provide(fleet));
     const credentials = McpCredentials.layer;
-    const endpoint = ControlPlaneEndpoint.layer({
-      policy: PERMISSIVE_POLICY,
-    }).pipe(
+    const endpoint = ControlPlaneEndpoint.layer({}).pipe(
       Layer.provideMerge(credentials),
       Layer.provideMerge(McpCallCounter.layer),
-      Layer.provideMerge(PolicyDecisions.layer),
       Layer.provide(stores),
     );
     const layer = Layer.mergeAll(
@@ -2255,7 +2210,6 @@ describe("one supervisor, two harnesses", () => {
         Layer.provide(HarnessResolver.single),
         Layer.provide(
           fakeClient(scriptFor, recorder, {
-            installGate: harness.installGate,
             newSessionId: harness.newSessionId,
           }),
         ),
@@ -2282,125 +2236,22 @@ describe("one supervisor, two harnesses", () => {
     return { root, runtime, ready };
   };
 
-  /**
-   * Calls the OpenCode plugin the supervisor installed, the way `opencode serve` does.
-   *
-   * A dynamic import of the file in the workspace — not of `plugins/policyHook.ts` — so a
-   * broken copy, a bad path, or a plugin that no longer default-exports `{ id, setup }` is
-   * caught here rather than silently producing an ungated run.
-   */
-  const invokeOpenCodeGate = async (workspace: string, tool: string) => {
-    const configPath = join(workspace, ".opencode", "opencode.json");
-    const config = JSON.parse(await Bun.file(configPath).text()) as {
-      plugins: { package: string; options: Record<string, unknown> }[];
-    };
-    const entry = config.plugins.find(
-      (plugin) => plugin.package === POLICY_PLUGIN_PACKAGE,
-    );
-    if (entry === undefined) throw new Error("no plugin entry was installed");
-    const hookPath = join(workspace, ".opencode", "policy", "index.ts");
-    const module = (await import(`${hookPath}?v=${String(Date.now())}`)) as {
-      default: {
-        setup: (ctx: {
-          options: Record<string, unknown>;
-          tool: {
-            hook: (
-              name: "execute.before",
-              handler: (event: {
-                tool: string;
-                sessionID: string;
-                input: unknown;
-              }) => Promise<void>,
-            ) => void;
-          };
-        }) => Promise<void>;
-      };
-    };
-    let before:
-      | ((event: {
-          tool: string;
-          sessionID: string;
-          input: unknown;
-        }) => Promise<void>)
-      | undefined;
-    await module.default.setup({
-      options: entry.options,
-      tool: {
-        hook: (_name, handler) => {
-          before = handler;
-        },
-      },
-    });
-    if (before === undefined) throw new Error("the hook registered no handler");
-    // It must not throw: this scope permits.
-    await before({
-      tool,
-      sessionID: "ses_gated",
-      input: { url: "https://x.test/" },
-    });
-  };
-
-  /**
-   * Spawns the Claude Code hook the supervisor installed, the way the CLI does.
-   *
-   * The command and argv come out of the settings we wrote, so an entry pointing at a file
-   * we did not write, or carrying argv the script does not parse, fails here instead of
-   * producing an ungated run.
-   */
-  const invokeClaudeCodeGate = async (workspace: string, tool: string) => {
-    const settings = JSON.parse(
-      await Bun.file(join(workspace, CLAUDE_SETTINGS_PATH)).text(),
-    ) as {
-      hooks: { PreToolUse: { hooks: { command: string; args: string[] }[] }[] };
-    };
-    const entry = settings.hooks.PreToolUse[0]?.hooks[0];
-    if (entry === undefined) throw new Error("no hook entry was installed");
-    const child = Bun.spawn([entry.command, ...entry.args], {
-      stdin: new TextEncoder().encode(
-        JSON.stringify({
-          hook_event_name: "PreToolUse",
-          tool_name: tool,
-          session_id: "11111111-0000-4000-8000-00000000gate".replace(
-            "gate",
-            "0001",
-          ),
-          tool_input: { url: "https://x.test/" },
-        }),
-      ),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const code = await child.exited;
-    // 0, not 2: this scope permits, and anything but 0 would mean the gate refused.
-    if (code !== 0) {
-      throw new Error(
-        `the installed Claude Code gate exited ${String(code)}: ${await new Response(child.stderr).text()}`,
-      );
-    }
-  };
-
   const harnesses = [
     {
       driver: "opencode",
-      installGate: installOpenCodeGate,
       newSessionId: newOpenCodeSessionId,
       sessionShape: /^ses_/,
-      invoke: invokeOpenCodeGate,
-      tool: "webfetch",
     },
     {
       driver: "claude-code",
-      installGate: installClaudeCodeGate,
       newSessionId: newClaudeCodeSessionId,
       sessionShape:
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-      invoke: invokeClaudeCodeGate,
-      tool: "WebFetch",
     },
   ] as const;
 
   for (const harness of harnesses) {
-    test(`a run on ${harness.driver} settles, and its gate is consulted`, async () => {
+    test(`a run on ${harness.driver} settles, and nothing is written into its workspace`, async () => {
       const targetId = `target-${harness.driver}`;
       const recorder = emptyRecorder();
       const { scriptFor, release, held } = scripts({
@@ -2408,7 +2259,7 @@ describe("one supervisor, two harnesses", () => {
         stream: "open",
         status: "succeeded",
       });
-      const { root, runtime, ready } = gatedWorld(
+      const { root, runtime, ready } = listenerWorld(
         targetId,
         scriptFor,
         recorder,
@@ -2431,33 +2282,9 @@ describe("one supervisor, two harnesses", () => {
         // And the attempt is pinned to the instance that ran it.
         expect(started.instanceId).toBe(STUB_INSTANCE.instanceId);
 
-        // The gate the supervisor installed, invoked the way this harness invokes it,
-        // against the real policy route.
-        await harness.invoke(input.workspace, harness.tool);
-
-        const decisions = await runtime.runPromise(
-          Effect.flatMap(PolicyDecisions, (recorded) => recorded.all),
-        );
-        // A decision *row*, not a config assertion: the control plane decided this call.
-        expect(decisions).toHaveLength(1);
-        expect(decisions[0]).toMatchObject({
-          tool: harness.tool,
-          effect: "allow",
-          // The same basis vocabulary from both gates, so one reader handles either trail.
-          basis: "unrestricted",
-        });
-
-        // And the audit line, outside the workspace the worker runs in.
-        const audit = await Bun.file(input.auditPath).text();
-        expect(JSON.parse(audit.trim())).toMatchObject({
-          tool: harness.tool,
-          outcome: "allowed",
-          basis: "unrestricted",
-        });
-        // Not *inside* the workspace: compared with a separator, because the audit sits
-        // beside the workspace and a bare prefix check would read `…/work/t-audit.log` as
-        // being under `…/work/t`.
-        expect(input.auditPath.startsWith(`${input.workspace}/`)).toBe(false);
+        // Nothing of bit's in the operator's folder: no policy plugin, no hook, no
+        // settings file. The harness runs on the operator's own configuration.
+        expect(readdirSync(input.workspace)).toEqual([]);
 
         // Settlement, from the harness's own answer.
         await runtime.runPromise(release(started.harnessSessionId));
@@ -2484,9 +2311,8 @@ describe("one supervisor, two harnesses", () => {
   test("a second concurrent run in the same folder is refused, not queued", async () => {
     // Nothing else enforces one run at a time: slice A detached runs so they outlive the
     // request, and neither the route nor `start` had a guard. Two workers in one folder can
-    // misattribute each other's writes — both harnesses configure the gate per folder, so
-    // the second install repoints the first run's audit, and OpenCode registers its MCP
-    // endpoint per folder, so each worker would see the other's. Provenance is the thing
+    // misattribute each other's writes — OpenCode registers its MCP endpoint per folder, so
+    // each worker would see the other's. Provenance is the thing
     // this system exists to get right, so this refuses.
     const targetId = "target-busy";
     const recorder = emptyRecorder();
@@ -2495,10 +2321,14 @@ describe("one supervisor, two harnesses", () => {
       stream: "open",
       status: "succeeded",
     });
-    const { root, runtime, ready } = gatedWorld(targetId, scriptFor, recorder, {
-      installGate: installOpenCodeGate,
-      newSessionId: newOpenCodeSessionId,
-    });
+    const { root, runtime, ready } = listenerWorld(
+      targetId,
+      scriptFor,
+      recorder,
+      {
+        newSessionId: newOpenCodeSessionId,
+      },
+    );
     await ready;
     try {
       const input = await runtime.runPromise(
@@ -2530,8 +2360,7 @@ describe("one supervisor, two harnesses", () => {
         expect(second.failure.detail).toContain(first.attemptId);
         expect(second.failure.detail).toContain(input.workspace);
       }
-      // Nothing of the second run exists: no session created, nothing prompted, and — the
-      // part that matters — no second gate installed over the first run's.
+      // Nothing of the second run exists: no session created, nothing prompted.
       expect(recorder.created).toHaveLength(1);
       expect(recorder.prompts).toHaveLength(1);
       // And the refused run gave its intent back: a start that refuses after the claim was
@@ -2586,11 +2415,11 @@ describe("one supervisor, two harnesses", () => {
       stream: "open",
       status: "succeeded",
     });
-    const { root, runtime, ready } = gatedWorld(
+    const { root, runtime, ready } = listenerWorld(
       "target-one",
       scriptFor,
       recorder,
-      { installGate: installOpenCodeGate, newSessionId: newOpenCodeSessionId },
+      { newSessionId: newOpenCodeSessionId },
     );
     await ready;
     try {
@@ -2627,60 +2456,6 @@ describe("one supervisor, two harnesses", () => {
       await runtime.runPromise(releaseAll(held));
       await runtime.dispose();
     }
-  });
-
-  test("a Claude Code workspace whose settings we cannot parse refuses the run", async () => {
-    // The gate is load-bearing: a workspace that cannot be gated refuses the run rather
-    // than starting an ungated worker in it. Nothing has been prompted at that point, so
-    // refusing costs an error message — and because the refusal happens before
-    // `seedAttempt`, it writes *nothing at all*: no row to settle and nothing for a sweep
-    // to find.
-    const targetId = "target-unparseable";
-    const recorder = emptyRecorder();
-    const { scriptFor, held } = scripts({
-      narration: [],
-      stream: "open",
-      status: "succeeded",
-    });
-    const { root, runtime, ready } = gatedWorld(targetId, scriptFor, recorder, {
-      installGate: installClaudeCodeGate,
-      newSessionId: newClaudeCodeSessionId,
-    });
-    await ready;
-    try {
-      const input = await runtime.runPromise(
-        draft(root, targetId, "probe the limiter").pipe(Effect.orDie),
-      );
-      mkdirSync(join(input.workspace, ".claude"), { recursive: true });
-      const theirs = "{ not json, and possibly precious\n";
-      await Bun.write(join(input.workspace, CLAUDE_SETTINGS_PATH), theirs);
-
-      const refusal = await runtime.runPromise(
-        Effect.result(
-          Effect.flatMap(RunSupervisor, (supervisor) =>
-            supervisor.start(input),
-          ),
-        ),
-      );
-      expect(refusal._tag).toBe("Failure");
-      if (refusal._tag === "Failure") {
-        expect(refusal.failure.reason).toBe("workspace_ungated");
-      }
-      // Their file is untouched, and nothing was prompted.
-      expect(
-        await Bun.file(join(input.workspace, CLAUDE_SETTINGS_PATH)).text(),
-      ).toBe(theirs);
-      expect(recorder.prompts).toEqual([]);
-      expect(recorder.created).toEqual([]);
-    } finally {
-      await runtime.runPromise(releaseAll(held));
-      await runtime.dispose();
-    }
-
-    // No attempt row at all: the refusal is earlier than the seed, deliberately.
-    const rows = readAfterShutdown(root, targetId);
-    expect(rows.attempts).toEqual([]);
-    expect(rows.events).toEqual([]);
   });
 });
 
@@ -2792,7 +2567,6 @@ describe("two configured instances", () => {
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
           ),
@@ -3213,7 +2987,6 @@ describe("settlement keeps no transcript", () => {
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
           ),
@@ -3895,7 +3668,6 @@ describe("running an existing intent", () => {
         plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
         goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
         importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-        policy: "http://127.0.0.1:9/api/v1/policy/decide",
       }),
     );
     const started = await starting;

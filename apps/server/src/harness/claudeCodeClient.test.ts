@@ -42,7 +42,6 @@ import type { LiveItem } from "@bit/contracts";
 import { Duration, Effect, Fiber, Layer, Redacted, Stream } from "effect";
 
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
-import { CLAUDE_CODE_MINIMUM, compareVersions } from "../policy/claudeCodeGate";
 import { claudeCodeMessageId } from "./messageId";
 import { processIdentity } from "./ownedProcesses";
 import { HarnessResolver } from "./resolver";
@@ -385,19 +384,14 @@ describe("identity", () => {
   });
 });
 
-/* ── The build floor ────────────────────────────────────────────────────────── */
+/* ── The build ─────────────────────────────────────────────────────────────── */
 
-describe("the build floor", () => {
+describe("the build", () => {
   /**
-   * Builds the harness against a manifest reporting a given version.
-   *
-   * The version is read from the SDK package's own manifest, so there is no option to
-   * override — which is correct for production and means this test has to reach the real
-   * value. What it can check is the two things that matter: the installed build clears the
-   * floor, and the comparison that decides is the one `claudeCodeGate.ts` exports and
-   * tests directly.
+   * The version is read from the SDK package's own manifest. A diagnostic since the policy
+   * gate's floor went (2026-11-06), but still read, and still not "unknown" here.
    */
-  test("the installed build clears the floor, so the harness is offered", async () => {
+  test("the installed build's version is read, and the harness is offered", async () => {
     const built = await Effect.runPromise(
       Effect.result(
         Effect.scoped(
@@ -408,22 +402,7 @@ describe("the build floor", () => {
       ),
     );
     expect(built._tag).toBe("Success");
-    if (built._tag === "Success") {
-      // Not "unknown": an unreadable version refuses, because the version *is* the
-      // evidence for a safety property here rather than a diagnostic.
-      expect(built.success).not.toBe("unknown");
-      expect(
-        compareVersions(built.success, CLAUDE_CODE_MINIMUM),
-      ).toBeGreaterThanOrEqual(0);
-    }
-  });
-
-  test("the floor is the version that gained onFailure", () => {
-    // Below this, a PreToolUse hook entry silently ignores `onFailure: "block"`, so a hook
-    // that could not start would let its tool call through with no trace but a missing
-    // audit line. Pinned here so an SDK downgrade is a startup refusal rather than a
-    // quietly weaker gate.
-    expect(CLAUDE_CODE_MINIMUM).toBe("2.1.295");
+    if (built._tag === "Success") expect(built.success).not.toBe("unknown");
   });
 });
 
@@ -468,13 +447,15 @@ describe("starting a session", () => {
         return seen[0]?.options;
       }),
     );
-    // `dontAsk` denies anything not pre-approved, and our PreToolUse gate's allow is what
-    // pre-approves. Change it and the gate becomes advisory, or the run stalls on the
-    // first tool call with nobody at a prompt.
+    // `dontAsk` denies anything not pre-approved, with no prompt: nobody is at one. What
+    // pre-approves is the operator's own settings plus `preapprovedTools` (the policy gate
+    // that used to was removed, 2026-11-06).
     expect(options?.permissionMode).toBe("dontAsk");
-    // The gate lives in `.claude/settings.local.json` in `cwd`. Omitting this would make
-    // un-gating a run a matter of somebody changing an SDK default.
+    // The operator's settings decide every call bit does not pre-approve. Omitting this
+    // would make what a session may do a matter of somebody changing an SDK default.
     expect(options?.settingSources).toEqual(["user", "project", "local"]);
+    // A session with no MCP server and no pages to read is pre-approved nothing.
+    expect(options?.allowedTools).toEqual([]);
     // Without this a subagent's text never reaches the stream and narration shows only
     // tool-call heartbeats.
     expect(options?.forwardSubagentText).toBe(true);
@@ -482,6 +463,34 @@ describe("starting a session", () => {
     expect(options?.persistSession).toBe(true);
     // A worker's attempt and a planner round have no live partial view (A6 F8).
     expect(options?.includePartialMessages).toBe(false);
+  });
+
+  test("bit pre-approves its own MCP servers, and WebFetch only for a session that reads pages", async () => {
+    const launch = (fetchesPages: boolean) => {
+      const sessionId = newClaudeCodeSessionId();
+      return withHarness({}, (harness, seen) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "bit scope importer: t",
+            model: "claude-sonnet-5",
+            directory: "/tmp/ws",
+            sessionId,
+            ...(fetchesPages ? { fetchesPages: true } : {}),
+          });
+          yield* harness.registerMcpServer(sessionId, "bit-imp_1", {
+            url: "http://127.0.0.1:9/api/v1/importer/mcp",
+            headers: { authorization: Redacted.make("Bearer x") },
+            directory: "/tmp/ws",
+          });
+          yield* harness.prompt(sessionId, "go");
+          return seen[0]?.options?.allowedTools;
+        }),
+      );
+    };
+    // The importer: its MCP server, server-wide, and the page read that is its job.
+    expect(await launch(true)).toEqual(["mcp__bit-imp_1", "WebFetch"]);
+    // Anyone else: the MCP server alone. Write, Bash and the rest are the operator's.
+    expect(await launch(false)).toEqual(["mcp__bit-imp_1"]);
   });
 
   test("a conversation asks for partial messages, and a single-turn session does not", async () => {

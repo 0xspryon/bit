@@ -22,8 +22,7 @@ import type { MessageUploadRefused } from "@bit/contracts";
 import { Effect } from "effect";
 import { HttpServerRequest } from "effect/http";
 
-import { isWithin } from "../policy/install";
-import { decide, PERMISSIVE_POLICY } from "../policy/service";
+import { isWithin } from "../harness/roleDirectory";
 import {
   classifyUpload,
   DEFAULT_UPLOAD_LIMITS,
@@ -649,8 +648,8 @@ describe("undoing a store removes only what it made", () => {
   });
 });
 
-describe("the gate and an uploaded file (no new authority)", () => {
-  test("a stored file is inside the session's directory, so the agent reading it is a read the gate already covers", async () => {
+describe("an uploaded file and the session's directory", () => {
+  test("a stored file is inside the session's directory, even from a name that tried to leave it", async () => {
     const directory = sessionDirectory();
     const [stored] = await Effect.runPromise(
       storeUploads(
@@ -664,29 +663,6 @@ describe("the gate and an uploaded file (no new authority)", () => {
     if (stored === undefined) throw new Error("nothing was stored");
     expect(stored.path).toBe(join(directory, "uploads", "escape.txt"));
     expect(isWithin(directory, stored.path)).toBe(true);
-    // The gate the installation runs allows the agent's own read of it, as of any file.
-    expect(
-      decide(PERMISSIVE_POLICY, {
-        sessionId: "ses_any",
-        tool: "Read",
-        input: { file_path: stored.path },
-      }),
-    ).toEqual({ effect: "allow", basis: "unrestricted" });
-  });
-
-  test("and a boundary the gate does draw still holds for an uploaded file's path", () => {
-    // A forbidden fragment is refused whether or not the path is an upload's: storing a file
-    // relaxes nothing the policy says.
-    expect(
-      decide(
-        { ...PERMISSIVE_POLICY, forbiddenPathFragments: ["/uploads/secret"] },
-        {
-          sessionId: "ses_any",
-          tool: "Read",
-          input: { file_path: "/x/uploads/secret.txt" },
-        },
-      ).effect,
-    ).toBe("deny");
   });
 });
 

@@ -49,7 +49,6 @@ import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials } from "./credentials";
 import { McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-importer-tools-"));
 const databaseFile = join(directory, "hunt.sqlite");
@@ -263,7 +262,6 @@ class Seeded extends Context.Service<
 const endpoint = Layer.unwrap(
   Effect.map(Effect.context<ScopeImportProgress>(), (shared) =>
     ControlPlaneEndpoint.layer({
-      policy: DEFAULT_POLICY,
       scopeImports: Layer.succeed(
         ScopeImportProgress,
         Context.get(shared, ScopeImportProgress),
@@ -275,7 +273,6 @@ const endpoint = Layer.unwrap(
 const testLayer = Layer.mergeAll(endpoint, Seeded.layer).pipe(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   Layer.provideMerge(ScopeImportProgress.layer),
   Layer.provideMerge(ObservationStore.layer(databaseFile)),
   Layer.provideMerge(

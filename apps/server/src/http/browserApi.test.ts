@@ -88,7 +88,6 @@ import { RunNarrations } from "../run/narration";
 import { GoalConversations } from "../plan/goalConversation";
 import { PlanSupervisor } from "../plan/planSupervisor";
 import { RunSupervisor, type RunInput } from "../run/supervisor";
-import { PolicyDecisions, type PolicyConfig } from "../policy/service";
 import type { ReadUpload } from "../upload/uploads";
 
 const scratch = mkdtempSync(join(tmpdir(), "bit-browser-api-"));
@@ -125,11 +124,6 @@ const SUITE_UPLOAD_MAX_FILES = 2;
  */
 const SUITE_UPLOAD_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 
-const POLICY: PolicyConfig = {
-  forbiddenPathFragments: ["out-of-scope/"],
-  hostScope: { _tag: "hosts", allowed: ["127.0.0.1"] },
-};
-
 /** One MCP grant, so "an MCP bearer is not a session" can be asserted rather than assumed. */
 class TestCredential extends Context.Service<
   TestCredential,
@@ -156,8 +150,8 @@ const fleet = FleetStore.layer(fleetRoot);
 /**
  * The one run this suite's supervisor claims to be holding.
  *
- * Its session id is what the policy gate's request has to name for a refusal to be
- * attributable, and its target is the one the live-transcript block registers. Nothing
+ * Its target is the one the live-transcript block registers. (Its session id was what the
+ * policy gate's request named for a refusal to be attributed, until the gate went.) Nothing
  * actually runs: `start` is refused exactly as it is on a harness-less server.
  */
 const SUPERVISED: RunningAttempt = {
@@ -341,7 +335,6 @@ const importerHoldingOne = Layer.effect(
 const endpoint = Layer.unwrap(
   Effect.map(Effect.context<RunNarrations>(), (shared) =>
     ControlPlaneEndpoint.layer({
-      policy: POLICY,
       extraRoutes: browserApiRoutes({
         workspaceRoot,
         goalBriefingMaxChars: SUITE_BRIEFING_CEILING,
@@ -363,9 +356,8 @@ const endpoint = Layer.unwrap(
         // No harness in this suite, so starts are refused exactly as they are on a server
         // without one — standing up an agent to check a 409 would make this suite depend on
         // a provider login. What this adds over `RunSupervisor.unavailable` is a non-empty
-        // `running`, because that is the only way a policy decision can be attributed: the
-        // gate's request carries a harness session id and the live route resolves it against
-        // the runs the supervisor is holding. See {@link SUPERVISED}.
+        // `running`, which the live block's narration is attributed against. See
+        // {@link SUPERVISED}.
         Layer.provide(supervisorHolding),
         // No harness, so every `POST .../plan` is refused `no_harness` by name — which is
         // what a server without one really answers, and what the goal screen's control
@@ -424,12 +416,10 @@ const testLayer = Layer.mergeAll(
   endpoint,
   McpCredentials.layer,
   McpCallCounter.layer,
-  PolicyDecisions.layer,
 ).pipe(
   Layer.provideMerge(RunNarrations.layer),
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   // The MCP route on this listener dispatches by credential, so it takes a resolver. The
   // browser API has its own, fleet-backed, provided above; this one is for the MCP route
   // and holds the one target `TestCredential` names.
@@ -1054,8 +1044,8 @@ describe("creating a target", () => {
  * nominated, and nothing on the creation path compared the two.
  *
  * What the refusal is worth: every non-worker session on a target runs in a directory
- * under `<fleet root>/targets/<id>/`, and `gatedRoleDirectory` refuses to install the
- * policy gate into a role directory inside the workspace. So the operator saw the import
+ * under `<fleet root>/targets/<id>/`, and `roleDirectory` refuses a role directory inside
+ * the workspace. So the operator saw the import
  * refuse, and their first planner round and first conversation would have refused
  * identically. The refusal below moves that from four failures to one, before a row is
  * written.
@@ -1082,7 +1072,6 @@ describe("a workspace that would contain the target's own fleet directory", () =
     const layer = Layer.unwrap(
       Effect.map(Effect.context<RunNarrations>(), (shared) =>
         ControlPlaneEndpoint.layer({
-          policy: POLICY,
           extraRoutes: browserApiRoutes({
             workspaceRoot: ownWorkspaceRoot,
           }).pipe(
@@ -1107,7 +1096,6 @@ describe("a workspace that would contain the target's own fleet directory", () =
       Layer.provideMerge(RunNarrations.layer),
       Layer.provideMerge(McpCredentials.layer),
       Layer.provideMerge(McpCallCounter.layer),
-      Layer.provideMerge(PolicyDecisions.layer),
       Layer.provide(
         TargetStores.ofStore("t").pipe(
           Layer.provide(ObservationStore.layer(join(ownBase, "served.sqlite"))),
@@ -1885,14 +1873,14 @@ const liveFrames = async (
 /**
  * Waits for a bus's subscriber count to reach `want`.
  *
- * Both activity buses replay nothing — `run/narration.ts` and `policy/service.ts` both say
- * so — so publishing before the connection under test is subscribed is publishing into the
- * void. The counts are usable as readiness signals precisely because each is incremented
- * *after* its `PubSub.subscribe` returns, which `policy/service.test.ts` pins down; a fixed
- * sleep here would be a test that passes on a fast machine and flakes on a loaded one.
+ * The activity bus replays nothing — `run/narration.ts` says so — so publishing before the
+ * connection under test is subscribed is publishing into the void. The count is usable as
+ * a readiness signal because it is incremented *after* its `PubSub.subscribe` returns; a
+ * fixed sleep here would be a test that passes on a fast machine and flakes on a loaded
+ * one. (A second bus, the policy gate's decisions, went with the gate on 2026-11-06.)
  */
 const untilSubscribers = (
-  count: Effect.Effect<number, never, RunNarrations | PolicyDecisions>,
+  count: Effect.Effect<number, never, RunNarrations>,
   want: number,
 ): Promise<void> =>
   runtime.runPromise(
@@ -1908,13 +1896,9 @@ const narrationSubscribers = Effect.flatMap(
   RunNarrations,
   (narrations) => narrations.subscriberCount,
 );
-const decisionSubscribers = Effect.flatMap(
-  PolicyDecisions,
-  (decisions) => decisions.subscriberCount,
-);
 
 /**
- * Waits until no live connection is subscribed to either activity bus.
+ * Waits until no live connection is subscribed to the activity bus.
  *
  * **This is what makes the readiness wait below mean anything**, and finding out why cost a
  * debugging round worth recording. Aborting a `fetch` tears the socket down from the client
@@ -1930,12 +1914,11 @@ const decisionSubscribers = Effect.flatMap(
  */
 const quietBuses = async (): Promise<void> => {
   await untilSubscribers(narrationSubscribers, 0);
-  await untilSubscribers(decisionSubscribers, 0);
 };
 
 /** Waits until the connection under test — the only one — has subscribed. */
 const connectionSubscribed = (
-  count: Effect.Effect<number, never, RunNarrations | PolicyDecisions>,
+  count: Effect.Effect<number, never, RunNarrations>,
 ): Promise<void> => untilSubscribers(count, 1);
 
 const liveItems = (frames: readonly LiveFrame[]): readonly LiveItem[] =>
@@ -1954,8 +1937,7 @@ const liveCaughtUp = (frames: readonly LiveFrame[]): boolean =>
  * connection is a stream rather than a response that waits for the run to finish.
  *
  * `RunSupervisor.unavailable` is still what this suite has, so nothing is *running*: the
- * activity channel has no publisher a request could reach and the policy gate's decisions
- * cannot be attributed to an attempt. Those two paths are proven in
+ * activity channel has no publisher a request could reach. That path is proven in
  * `run/liveTranscript.test.ts`, with the real narration bus, and claiming them here would
  * mean standing up an agent and a provider login to assert a status code.
  */
@@ -2136,9 +2118,8 @@ describe("watching a target's live transcript", () => {
  * The activity channel, over the socket.
  *
  * The block above proves the record channel on the wire. This one proves the other half,
- * which nothing had tested over HTTP: that a harness's narration and the policy gate's
- * refusals reach a browser through this endpoint, with their arguments intact and
- * attributed to the right attempt.
+ * which nothing had tested over HTTP: that a harness's narration reaches a browser through
+ * this endpoint, with its arguments intact and attributed to the right attempt.
  *
  * **It is a different claim from the one `run/liveTranscript.test.ts` makes**, and the
  * difference is the whole reason it is here. That suite drives the merge in process, so it
@@ -2148,9 +2129,7 @@ describe("watching a target's live transcript", () => {
  * whether an item survives SSE framing and the contract's own encoding with its JSON
  * arguments unmangled. Both were taken on trust until this block existed.
  *
- * Attribution needs a supervisor that is holding something, which is what {@link SUPERVISED}
- * is for: the gate's request carries a harness session id and nothing else, so a decision is
- * matched against the runs this process reports.
+ * {@link SUPERVISED} is the run this process reports holding.
  */
 describe("the live transcript's activity channel, on the wire", () => {
   const targetId = "livefeed";
@@ -2357,124 +2336,6 @@ describe("the live transcript's activity channel, on the wire", () => {
       await signedIn(`/targets/${targetId}/live?partials=yes`),
     );
     expect(refused.status).toBe(400);
-  });
-
-  test("a refused action reaches the browser, attributed to the run holding its session", async () => {
-    await quietBuses();
-    const live = await liveFrames(
-      `/targets/${targetId}/live?cursor=99`,
-      (frames) => activityOf(frames).some((i) => i.kind === "action.denied"),
-      async () => {
-        await connectionSubscribed(decisionSubscribers);
-        // Through the real decision bus, from the same instance the policy route records
-        // into — see this block's header on why that sameness is the thing under test.
-        await runtime.runPromise(
-          Effect.flatMap(PolicyDecisions, (decisions) =>
-            decisions.record({
-              sessionId: SUPERVISED.harnessSessionId,
-              tool: "shell",
-              input: { command: "curl -s https://out-of-scope.test/" },
-              effect: "deny",
-              reason: "host 'out-of-scope.test' is not in scope",
-            }),
-          ),
-        );
-      },
-    );
-
-    const denied = activityOf(live.frames).find(
-      (item) => item.kind === "action.denied",
-    );
-    expect(denied?.headline).toBe("Denied");
-    expect(denied?.outcome).toBe("denied");
-    expect(denied?.tool).toBe("shell");
-    // The gate's own sentence, unsoftened and unmangled.
-    expect(denied?.body).toBe("host 'out-of-scope.test' is not in scope");
-    expect(denied?.input).toContain("out-of-scope.test");
-    // Attributed from the supervisor's own map, not from anything in the request.
-    expect(denied?.attemptId).toBe(SUPERVISED.attemptId);
-    // A refusal carries no call id: the hook does not know which of the harness's own calls
-    // it is being asked about.
-    expect(denied?.callId).toBeNull();
-  });
-
-  test("a decision for a session this target does not hold never reaches the browser", async () => {
-    await quietBuses();
-    const live = await liveFrames(
-      `/targets/${targetId}/live?cursor=99`,
-      (frames) => activityOf(frames).some((i) => i.kind === "action.denied"),
-      async () => {
-        await connectionSubscribed(decisionSubscribers);
-        await runtime.runPromise(
-          Effect.flatMap(PolicyDecisions, (decisions) =>
-            Effect.andThen(
-              // Another engagement's session — or this one's, after its attempt settled and
-              // left the supervisor's map.
-              decisions.record({
-                sessionId: "ses_somewhere_else",
-                tool: "shell",
-                input: { command: "whoami" },
-                effect: "deny",
-                reason: "not this target's business",
-              }),
-              // One that *is* placeable behind it, so reaching the second proves the first
-              // was reached and dropped rather than still in flight.
-              decisions.record({
-                sessionId: SUPERVISED.harnessSessionId,
-                tool: "shell",
-                input: { command: "id" },
-                effect: "deny",
-                reason: "placeable",
-              }),
-            ),
-          ),
-        );
-      },
-    );
-
-    const denials = activityOf(live.frames).filter(
-      (item) => item.kind === "action.denied",
-    );
-    // Showing one target's refused action under another target would be worse than not
-    // showing it, so it does not appear.
-    expect(denials).toHaveLength(1);
-    expect(denials[0]?.body).toBe("placeable");
-  });
-
-  test("an allowed decision is not pushed down the socket", async () => {
-    await quietBuses();
-    const live = await liveFrames(
-      `/targets/${targetId}/live?cursor=99`,
-      (frames) => activityOf(frames).some((i) => i.kind === "action.denied"),
-      async () => {
-        await connectionSubscribed(decisionSubscribers);
-        await runtime.runPromise(
-          Effect.flatMap(PolicyDecisions, (decisions) =>
-            Effect.andThen(
-              decisions.record({
-                sessionId: SUPERVISED.harnessSessionId,
-                tool: "read",
-                input: { filePath: "in-scope.txt" },
-                effect: "allow",
-                basis: "no_host_named",
-              }),
-              decisions.record({
-                sessionId: SUPERVISED.harnessSessionId,
-                tool: "shell",
-                input: { command: "id" },
-                effect: "deny",
-                reason: "the one that should arrive",
-              }),
-            ),
-          ),
-        );
-      },
-    );
-    // The permitted call is already on this stream as `tool.call` from the harness's own
-    // narration; the gate's agreement beside it would show one call as two items.
-    expect(activityOf(live.frames).map((item) => item.body)).toEqual([
-      "the one that should arrive",
-    ]);
   });
 
   test("the record and the activity channel arrive on one connection, told apart", async () => {
@@ -4051,7 +3912,6 @@ describe("a live connection that has nothing to say", () => {
     const layer = Layer.unwrap(
       Effect.map(Effect.context<RunNarrations>(), (shared) =>
         ControlPlaneEndpoint.layer({
-          policy: POLICY,
           idleTimeout: IDLE_TIMEOUT_SECONDS,
           extraRoutes: browserApiRoutes({
             workspaceRoot,
@@ -4085,7 +3945,6 @@ describe("a live connection that has nothing to say", () => {
       Layer.provideMerge(RunNarrations.layer),
       Layer.provideMerge(McpCredentials.layer),
       Layer.provideMerge(McpCallCounter.layer),
-      Layer.provideMerge(PolicyDecisions.layer),
       Layer.provide(
         TargetStores.ofStore("t").pipe(
           Layer.provide(

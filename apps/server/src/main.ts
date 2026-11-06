@@ -155,8 +155,6 @@ import { McpCallCounter } from "./mcp/server";
 import { FleetStore } from "./persistence/fleet";
 import { ObservationStore } from "./persistence/store";
 import { TargetStores } from "./persistence/targetStores";
-import { POLICY_AUDIT_FILE } from "./policy/install";
-import { PERMISSIVE_POLICY, PolicyDecisions } from "./policy/service";
 import { harnessSelection, renderSelection, KNOWN_DRIVERS } from "./run/model";
 import { RunNarrations } from "./run/narration";
 import { RunSupervisor, WorkerEndpoints } from "./run/supervisor";
@@ -533,9 +531,8 @@ const callCounter = McpCallCounter.layer;
  * Where a worker calls back into, answered once the listener exists.
  *
  * The cycle this breaks is recorded on {@link WorkerEndpoints}: the browser API needs the
- * supervisor, the supervisor needs these URLs — the MCP endpoint for the credential it
- * hands the harness, and the policy endpoint for the gate it installs into the workspace
- * — and both belong to the listener the browser API is merged onto. `publish` is called
+ * supervisor, the supervisor needs these URLs — the MCP endpoints for the credential it
+ * hands the harness — and they belong to the listener the browser API is merged onto. `publish` is called
  * in `program` below, before anything else, so the gap between the listener accepting
  * requests and workers being able to be told where to call back is as small as this
  * process can make it.
@@ -695,8 +692,7 @@ const withoutHarness = Layer.mergeAll(
  *
  * **A harness that will not start is not fatal — now per instance rather than per
  * process.** `opencode` may be missing, the wrong version or unauthenticated, and the
- * Claude Agent SDK may carry a build too old to fail its policy hook closed; on any of
- * those this process still has a job: serving the browser the evidence earlier runs
+ * Claude Agent SDK may not start; on any of those this process still has a job: serving the browser the evidence earlier runs
  * recorded, sweeping the fleet, and reconciling attempts a previous process left unsettled.
  * Refusing to boot would make a missing agent into an inability to read what the agent
  * already found.
@@ -767,11 +763,6 @@ const agent =
         Layer.provide(targetStores),
         Layer.provide(fleet),
         Layer.provide(credentials),
-        // The same instance the policy route decides with (memoised: the endpoint below
-        // provides this same layer), because the conversations tell it which sessions they
-        // have ended and the route refuses those sessions' tool calls. Two instances would
-        // be a backstop that never fires.
-        Layer.provide(PolicyDecisions.layer),
         // `provideMerge`, so the bus the supervisor publishes to is also in this graph's
         // context and can be handed to the browser API below. With `provide` it was the
         // supervisor's private dependency, which was right while nothing subscribed.
@@ -844,7 +835,7 @@ const endpoint = Layer.unwrap(
       // accepts, and whose sessions this process's shutdown closes.
       | GoalConversations
       // The round opener, so the goal agent's `wake_planner` and the browser's "Plan next"
-      // assemble one answer to where planning happens and where its gate writes.
+      // assemble one answer to where planning happens.
       | RoundOpener
       | HarnessResolver
       // The narration bus, for the same reason as the four above and with the same
@@ -865,7 +856,6 @@ const endpoint = Layer.unwrap(
     >(),
     (shared) =>
       ControlPlaneEndpoint.layer({
-        policy: PERMISSIVE_POLICY,
         port: PORT,
         // Bun's 128 MiB, or the upload total and 8 MiB for the message and the form's own
         // framing when an operator raised the total past it.
@@ -955,7 +945,6 @@ const endpoint = Layer.unwrap(
 ).pipe(
   Layer.provideMerge(credentials),
   Layer.provideMerge(callCounter),
-  Layer.provideMerge(PolicyDecisions.layer),
   Layer.provide(targetStores),
 );
 
@@ -1196,7 +1185,6 @@ const continueInterrupted = (swept: readonly SweptTarget[]) =>
                 targetId: target.targetId,
                 replacesAttemptId: subject.attemptId,
                 workspace: engagement.workspacePath ?? WORKSPACE_ROOT,
-                auditPath: `${registry.paths.evidenceDirectory(target.targetId)}/${POLICY_AUDIT_FILE}`,
                 title: `bit: ${engagement.name}`,
                 note: input.instruction,
               }),
@@ -1369,7 +1357,6 @@ const program = Effect.gen(function* () {
     plannerMcp: control.plannerMcpUrl,
     goalMcp: control.goalMcpUrl,
     importerMcp: control.importerMcpUrl,
-    policy: control.policyUrl,
   });
   /*
    * The two halves of S7, in the order the whole slice rests on: terminalize everything a
@@ -1385,8 +1372,11 @@ const program = Effect.gen(function* () {
   console.log(
     `  mcp, planner tools (bearer required): ${control.plannerMcpUrl}`,
   );
+  // V2(chat): the pre-execution policy gate and its unauthenticated decide route were
+  // removed on 2026-11-06 at the operator's request; the harnesses run on the operator's
+  // own settings (`claudeCodeClient.ts`'s header says what bit pre-approves).
   console.log(
-    `  policy (unauthenticated): ${control.policyUrl} — gate installed per run, host scope: ${PERMISSIVE_POLICY.hostScope._tag}`,
+    `  policy gate: none — each harness runs on the operator's own settings`,
   );
   console.log(`  browser api (session bearer): ${control.origin}${API_PREFIX}`);
   console.log(`  folder picker root: ${WORKSPACE_ROOT}`);

@@ -1,6 +1,6 @@
 /**
  * The OpenCode implementation of {@link AgentHarness}: a typed client over the OpenCode 2
- * HTTP API, plus the identity and the gate installer that go with it.
+ * HTTP API, plus the identity that goes with it.
  *
  * This used to *be* the harness seam. It declared `OpenCodeClient` as the service the
  * supervisor required, and so OpenCode's vocabulary — a `{ providerID, id }` model pair, a
@@ -104,7 +104,6 @@ import {
   HttpClientResponse,
 } from "effect/http";
 
-import { installOpenCodeGate } from "../policy/install";
 import {
   AgentHarness,
   OPEN_PROMPT,
@@ -325,8 +324,8 @@ const OPENCODE_RESERVE_MIN = 16_000;
  * **This is the number the meter needs so that it does not imply nothing happens before the
  * window fills.** bit never calls compaction; OpenCode compacts anyway. Its
  * `SessionCompaction` state starts `{ auto: true }` (`compaction.ts:200`) and the only thing
- * that turns it off is a `compaction.auto` config key, which bit never writes — the gate
- * install writes a plugin registration into `.opencode/opencode.json` and nothing else. So
+ * that turns it off is a `compaction.auto` config key, which bit never writes (it writes no
+ * OpenCode config at all since the policy gate went, 2026-11-06). So
  * on bit's own default model, `openai/gpt-5.6-sol` (400 000 context, 272 000 input), the
  * harness rewrites the session at about 231 200 tokens: **58 % of the figure the meter
  * divides by.**
@@ -3053,7 +3052,7 @@ export const openCodeHarness = (
        * after the lookup succeeds: OpenCode resolves a prompt through the session's *stored*
        * directory and answers `LocationNotFoundError` for one that no longer exists. The
        * caller is the only thing that knows whether that path is a directory it is prepared
-       * to gate and to recreate, so it gets the path rather than a verdict.
+       * to check and to recreate, so it gets the path rather than a verdict.
        *
        * A `404` is an answer — the session is gone, and on this driver that means the
        * database no longer holds it — while any other failure is a failure: "we could not
@@ -4240,7 +4239,13 @@ export const openCodeHarness = (
         instance,
         newSessionId: newOpenCodeSessionId,
         modelProvenance: openCodeModelProvenance,
-        installGate: installOpenCodeGate,
+        /*
+         * V2(chat): `installGate: installOpenCodeGate` was here — bit's policy plugin, written
+         * into each session's `.opencode/` with a config entry that loaded it (removed
+         * 2026-11-06 at the operator's request, to be redone). OpenCode now runs on the
+         * operator's own `opencode.json`: bit sets no `permission` and writes no config into
+         * a session's directory; the serve child gets only its password.
+         */
         registerMcpServer,
         unregisterMcpServer,
         createSession,

@@ -23,7 +23,7 @@
 import { Effect } from "effect";
 
 import { runMain } from "./main";
-import { runPlannerPhase, WORKER_POLICY } from "./phases";
+import { runPlannerPhase } from "./phases";
 import { spikeLayer } from "./runtime";
 
 const INTENT_ID = "intent-per-client-limiter";
@@ -117,7 +117,7 @@ const program = Effect.gen(function* () {
 runMain(
   Effect.scoped(
     program.pipe(
-      Effect.provide(spikeLayer({ policy: WORKER_POLICY })),
+      Effect.provide(spikeLayer()),
       Effect.tap((result) =>
         Effect.sync(() => {
           console.log(`\nresult: ${result}`);

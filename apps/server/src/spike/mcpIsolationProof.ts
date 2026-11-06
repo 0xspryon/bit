@@ -25,8 +25,8 @@
  * 3. **The harness's own registry** (`api.mcp.list`, OpenCode only), asked per directory.
  *
  * **The credential shape is the real one.** Real `McpCredentials.issue`, real
- * `seedAttempt`, real `registerMcpServer` on the real driver, real policy gate installed in
- * every directory. Nothing is simulated; a driver that cannot start here is reported
+ * `seedAttempt`, real `registerMcpServer` on the real driver (a real policy gate was
+ * installed in every directory until it was removed, 2026-11-06). Nothing is simulated; a driver that cannot start here is reported
  * UNTESTED by its own startup failure and not stood in for.
  *
  * **Nothing may import this module.** `runMain` is called at module scope, as in every
@@ -60,7 +60,6 @@ import { McpCallCounter } from "../mcp/server";
 import { multiCaseWireArgs } from "../persistence/fixtures";
 import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import { runMain } from "./main";
 import { RUNTIME_DIR } from "./runtime";
 
@@ -181,7 +180,7 @@ const prompt = (server: string, operationId: string) =>
     `REASON: <one line: what you did, or the exact error or why you could not>`,
   ].join("\n");
 
-const makeKit = (driver: Driver) =>
+const makeKit = (_driver: Driver) =>
   Effect.gen(function* () {
     const store = yield* ObservationStore;
     const harness = yield* AgentHarness;
@@ -190,22 +189,12 @@ const makeKit = (driver: Driver) =>
 
     const labels = new Map<string, string>();
     const proxy = yield* startProxy(control.mcpUrl, labels);
-    const policyBefore = (yield* control.decisions).length;
 
     const model = harness.instance.defaultModel;
-    const auditPath = join(ROOT, driver, "audit.log");
 
     const prepare = (directory: string) =>
       Effect.gen(function* () {
         yield* Effect.sync(() => mkdirSync(directory, { recursive: true }));
-        yield* Effect.orDie(
-          harness.installGate({
-            workspace: directory,
-            policyUrl: control.policyUrl,
-            auditPath,
-            freshAudit: false,
-          }),
-        );
       });
 
     const open = (directory: string, name: string) =>
@@ -340,9 +329,6 @@ const makeKit = (driver: Driver) =>
       since,
       mark,
       show,
-      policyDecisions: Effect.gen(function* () {
-        return (yield* control.decisions).slice(policyBefore);
-      }),
     };
   });
 
@@ -591,14 +577,6 @@ const openCodeProgram = Effect.gen(function* () {
   line("files scanned (touched this run)", scan.scanned);
   line("raw tokens found on disk", scan.hits.length === 0 ? "none" : scan.hits);
 
-  heading("policy gate");
-  const decisions = yield* kit.policyDecisions;
-  line("decisions answered", decisions.length);
-  for (const decision of decisions)
-    console.log(
-      `  ${decision.sessionId.slice(0, 12)} ${decision.tool} -> ${decision.effect}`,
-    );
-
   const seen = yield* diagnostics;
   if (seen.stderr.length > 0) {
     heading("harness stderr (bounded tail)");
@@ -703,14 +681,6 @@ const claudeProgram = Effect.gen(function* () {
   );
   line("files scanned (touched this run)", scan.scanned);
   line("raw tokens found on disk", scan.hits.length === 0 ? "none" : scan.hits);
-
-  heading("policy gate");
-  const decisions = yield* kit.policyDecisions;
-  line("decisions answered", decisions.length);
-  for (const decision of decisions)
-    console.log(
-      `  ${decision.sessionId.slice(0, 12)} ${decision.tool} -> ${decision.effect}`,
-    );
 });
 
 // --------------------------------------------------------------------------------------
@@ -720,10 +690,9 @@ const claudeProgram = Effect.gen(function* () {
 const base = (driver: Driver) => {
   const store = ObservationStore.layer(join(ROOT, driver, "hunt.sqlite"));
   const resolver = TargetStores.ofStore(TARGET_ID).pipe(Layer.provide(store));
-  const endpoint = ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY }).pipe(
+  const endpoint = ControlPlaneEndpoint.layer({}).pipe(
     Layer.provideMerge(McpCredentials.layer),
     Layer.provideMerge(McpCallCounter.layer),
-    Layer.provideMerge(PolicyDecisions.layer),
     Layer.provide(resolver),
   );
   return Layer.mergeAll(store, endpoint);

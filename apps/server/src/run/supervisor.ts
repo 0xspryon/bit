@@ -138,8 +138,7 @@ import {
  *
  * **This exists to break a real cycle, and the cycle is worth stating.** The browser API's
  * handler group needs {@link RunSupervisor}. The supervisor needs two URLs from the
- * control plane: the MCP endpoint, for the registration body it hands the harness, and
- * the policy endpoint, for the options of the gate it installs into the workspace. Both
+ * control plane: the MCP endpoints, for the registration body it hands the harness. They
  * belong to `ControlPlaneEndpoint`, which is the listener — and the listener is built
  * *with* the browser API's routes merged onto its router. Three layers, each needing the
  * next.
@@ -197,8 +196,6 @@ export interface WorkerUrls {
    * are answerable at the same instant by the same listener.
    */
   readonly importerMcp: string;
-  /** Where the harness-side policy hook posts each decision request. */
-  readonly policy: string;
 }
 
 export class WorkerEndpoints extends Context.Service<
@@ -222,7 +219,6 @@ export class WorkerEndpoints extends Context.Service<
           plannerMcp: endpoint.plannerMcpUrl,
           goalMcp: endpoint.goalMcpUrl,
           importerMcp: endpoint.importerMcpUrl,
-          policy: endpoint.policyUrl,
         }),
       }),
     ),
@@ -315,15 +311,6 @@ export interface RunInput {
    * exactly the kind of quiet loss this product keeps refusing to ship.
    */
   readonly modelOptions?: readonly ModelOptionSelection[] | undefined;
-  /**
-   * Where the harness-side policy gate appends its decisions.
-   *
-   * Supplied by the caller rather than derived here, because it is a *fleet layout*
-   * question — the target's own `evidence/` directory — and the supervisor does not hold
-   * the registry. It must be outside {@link workspace}: a worker that can read its own
-   * audit trail can read the shape of the boundary it is inside.
-   */
-  readonly auditPath: string;
   /** Shown as the session's title in the harness's own UI. */
   readonly title: string;
 }
@@ -504,8 +491,6 @@ export interface ContinueAttemptInput {
   readonly replacesAttemptId: string;
   /** See {@link RunInput.workspace}. */
   readonly workspace: string;
-  /** See {@link RunInput.auditPath}. */
-  readonly auditPath: string;
   /** See {@link RunInput.title}. */
   readonly title: string;
   /**
@@ -701,13 +686,6 @@ const refuse = (error: {
         reason: "target_unavailable",
         detail: error.message ?? "that target's database could not be opened",
       });
-    case "PolicyHookNotInstalled":
-      return new RunRefused({
-        reason: "workspace_ungated",
-        detail:
-          error.message ??
-          "the pre-execution policy gate could not be installed into this engagement's folder",
-      });
     case "HarnessTransportError":
     case "HarnessDecodeError":
       return new RunRefused({
@@ -798,14 +776,7 @@ const make = Effect.fnUntraced(function* (options?: {
    *
    * ## Why a directory can hold only one run at a time
    *
-   * **Both harnesses configure their pre-execution gate per workspace, not per attempt.**
-   * `installGate` writes `.opencode/opencode.json` or `.claude/settings.local.json` in the
-   * session's directory, carrying that run's policy URL and *that target's* audit path. A
-   * second run installing into the same folder replaces those options — so the first run's
-   * tool calls start being audited into a different target's file, and the audit stops
-   * being a record of what that worker was allowed to do.
-   *
-   * **And on OpenCode the MCP registration is per directory too.** `api.mcp.add` takes a
+   * **On OpenCode the MCP registration is per directory.** `api.mcp.add` takes a
    * `location: { directory }`, so two attempts in one folder each register
    * `bit-<attemptId>` into it and **both workers see both servers**. A tool call through
    * the wrong one writes under the wrong attempt's credential: an observation attributed
@@ -815,13 +786,13 @@ const make = Effect.fnUntraced(function* (options?: {
    *
    * **One rule, both harnesses, deliberately.** Claude Code's MCP registration *is* per
    * session — `claudeCodeClient.ts` has a test proving one session's registration is not
-   * reachable from another's — so the second hazard is OpenCode's alone and the refusal
-   * could have been scoped to it. It is not, because the *first* hazard is not: the gate's
-   * audit path is per workspace on both. Two rules where one will do is two things to
-   * reason about, and here the single rule is also the correct one for each.
+   * reachable from another's — so the hazard is OpenCode's alone and the refusal could be
+   * scoped to it. It is not: two workers in one folder also share every file the other
+   * writes, and one rule is less to reason about. (Until 2026-11-06 the policy gate's
+   * per-workspace audit path was a second reason on both harnesses.)
    *
-   * Two workers cooperating on one engagement is later work. Until the gate and the MCP
-   * registration are per attempt, refusing is the honest answer.
+   * Two workers cooperating on one engagement is later work. Until the MCP registration
+   * is per attempt, refusing is the honest answer.
    *
    * ## Keyed by workspace, and claimed before anything is forked
    *
@@ -868,7 +839,7 @@ const make = Effect.fnUntraced(function* (options?: {
       if (held !== undefined) {
         return new RunRefused({
           reason: "workspace_busy",
-          detail: `attempt ${held.attemptId} is already running in ${workspace} (target '${held.targetId}'). Only one run at a time may use an engagement's folder: both harnesses configure their pre-execution policy gate per folder, and OpenCode registers its MCP endpoint per folder, so a second worker there could be audited against the wrong target or record an observation under the wrong attempt. Stop that run, or wait for it to settle, and start this one after.`,
+          detail: `attempt ${held.attemptId} is already running in ${workspace} (target '${held.targetId}'). Only one run at a time may use an engagement's folder: OpenCode registers its MCP endpoint per folder, so a second worker there could record an observation under the wrong attempt. Stop that run, or wait for it to settle, and start this one after.`,
         });
       }
       claimedWorkspaces.set(workspace, claim);
@@ -1027,37 +998,13 @@ const make = Effect.fnUntraced(function* (options?: {
     const store = yield* stores.open(input.targetId);
     const urls = yield* endpoints.urls;
 
-    /**
-     * The pre-execution gate, into the workspace, before the session exists.
-     *
-     * **First, before even the attempt row.** Two reasons, and they are different. The
-     * gate is loaded from the session's own directory, so installing it after
-     * `createSession` would leave a window — possibly the whole run — in which the worker
-     * executed tools no gate had seen. And doing it before `seedAttempt` means a refusal
-     * writes *nothing at all*: no row to settle, nothing for a sweep to find, no record
-     * of a run that never happened.
-     *
-     * A failure here **refuses the run**. A workspace whose configuration we will not
-     * overwrite is a reason not to start an ungated worker in it, not a reason to start
-     * one and hope: nothing has been prompted at this point, so refusing costs an error
-     * message, and permitting would cost a worker running against somebody's systems with
-     * no record of what it was allowed to do.
-     *
-     * **The harness installs it, and that is why this line has no `switch` in it.**
-     * OpenCode's gate is a plugin in `.opencode/opencode.json`; Claude Code's is a
-     * `PreToolUse` command hook in `.claude/settings.local.json`, with a different
-     * payload, a different way of saying "deny" and a different failure default. The one
-     * thing they share is this call. `policy/install.ts` records the six properties every
-     * implementation of it has to keep.
+    /*
+     * V2(chat): the pre-execution policy gate was installed into the workspace here, first,
+     * before the attempt row, through the harness's `installGate`; a workspace it would
+     * not install into refused the run (`workspace_ungated`). Removed 2026-11-06 at the
+     * operator's request, to be redone; the plan's "Policy gate removed" entry names the
+     * last commit that had it.
      */
-    yield* harness.installGate({
-      workspace: input.workspace,
-      policyUrl: urls.policy,
-      auditPath: input.auditPath,
-      // Appended to, not emptied: the audit belongs to the target and accumulates across
-      // runs, unlike the spike's, which describes one scope and is read back immediately.
-      freshAudit: false,
-    });
 
     // Minted by the harness, in the harness's own format: OpenCode brands a `ses_`-prefixed
     // id and the Claude Agent SDK requires a UUID. Neither is ours to invent, and the
@@ -1630,8 +1577,8 @@ const make = Effect.fnUntraced(function* (options?: {
       ),
       // The claim, if no attempt ever came to hold it. When a row was written its
       // settlement (or the sweep's) releases the intent in the same transaction, so this
-      // acts only for a start that failed before the row existed — the gate refusing to
-      // install, say — and leaves the intent `open` rather than `claimed` by an attempt
+      // acts only for a start that failed before the row existed — a harness refusing the
+      // session, say — and leaves the intent `open` rather than `claimed` by an attempt
       // that does not exist.
       Effect.ensuring(releaseUnstarted(input.targetId, ids)),
       // The one harness this run was resolved to, handed to everything above. Provided
@@ -1865,7 +1812,7 @@ const make = Effect.fnUntraced(function* (options?: {
        *
        * Synchronously: the reasoning is on {@link claimedWorkspaces}. Refusing
        * here means a second concurrent run in one engagement's folder writes *nothing at
-       * all* — no gate installed over the first run's, no attempt row, nothing for a sweep
+       * all* — no attempt row, nothing for a sweep
        * to find.
        */
       const busy = yield* workspaceClaim(input.workspace, {
@@ -1999,7 +1946,6 @@ const make = Effect.fnUntraced(function* (options?: {
           targetId: input.targetId,
           intentId: attempt.intent_id,
           workspace: input.workspace,
-          auditPath: input.auditPath,
           title: input.title,
           // No instance and no model, deliberately: a replacement is new work, so it takes
           // the intent's own suggestion and then this server's default, exactly as a fresh

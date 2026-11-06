@@ -7,7 +7,8 @@
  * bun run src/spike/persistenceProof.ts 2>&1 | tee .runtime/persistence-proof-$(date +%H%M%S).log
  * ```
  *
- * A **sibling** of `milestoneProof.ts` rather than a fifth phase on it, which the brief
+ * A **sibling** of `milestoneProof.ts` (removed with the policy gate, 2026-11-06) rather
+ * than a fifth phase on it, which the brief
  * allows and which is the right choice for one reason: `milestoneProof.ts` needs a real
  * subscription-authenticated OpenCode worker and spends model tokens, so it can be run
  * only where that is available. Everything this sprint claims is about files, transactions

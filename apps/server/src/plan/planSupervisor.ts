@@ -11,7 +11,7 @@
  * ## Why this is a second service and not an overloaded `RunSupervisor`
  *
  * The two supervise different things and the claims differ: a worker claims an *engagement
- * folder* because the gate and the MCP registration are per directory there, and a round
+ * folder* because the MCP registration is per directory there, and a round
  * claims a *goal* because one planner works one goal at a time (the spec's decision 7).
  * `RunningAttempt` is a contract about attempts, `claimedWorkspaces`' reasoning is about
  * two workers in one folder, and `settleAttempt` writes to `attempts`. An overload would
@@ -126,7 +126,7 @@ import {
 import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials } from "../mcp/credentials";
 import { McpCallCounter } from "../mcp/server";
-import { gatedRoleDirectory, type GatedDirectory } from "../policy/install";
+import { roleDirectory, type RoleDirectory } from "../harness/roleDirectory";
 import {
   SETTLEMENT_ASK_TIMEOUT,
   renderEnd,
@@ -148,17 +148,17 @@ import { WorkerEndpoints } from "../run/supervisor";
 export const DEFAULT_ROUND_BUDGET = 5;
 
 /**
- * `AgentHarness.createSession`, narrowed so that the directory must be gated.
+ * `AgentHarness.createSession`, narrowed so that the directory must have been checked.
  *
- * **This exists because the brand alone guarantees nothing.** `GatedDirectory` is
- * `string & Brand<"GatedDirectory">`, and `AgentHarness.createSession` takes
- * `directory: string` — so a plain path, or an `UngatedRoleDirectory`'s `unsafePath()`,
+ * **This exists because the brand alone guarantees nothing.** `RoleDirectory` is
+ * `string & Brand<"RoleDirectory">`, and `AgentHarness.createSession` takes
+ * `directory: string` — so a plain path, or an `UncheckedRoleDirectory`'s `unsafePath()`,
  * compiles perfectly well at that seam. Slice 3's own comment is careful about this: the
- * brand is what *lets* a function that creates a session ask for a gated path. It is a
+ * brand is what *lets* a function that creates a session ask for a checked path. It is a
  * capability, and until somebody uses it nothing is enforced.
  *
  * This is the use. The one call in this file that opens a planner session goes through
- * here, so passing a path that has not been through `gatedRoleDirectory` is a compile
+ * here, so passing a path that has not been through `roleDirectory` is a compile
  * error rather than a convention, and the next role to need one (slice 9's goal agent) has
  * a pattern to copy. It is three lines and adds no behaviour: deliberately, because a
  * wrapper that did anything else would be a second place for session creation to differ.
@@ -173,7 +173,7 @@ const createPlannerSession = (
   input: {
     readonly title: string;
     readonly model: string;
-    readonly directory: GatedDirectory;
+    readonly directory: RoleDirectory;
     readonly sessionId: string;
     readonly parentSessionId?: string | undefined;
   },
@@ -203,22 +203,13 @@ export interface PlanInput {
    * has none.
    *
    * **Not where this session runs.** A round runs in `targets/<id>/planning/<roundId>/`,
-   * which this supervisor obtains through `gatedRoleDirectory` and which the caller cannot
+   * which this supervisor obtains through `roleDirectory` and which the caller cannot
    * name. This field is here only so the containment check can refuse a planning directory
    * that lies *inside* the workspace, and it is required — explicitly `undefined` when
    * there is none — because an optional field is a check that silently does not run for
-   * the caller who forgets it (`policy/install.ts`'s `GatedRoleDirectory.workspace`).
+   * the caller who forgets it (`harness/roleDirectory.ts`'s `RoleDirectoryInput.workspace`).
    */
   readonly workspace: string | undefined;
-  /**
-   * Where the harness-side policy gate appends its decisions.
-   *
-   * Supplied by the caller for `RunInput.auditPath`'s reason — it is a fleet-layout
-   * question and this supervisor does not hold the registry's paths for it — and it must
-   * be outside the planning directory, which `gatedRoleDirectory` checks rather than
-   * trusts.
-   */
-  readonly auditPath: string;
   /** Shown as the session's title in the harness's own UI. */
   readonly title: string;
   /**
@@ -426,12 +417,10 @@ const refuse = (error: {
             : "target_unavailable",
         detail: error.message ?? "that target could not be opened",
       });
-    case "PolicyHookNotInstalled":
+    case "RoleDirectoryRefused":
       return new PlanRefused({
-        reason: "planning_ungated",
-        detail:
-          error.message ??
-          "the pre-execution policy gate could not be installed into this round's directory",
+        reason: "planning_directory_unusable",
+        detail: error.message ?? "this round's directory cannot be used",
       });
     case "HarnessTransportError":
     case "HarnessDecodeError":
@@ -793,7 +782,7 @@ const make = Effect.fnUntraced(function* (options?: {
    *
    * **The split between this and {@link prepareRound} is the only reason it is two
    * functions, and it is worth the paragraph.** Everything after `openRound` can fail —
-   * the gate, the session, the lineage, the credential, the registration — and a failure
+   * the directory, the session, the lineage, the credential, the registration — and a failure
    * there leaves a row that says `running` under a goal that `openRound` will then refuse
    * a second round on, for the life of the process. `supervise` therefore registers the
    * settling finalizer *between* these two calls, so the first thing that is true after
@@ -818,11 +807,8 @@ const make = Effect.fnUntraced(function* (options?: {
    * was never created, which the sweep already handles by asking, being told `missing`, and
    * recording `uncertain`.
    *
-   * **2. The row, before the directory.** This is the one ordering that differs from a
-   * worker's, where the gate goes in first so a refusal writes nothing. The reason it is
-   * the other way round here is that the directory does not already exist: a worker's gate
-   * is a file written into the operator's own folder, and a round's directory is *created
-   * by us*, under `targets/<id>/planning/`. `openRound` is the authoritative refusal — an
+   * **2. The row, before the directory.** The directory does not already exist: a round's
+   * directory is *created by us*, under `targets/<id>/planning/`. `openRound` is the authoritative refusal — an
    * ended goal, a goal of another target, a second running round — and it is a local
    * transaction, so taking it first means a refused round leaves no directory tree behind
    * for a round that never happened. What that order costs is the finalizer ordering above,
@@ -874,14 +860,14 @@ const make = Effect.fnUntraced(function* (options?: {
    * The prompt is one step further out still, in {@link supervise}, because the narration
    * subscription has to be opened first — `event.subscribe()` is live-only, so prompting
    * before subscribing throws away the beginning of the round. Everything here is what has
-   * to be true *before* a prompt is a defensible thing to send: the directory is gated, the
+   * to be true *before* a prompt is a defensible thing to send: the directory is checked, the
    * session exists in it, a credential is bound to the round's fence, and our endpoint is
    * registered under that credential.
    *
-   * **3. The directory, through `gatedRoleDirectory` and no other way.**
-   * `ensurePlanningDirectory` hands back an opaque `UngatedRoleDirectory`, and the single
-   * conversion installs the policy gate and runs both containment checks before branding
-   * the path `GatedDirectory`. A session created in a directory obtained any other way
+   * **3. The directory, through `roleDirectory` and no other way.**
+   * `ensurePlanningDirectory` hands back an opaque `UncheckedRoleDirectory`, and the single
+   * conversion runs the workspace containment check before branding the path
+   * `RoleDirectory`. A session created in a directory obtained any other way
    * would defeat slice 3 entirely. {@link createPlannerSession} is what makes that a
    * compile error rather than a convention: `AgentHarness.createSession` takes a plain
    * `string`, so the brand constrains nothing on its own — it had to be narrowed at a call
@@ -922,19 +908,13 @@ const make = Effect.fnUntraced(function* (options?: {
     const store = opened.store;
 
     /**
-     * The round's own directory, made and gated in that order, or the round is refused.
+     * The round's own directory, made and checked in that order, or the round is refused.
      *
-     * The gate goes into a directory where the planner is not expected to act, and that is
-     * the point rather than an oversight: "the planner does not run shell commands" is an
-     * assumption about what a model will choose to do, and the gate is what turns it into
-     * a fact. `policy/install.ts` carries the long form, including why the audit path is
-     * refused if it is inside this directory.
+     * V2(chat): the pre-execution policy gate was installed into it here, through the
+     * harness's `installGate` (removed 2026-11-06 at the operator's request; to be redone).
      */
-    const planning: GatedDirectory = yield* gatedRoleDirectory({
+    const planning: RoleDirectory = yield* roleDirectory({
       ensure: fleet.ensurePlanningDirectory(input.targetId, ids.roundId),
-      install: harness.installGate,
-      policyUrl: urls.policy,
-      auditPath: input.auditPath,
       // The workspace is passed so the containment check can run, not because the round
       // goes anywhere near it. `undefined` says this target has no folder, which is a
       // statement rather than an omission; see {@link PlanInput.workspace}.
@@ -943,7 +923,7 @@ const make = Effect.fnUntraced(function* (options?: {
 
     const lineageBefore = yield* store.plannerLineage(input.goalId);
     // Through the narrowed wrapper, which is the one call in this file that will not take
-    // an ungated path. See step 3 on this function.
+    // an unchecked path. See step 3 on this function.
     const created = yield* createPlannerSession(harness, {
       title: input.title,
       model: opened.model,

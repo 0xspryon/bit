@@ -17,12 +17,10 @@
  *    registration stayed alive until process death, because `live.set` keeps one and the
  *    other scope was in no map.
  * 3. **The acquire order**, because each step rules out the next step's ambiguity:
- *    gated directory → session → credential → MCP registration → prompt. A failure at any
+ *    role directory → session → credential → MCP registration → prompt. A failure at any
  *    step closes the scope, which revokes the credential and unregisters the server —
  *    including when the *next* step is the one that failed.
- * 4. **{@link LiveAgentSessions.closeSession}**: the policy gate told first
- *    (`PolicyDecisions.endSession`), so it refuses the session's tool calls from that
- *    instant; then the narrator interrupted, so nothing is published for a session whose
+ * 4. **{@link LiveAgentSessions.closeSession}**: the narrator interrupted first, so nothing is published for a session whose
  *    credential is about to go; then the harness session
  *    ended (`AgentHarness.endSession`), so nothing of it runs once its authority is gone;
  *    then the scope; then a belt-and-braces revoke whose expected answer is zero and whose
@@ -91,18 +89,12 @@ import type { HarnessNotReady } from "./resolver";
 import type { MessageAttachment } from "./attachments";
 import type { CredentialRefused, IssuedCredential } from "../mcp/credentials";
 import type { DatabaseError } from "../persistence/sql";
-import type { PolicyDecisions } from "../policy/service";
-import type {
-  FleetError,
-  FleetStore,
-  UngatedRoleDirectory,
-} from "../persistence/fleet";
+import type { FleetError, UncheckedRoleDirectory } from "../persistence/fleet";
 import {
-  gatedRoleDirectory,
-  POLICY_AUDIT_FILE,
-  type GatedDirectory,
-  type PolicyHookNotInstalled,
-} from "../policy/install";
+  roleDirectory,
+  type RoleDirectory,
+  type RoleDirectoryRefused,
+} from "./roleDirectory";
 import type { WorkerUrls } from "../run/supervisor";
 import {
   storeUploads,
@@ -112,35 +104,38 @@ import {
 } from "../upload/uploads";
 
 /**
- * `AgentHarness.createSession`, narrowed so that the directory must be gated.
+ * `AgentHarness.createSession`, narrowed so that the directory must have been checked.
  *
- * `plan/planSupervisor.ts`'s `createPlannerSession` and for its reason: `GatedDirectory` is
+ * `plan/planSupervisor.ts`'s `createPlannerSession` and for its reason: `RoleDirectory` is
  * a brand, `createSession` takes `directory: string`, and a brand that is never *asked for*
  * at a call site constrains nothing. This is the one call that opens a long-lived session,
- * so passing a path that has not been through `gatedRoleDirectory` is a compile error rather
+ * so passing a path that has not been through `roleDirectory` is a compile error rather
  * than a convention.
  *
  * `multiTurn: true` is set here rather than by a caller, because it is not a choice a
  * caller could sensibly make differently: every session this registry holds is prompted
  * again after its first turn, and a session closed when it went idle could not take that.
  */
-const createGatedSession = (
+const createRoleSession = (
   harness: AgentHarness["Service"],
   input: {
     readonly title: string;
     readonly model: string;
-    readonly directory: GatedDirectory;
+    readonly directory: RoleDirectory;
     readonly sessionId: string;
     readonly options?: readonly ModelOptionSelection[] | undefined;
     /** An existing session to continue rather than create. See {@link OpenPlan.resume}. */
     readonly resume?: string | undefined;
     /** See {@link OpenPlan.operatorQuestions}. */
     readonly operatorQuestions?: boolean | undefined;
+    /** See {@link OpenPlan.fetchesPages}. */
+    readonly fetchesPages?: boolean | undefined;
   },
 ) =>
   harness.createSession({
     title: input.title,
     ...(input.operatorQuestions === true ? { operatorQuestions: true } : {}),
+    ...(input.fetchesPages === true ? { fetchesPages: true } : {}),
     model: input.model,
     directory: input.directory,
     ...(input.options === undefined ? {} : { options: input.options }),
@@ -166,7 +161,7 @@ export interface LiveAgentSession<Meta> {
    */
   readonly harnessSession: SessionRef;
   /**
-   * The session's working directory, as the spine gated it: where the agent works, and
+   * The session's working directory, as the spine checked it: where the agent works, and
    * where the files a message carries are stored, under `uploads/` (A6 F9).
    */
   readonly directory: string;
@@ -210,7 +205,7 @@ export type LiveSessionCloseReason =
 export type LiveSessionOpenFailure =
   | FleetError
   | DatabaseError
-  | PolicyHookNotInstalled
+  | RoleDirectoryRefused
   | HarnessFailure
   | HarnessNotReady
   | CredentialRefused
@@ -265,7 +260,7 @@ export interface OpenPlan<Meta> {
   /**
    * An existing session of this harness to **continue** instead of creating one (S6).
    *
-   * The whole acquire order is unchanged — gated directory, session, credential,
+   * The whole acquire order is unchanged — role directory, session, credential,
    * registration, prompt — and that is the point: a resumed session gets a fresh credential
    * and a fresh registration in a scope this registry owns, so it is held and closed exactly
    * like one this process opened. What differs is only that step two creates nothing.
@@ -273,10 +268,10 @@ export interface OpenPlan<Meta> {
    * **{@link ensureDirectory} must make the directory the harness itself resolves that
    * session in** (`AgentHarness.sessionContinuation`), not a new one. Both drivers need it:
    * OpenCode resolves a prompt through the session's stored directory and refuses a missing
-   * one, and Claude Code finds a transcript under the project its `cwd` belongs to. More
-   * importantly it is where the policy gate goes, so a resume into a directory the surface
-   * did not gate would be an ungated agent — and the surface, not this module, is what can
-   * tell whether the harness's path is one of ours.
+   * one, and Claude Code finds a transcript under the project its `cwd` belongs to. And it
+   * is the directory the containment check is asked about, so a resume into a directory the
+   * surface did not make would be an unchecked agent — and the surface, not this module, is
+   * what can tell whether the harness's path is one of ours.
    *
    * {@link sessionId} is ignored when this is set.
    */
@@ -287,10 +282,15 @@ export interface OpenPlan<Meta> {
    * that draws the question dock and answers it says yes: the importer.
    */
   readonly operatorQuestions?: boolean | undefined;
+  /**
+   * Whether the session's agent reads web pages with the harness's own fetch tool
+   * (`AgentHarness.createSession`'s `fetchesPages`): the importer.
+   */
+  readonly fetchesPages?: boolean | undefined;
   readonly title: string;
-  /** Makes the role directory. Gated by the spine and by no other code path. */
+  /** Makes the role directory. Checked by the spine and by no other code path. */
   readonly ensureDirectory: Effect.Effect<
-    UngatedRoleDirectory,
+    UncheckedRoleDirectory,
     FleetError | DatabaseError
   >;
   /** The engagement folder, or `undefined` for a target with none — a statement, not an omission. */
@@ -311,7 +311,7 @@ export interface OpenPlan<Meta> {
   readonly openingPrompt: (entry: LiveAgentSession<Meta>) => string;
   /**
    * The files the opening message carried, read and checked (A6 F9). Stored in the
-   * session's directory once it is gated, before anything is prompted, and handed to the
+   * session's directory once it is checked, before anything is prompted, and handed to the
    * harness with the opening prompt. A failure to store them fails the open, so a session
    * is never prompted without the files its message named.
    */
@@ -666,23 +666,12 @@ export interface LiveAgentSessions<Meta> {
  */
 export const makeLiveAgentSessions = <Meta>(
   deps: {
-    readonly fleet: FleetStore["Service"];
     readonly endpoints: { readonly urls: Effect.Effect<WorkerUrls> };
-    /**
-     * The policy gate's record of which sessions are held and which have ended
-     * (`PolicyDecisions.holdSession`): every session this registry opens is held from the
-     * moment it exists and ended the moment it is closed, so the gate refuses its tool
-     * calls whatever its harness is still doing.
-     */
-    readonly gate: Pick<
-      PolicyDecisions["Service"],
-      "holdSession" | "endSession"
-    >;
   },
   role: LiveSessionRole<Meta>,
 ): Effect.Effect<LiveAgentSessions<Meta>, never, Scope.Scope> =>
   Effect.gen(function* () {
-    const { fleet, endpoints, gate } = deps;
+    const { endpoints } = deps;
 
     /**
      * One entry per id this process is holding a session for.
@@ -757,9 +746,12 @@ export const makeLiveAgentSessions = <Meta>(
       const current = live.get(entry.id)?.scope === entry.scope;
       if (current) live.delete(entry.id);
       const buildsAtClose = builds.get(entry.id) ?? 0;
-      // The gate first, before anything suspends: from here every tool call of this opening
-      // is refused, whatever the harness does in the time it takes to stop it.
-      yield* gate.endSession(entry.sessionId, entry.scope);
+      /*
+       * V2(chat): the policy gate was told first here, so it refused this opening's tool
+       * calls from this instant whatever the harness did meanwhile (removed 2026-11-06 at the
+       * operator's request). Until a gate is back, what stops them is the harness session
+       * ending below and the credential going with the scope, which refuses bit's own tools.
+       */
       if (entry.narrator !== undefined) yield* Fiber.interrupt(entry.narrator);
       /*
        * The harness session is ended **before** the scope is closed, so the agent has stopped
@@ -834,9 +826,9 @@ export const makeLiveAgentSessions = <Meta>(
         if (ended.has(scope)) return Effect.void;
         ended.add(scope);
         const sessionId = session.id;
-        return gate
-          .endSession(sessionId, scope)
-          .pipe(Effect.andThen(harness.endSession(session)), Effect.asVoid)
+        return harness
+          .endSession(session)
+          .pipe(Effect.asVoid)
           .pipe(
             Effect.catch((failure) =>
               Effect.logWarning(
@@ -912,10 +904,8 @@ export const makeLiveAgentSessions = <Meta>(
     /**
      * The acquire order, inside the session's own scope, and nothing published yet.
      *
-     * **1. The directory, through `gatedRoleDirectory` and no other way.** The gate goes in a
-     * directory where the agent is not expected to run a shell command, which is the point:
-     * the gate is what turns that expectation into a fact. Under OpenCode the directory is
-     * also the authority boundary (DECISIONS.md §24.2) — the only session in it is this one,
+     * **1. The directory, through `roleDirectory` and no other way**, which refuses one inside
+     * the workspace. Under OpenCode the directory is also the authority boundary (DECISIONS.md §24.2) — the only session in it is this one,
      * which is what makes a credential with no expiry containable.
      *
      * **2. The session, `multiTurn`** — or, with {@link OpenPlan.resume}, the session the
@@ -932,23 +922,20 @@ export const makeLiveAgentSessions = <Meta>(
      */
     const acquire = (
       plan: OpenPlan<Meta>,
-      urls: WorkerUrls,
       id: string,
       scope: Scope.Closeable,
     ) =>
       Effect.gen(function* () {
         const harness = plan.harness;
-        const directory: GatedDirectory = yield* gatedRoleDirectory({
+        // V2(chat): the pre-execution policy gate was installed into this directory here,
+        // through the harness's `installGate`, before any session existed in it (removed
+        // 2026-11-06 at the operator's request; to be redone).
+        const directory: RoleDirectory = yield* roleDirectory({
           ensure: plan.ensureDirectory,
-          install: harness.installGate,
-          policyUrl: urls.policy,
-          // Outside the role directory: the gate's own record must not be somewhere the
-          // gated agent can read or rewrite. `gatedRoleDirectory` refuses the nesting.
-          auditPath: `${fleet.paths.evidenceDirectory(plan.targetId)}/${POLICY_AUDIT_FILE}`,
           workspace: plan.workspace,
         });
         const created = yield* Effect.acquireRelease(
-          createGatedSession(harness, {
+          createRoleSession(harness, {
             title: plan.title,
             model: plan.model,
             directory,
@@ -958,11 +945,8 @@ export const makeLiveAgentSessions = <Meta>(
             ...(plan.operatorQuestions === true
               ? { operatorQuestions: true }
               : {}),
-          }).pipe(
-            // Held from the moment it exists, so the gate allows it — including when an
-            // older opening of the same id ends while this one is still being built.
-            Effect.tap((made) => gate.holdSession(made.id, scope)),
-          ),
+            ...(plan.fetchesPages === true ? { fetchesPages: true } : {}),
+          }),
           (made) =>
             endHarnessSession(harness, made, scope, {
               [role.words.idKey]: id,
@@ -977,7 +961,7 @@ export const makeLiveAgentSessions = <Meta>(
       id: string,
       urls: WorkerUrls,
       created: { readonly id: string },
-      directory: GatedDirectory,
+      directory: RoleDirectory,
     ) =>
       Effect.gen(function* () {
         const harness = plan.harness;
@@ -1082,12 +1066,11 @@ export const makeLiveAgentSessions = <Meta>(
                     Effect.gen(function* () {
                       const { created, directory } = yield* acquire(
                         plan,
-                        urls,
                         input.id,
                         scope,
                       );
                       yield* register(plan, input.id, urls, created, directory);
-                      // The opening message's files, into the directory now gated (A6 F9).
+                      // The opening message's files, into the directory now checked (A6 F9).
                       const attachments =
                         plan.uploads === undefined || plan.uploads.length === 0
                           ? []

@@ -96,7 +96,6 @@ import {
 import { FleetStore, isRoleDirectoryId } from "../persistence/fleet";
 import { McpCredentials } from "../mcp/credentials";
 import { TargetStores } from "../persistence/targetStores";
-import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import { WorkerEndpoints } from "../run/supervisor";
@@ -139,12 +138,12 @@ const refuse = (error: {
             : "target_unavailable",
         detail: error.message ?? "that target could not be opened",
       });
-    case "PolicyHookNotInstalled":
+    case "RoleDirectoryRefused":
       return new GoalConversationRefused({
-        reason: "goal_ungated",
+        reason: "goal_directory_unusable",
         detail:
           error.message ??
-          "the pre-execution policy gate could not be installed into this goal's directory, so no conversation was opened",
+          "this goal's directory cannot be used, so no conversation was opened",
       });
     case "HarnessTransportError":
     case "HarnessDecodeError":
@@ -196,8 +195,8 @@ export class GoalConversations extends Context.Service<
      * what it says arrives on the narration bus.
      *
      * **The first message does a great deal and the second does almost nothing**, which is
-     * the shape worth knowing: message one creates the goal's directory, installs the
-     * policy gate in it, resolves a harness, creates a session, mints a credential with no
+     * the shape worth knowing: message one creates the goal's directory, checks it is
+     * outside the workspace, resolves a harness, creates a session, mints a credential with no
      * clock expiry, registers the goal MCP endpoint under it, subscribes to narration,
      * records the session id and sends the prompt. Message two is a `prompt` into the same
      * session, queued behind whatever it is doing — or, at `preemptive` urgency, landed at
@@ -289,7 +288,6 @@ export class GoalConversations extends Context.Service<
     never,
     | HarnessResolver
     | TargetStores
-    | PolicyDecisions
     | FleetStore
     | McpCredentials
     | WorkerEndpoints
@@ -415,7 +413,7 @@ const make = Effect.fnUntraced(function* () {
    * bug (`closeSession` there; this module's header on why).
    */
   const sessions = yield* makeLiveAgentSessions<LiveConversation["meta"]>(
-    { fleet, endpoints, gate: yield* PolicyDecisions },
+    { endpoints },
     {
       // The **goal** endpoint. A goal credential at the planner URL is a `401` before any
       // tool list is produced — which is what makes "no `add_intent`" a property of the
@@ -575,7 +573,7 @@ const make = Effect.fnUntraced(function* () {
    *
    * `import/importerHistory.ts`'s `importerReopenFor`, one surface along and through the
    * same {@link sessionReopen}: the harness is asked, every uncertainty is a `fresh`
-   * session, and the directory it names has to be one this server gated. Two refusals are
+   * session, and the directory it names has to be one this server made. Two refusals are
    * this function's own and both come before the harness is asked at all — no harness to
    * ask, and a row naming an instance this server does not run, which must not be asked
    * about because the harness we *do* have would answer a confident "no such session" for
@@ -583,9 +581,9 @@ const make = Effect.fnUntraced(function* () {
    *
    * **A goal's directory is named after the goal**, and unlike an import id a goal id does
    * not change between authority periods, so the only acceptable answer is this goal's own
-   * directory. Another goal's is refused rather than gated: the gate is per directory, and
-   * resuming goal A's conversation in goal B's directory would run it behind B's gate and
-   * write B's audit file.
+   * directory. Another goal's is refused: the harness's state is per directory (OpenCode's
+   * MCP set), and resuming goal A's conversation in goal B's directory would run it among
+   * B's registrations.
    *
    * It answers with the harness it resolved, so a resume runs on the instance the
    * conversation was opened on rather than on today's default — the same rule the importer
@@ -889,7 +887,7 @@ const make = Effect.fnUntraced(function* () {
            * names another.
            */
           beforePrompt: (entry: LiveConversation) => recordRow(entry, options),
-          // The message's files, stored by the spine in the gated directory (A6 F9).
+          // The message's files, stored by the spine in the checked directory (A6 F9).
           ...(input.uploads === undefined ? {} : { uploads: input.uploads }),
           /*
            * Three situations and two assemblers, which is the split S3.1 argues for: a

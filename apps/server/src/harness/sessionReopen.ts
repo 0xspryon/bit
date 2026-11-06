@@ -23,9 +23,11 @@
  * one that is gone, and Claude Code through the project its `cwd` belongs to. That much is
  * S2.5's caveat, and verifying it costs one comparison.
  *
- * The *reason* to verify is stronger than the caveat. **The pre-execution policy gate lives
- * in the directory the session runs in** (`policy/install.ts`), so a resume into a
- * directory this server did not gate is an agent whose tool calls nothing is consulting.
+ * The *reason* to verify is stronger than the caveat. **The directory is the session's
+ * authority boundary** — OpenCode keeps its MCP set per directory, and the role-directory
+ * check (`harness/roleDirectory.ts`) is of this path — so a resume into a directory this
+ * server did not make is an agent among registrations nobody checked. (It also held the
+ * pre-execution policy gate until that was removed, 2026-11-06.)
  * The path the harness reports is therefore not merely checked for existence: it has to be
  * recognised by the caller as one of *its own* role directories, rebuilt through
  * `FleetPaths` and compared. Nothing is parsed out of the path and trusted — that is

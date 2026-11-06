@@ -768,9 +768,8 @@ export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
  * - `import_ended` — the operator ended this import. Its authority is over: the importer's
  *   tools refuse every write under it, so it is not continued and a new conversation is the
  *   way on.
- * - `import_directory_unusable`, `import_ungated` — the import's directory could not be made,
- *   or the pre-execution policy gate would not install into it. Refused rather than run
- *   ungated, as a worker and a goal conversation are.
+ * - `import_directory_unusable` — the import's directory could not be made, or sits inside
+ *   the workspace where workers run.
  * - `target_unavailable`, `store_unavailable` — the target's database.
  * - `agent_unavailable` — the session runs as an agent this server does not define (or one
  *   an import session cannot be opened as), so it cannot be continued: an agent is pinned to
@@ -793,7 +792,6 @@ export class ImporterConversationRefused extends Schema.TaggedError<ImporterConv
       "harness_unreachable",
       "import_ended",
       "import_directory_unusable",
-      "import_ungated",
       "target_unavailable",
       "store_unavailable",
       "agent_unavailable",

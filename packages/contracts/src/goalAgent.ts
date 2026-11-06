@@ -152,10 +152,8 @@ export type GoalTurnAccepted = typeof GoalTurnAccepted.Type;
  * - `goal_not_active` — the goal is `met` or `abandoned`. An ended goal takes no new
  *   conversation: its agent's credential would be refused by every write anyway
  *   (`store.checkGoalAuthority`), so an agent could be talked to and could do nothing.
- * - `goal_directory_unusable` — `targets/<id>/goal/<goalId>/` could not be made.
- * - `goal_ungated` — the directory exists and the pre-execution policy gate would not
- *   install into it. The conversation is refused rather than run ungated, exactly as a
- *   worker and a round are.
+ * - `goal_directory_unusable` — `targets/<id>/goal/<goalId>/` could not be made, or sits
+ *   inside the workspace where workers run.
  * - `target_unavailable`, `store_unavailable` — the target's database.
  * - `upload_unwritable` — the message carried files and they could not be written into the
  *   goal's `uploads/` folder (A6 F9). Nothing was said to the agent; a live session is kept.
@@ -172,7 +170,6 @@ export class GoalConversationRefused extends Schema.TaggedError<GoalConversation
       "harness_unreachable",
       "goal_not_active",
       "goal_directory_unusable",
-      "goal_ungated",
       "target_unavailable",
       "store_unavailable",
       "upload_unwritable",

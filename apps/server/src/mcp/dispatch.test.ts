@@ -52,7 +52,6 @@ import { multiCaseWireArgs } from "../persistence/fixtures";
 import { FleetStore } from "../persistence/fleet";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import {
   McpCredentials,
   type AttemptBinding,
@@ -189,11 +188,10 @@ const base = Layer.mergeAll(
   AlphaCredential.layer,
   BetaCredential.layer,
   GhostCredential.layer,
-  ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY }),
+  ControlPlaneEndpoint.layer({}),
 ).pipe(
   Layer.provideMerge(credentials),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   // The real resolver over the real registry. This is the whole point of the suite: a
   // single endpoint whose store is chosen per request, from the credential.
   Layer.provideMerge(stores),
@@ -498,10 +496,8 @@ describe("one endpoint, two targets", () => {
         const started = yield* supervisor.start({
           targetId: "alpha",
           intentId: "intent-supervised",
-          // A scratch workspace of its own, because starting a run installs the
-          // pre-execution policy gate into it before creating the session.
+          // A scratch workspace of its own: a run claims its engagement folder.
           workspace: workspaceFor("alpha"),
-          auditPath: join(directory, "alpha-policy-audit.log"),
           title: "bit: alpha",
         });
         return { started, supervisor };

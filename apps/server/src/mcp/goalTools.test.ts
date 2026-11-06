@@ -43,7 +43,6 @@ import { McpCredentials } from "./credentials";
 import { GoalBriefingCeiling, GoalPlanning } from "./goalTools";
 import { McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-goal-tools-"));
 const databaseFile = join(directory, "hunt.sqlite");
@@ -333,7 +332,6 @@ class Seeded extends Context.Service<
 
 const testLayer = Layer.mergeAll(
   ControlPlaneEndpoint.layer({
-    policy: DEFAULT_POLICY,
     planning,
     // The configured ceiling, which is what `main.ts` passes and what this suite exists to
     // check reaches the toolkit at all. See {@link SUITE_BRIEFING_CEILING}.
@@ -342,12 +340,10 @@ const testLayer = Layer.mergeAll(
   Seeded.layer,
   McpCredentials.layer,
   McpCallCounter.layer,
-  PolicyDecisions.layer,
   ObservationStore.layer(databaseFile),
 ).pipe(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   Layer.provideMerge(ObservationStore.layer(databaseFile)),
   Layer.provideMerge(
     TargetStores.ofStore(TARGET).pipe(

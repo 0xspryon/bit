@@ -1,15 +1,16 @@
 /**
  * The two halves of the single-worker loop, as functions rather than as scripts.
  *
- * `workerDemo.ts`, `briefingDemo.ts` and `milestoneProof.ts` all drive the same code
+ * `workerDemo.ts` and `briefingDemo.ts` drive the same code (as `milestoneProof.ts` did,
+ * until it went with the policy gate it proved, 2026-11-06)
  * from here. That is the point: a proof that re-implemented the worker leg would be
  * proving its own copy, and the three entrypoints would drift until the demo and the
  * proof disagreed about what the system does.
  *
  * Each phase returns what it observed rather than printing it, so a caller can assert on
  * it. Everything a phase reads is read from the control plane or the database — the
- * harness's own view of the session, our MCP call counter, the policy decisions our
- * endpoint answered, the fixture's own traffic counters, the stored rows — and never
+ * harness's own view of the session, our MCP call counter, the fixture's own traffic
+ * counters, the stored rows — and never
  * from the model's account of what it did.
  */
 import type { Observation, OpenQuestion } from "@bit/contracts";
@@ -26,11 +27,6 @@ import { OpenCodeServer } from "../harness/openCodeServer";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
 import { McpCredentials } from "../mcp/credentials";
 import { ObservationStore, type AttemptSettlement } from "../persistence/store";
-import type {
-  PolicyConfig,
-  PolicyDecision,
-  PolicyRequest,
-} from "../policy/service";
 import { plannerPrompt } from "./prompts";
 import {
   openWorkerSession,
@@ -38,9 +34,6 @@ import {
   WORKER_MODEL,
   type AttemptBinding,
 } from "./runtime";
-
-/** A policy decision as the endpoint recorded it. */
-export type RecordedDecision = PolicyRequest & PolicyDecision;
 
 export interface WorkerPhaseInput {
   readonly binding: AttemptBinding;
@@ -54,12 +47,11 @@ export interface WorkerPhaseResult {
   readonly sessionId: string;
   readonly harnessVersion: string;
   readonly fixtureUrl: string;
-  /** Liveness, from the same origin that serves MCP and policy. */
+  /** Liveness, from the same origin that serves MCP. */
   readonly health: { readonly status: number; readonly body: string };
   readonly writeFence: number;
   /** Authenticated MCP requests this endpoint served during the phase. */
   readonly mcpCallsServed: number;
-  readonly policyDecisions: readonly RecordedDecision[];
   readonly sessionOutcome: string;
   /** True when our `wait` call failed, which makes the outcome uncertain, not failed. */
   readonly waitFailed: boolean;
@@ -118,7 +110,6 @@ export const runWorkerPhase = Effect.fn("runWorkerPhase")(function* (
 
   const health = yield* probe(control.healthUrl);
   const callsBefore = yield* control.callCount;
-  const decisionsBefore = (yield* control.decisions).length;
 
   const { session, credential, authority } = yield* openWorkerSession(
     input.binding,
@@ -163,7 +154,6 @@ export const runWorkerPhase = Effect.fn("runWorkerPhase")(function* (
     health,
     writeFence: authority.writeFence,
     mcpCallsServed: (yield* control.callCount) - callsBefore,
-    policyDecisions: (yield* control.decisions).slice(decisionsBefore),
     sessionOutcome: status.outcome ?? "unknown",
     waitFailed: waited._tag === "Failure",
     settlement,
@@ -323,20 +313,6 @@ export const runPlannerPhase = Effect.fn("runPlannerPhase")(function* (
 });
 
 /**
- * The boundaries this run actually enforces.
- *
- * Loopback only, and two forbidden fragments that are genuinely out of scope for a
- * worker testing the fixture: our own control-plane database, and anything marked
- * out-of-scope. Deliberately narrow — inventing constraints the task would never touch
- * makes a run look more constrained than it is, and constraints the task *does* need
- * would make a denial look like a boundary when it was a misconfiguration.
- */
-export const WORKER_POLICY: PolicyConfig = {
-  forbiddenPathFragments: ["hunt.sqlite", "out-of-scope"],
-  hostScope: { _tag: "hosts", allowed: ["127.0.0.1", "localhost"] },
-};
-
-/**
  * Prints what actually landed in the database.
  *
  * The two record formats are reported differently on purpose: a summary row has one
@@ -408,33 +384,6 @@ export const reportObservations = (result: WorkerPhaseResult): void => {
   for (const question of result.openQuestions) {
     console.log(
       `  [${question.status}] ${question.address}  ${question.dimension}`,
-    );
-  }
-};
-
-/** One line per policy decision the control plane answered for this run. */
-export const reportPolicy = (result: WorkerPhaseResult): void => {
-  const denied = result.policyDecisions.filter(
-    (decision) => decision.effect === "deny",
-  );
-  console.log(
-    `\n-- policy decisions answered during the run (${result.policyDecisions.length}; ${denied.length} denied) --`,
-  );
-  const byTool = new Map<string, { allow: number; deny: number }>();
-  for (const decision of result.policyDecisions) {
-    const tally = byTool.get(decision.tool) ?? { allow: 0, deny: 0 };
-    if (decision.effect === "deny") tally.deny += 1;
-    else tally.allow += 1;
-    byTool.set(decision.tool, tally);
-  }
-  for (const [tool, tally] of byTool) {
-    console.log(
-      `  ${tool.padEnd(18)} allow=${String(tally.allow)} deny=${String(tally.deny)}`,
-    );
-  }
-  for (const decision of denied) {
-    console.log(
-      `  DENIED ${decision.tool}: ${"reason" in decision ? decision.reason : ""}`,
     );
   }
 };

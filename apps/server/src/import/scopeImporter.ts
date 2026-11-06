@@ -78,8 +78,8 @@
  * ## What `failed` is reserved for
  *
  * Not "the pages did not parse". `failed` is this server being unable to run the importer
- * at all: no ready harness, a session that would not open, a policy gate that would not
- * install, an MCP registration the harness refused. Those are the operator's to fix and
+ * at all: no ready harness, a session that would not open, a directory it may not use,
+ * an MCP registration the harness refused. Those are the operator's to fix and
  * are reported with the refusing component's own sentence.
  *
  * ## The chat reads the session's narration; the panel reads its calls (D16, amended)
@@ -202,7 +202,6 @@ import { McpCredentials } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { newImportId } from "../persistence/identifier";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
-import { PolicyDecisions } from "../policy/service";
 import { RunNarrations } from "../run/narration";
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import { WorkerEndpoints } from "../run/supervisor";
@@ -303,12 +302,12 @@ const refusal = (failure: {
             : "target_unavailable",
         detail: failure.message ?? "that target could not be opened",
       });
-    case "PolicyHookNotInstalled":
+    case "RoleDirectoryRefused":
       return new ImporterConversationRefused({
-        reason: "import_ungated",
+        reason: "import_directory_unusable",
         detail:
           failure.message ??
-          "the pre-execution policy gate could not be installed into this import's directory, so no session was opened",
+          "this import's directory cannot be used, so no session was opened",
       });
     case "HarnessTransportError":
     case "HarnessDecodeError":
@@ -362,7 +361,7 @@ const NOT_LIVE = { _tag: "NotLive" } as const;
 export interface ScopeImportRequest {
   readonly targetId: string;
   readonly targetName: string;
-  /** The engagement folder, for the gate's containment check. `null` when there is none. */
+  /** The engagement folder, for the role directory's containment check. `null` when there is none. */
   readonly workspacePath: string | null;
   readonly links: readonly string[];
   /**
@@ -374,7 +373,7 @@ export interface ScopeImportRequest {
   readonly message?: string | undefined;
   /**
    * The files that first message carried, read and checked (A6 F9). Stored in the
-   * session's directory once the spine has gated it, before the opening prompt.
+   * session's directory once the spine has checked it, before the opening prompt.
    */
   readonly uploads?: readonly ReadUpload[] | undefined;
   /**
@@ -402,8 +401,7 @@ export interface ScopeImportRequest {
    *
    * `directoryImportId` is the import whose directory the **harness** resolves the session
    * in, which is the original opening's and not this one's. The session is created — or
-   * rather continued — in that directory, so the gate is installed there, which is the only
-   * place it can be: the hook lives in the directory the agent runs commands in.
+   * rather continued — in that directory, which is the one the harness resolves it in.
    *
    * Absent for every other open, including a reopen that could not resume.
    */
@@ -710,7 +708,6 @@ export class ScopeImporter extends Context.Service<
     | HarnessResolver
     | FleetStore
     | McpCredentials
-    | PolicyDecisions
     | WorkerEndpoints
     | ScopeImportProgress
     | TargetStores
@@ -770,7 +767,7 @@ export class ScopeImporter extends Context.Service<
        * with its reason recorded once the session is closed.
        */
       const sessions = yield* makeLiveAgentSessions<ImportSessionMeta>(
-        { fleet, endpoints, gate: yield* PolicyDecisions },
+        { endpoints },
         {
           // The **importer** endpoint. The path selects the toolkit and the grant decides
           // whether the request is served at all: an importer credential at the worker URL
@@ -1047,8 +1044,8 @@ export class ScopeImporter extends Context.Service<
        * The first turn of one import: open the session, let it work, settle the view.
        *
        * The acquire order is the spine's, and each step rules out the next step's
-       * ambiguity: the gated directory before the session, so a session is never created
-       * in a directory nothing is auditing; the credential before the registration, so
+       * ambiguity: the checked directory before the session, so a session is never created
+       * inside the workspace; the credential before the registration, so
        * there is something to register; the registration before the prompt, so turn one has
        * the tools. A failure at any step closes the scope, which revokes the credential and
        * unregisters the server — including the case where the *next* step is the thing that
@@ -1081,7 +1078,7 @@ export class ScopeImporter extends Context.Service<
          * A resume continues a conversation; everything else about this function is the same.
          *
          * Two things change and they are both in `prepare`: the directory is the one the
-         * harness resolves the session in (so the gate goes where the agent runs), and the
+         * harness resolves the session in (so the check is of where the agent runs), and the
          * opening prompt is the short reconnection note rather than the whole opener, because
          * the rules and the pages are already in the session's own history.
          */
@@ -1128,7 +1125,7 @@ export class ScopeImporter extends Context.Service<
                * The session's directory, which on a resume is **not** this import's.
                *
                * Both drivers resolve a conversation through the directory it was created in,
-               * and the gate lives in that directory — so a resumed session is gated and run
+               * so a resumed session is checked and run
                * where the harness will actually resolve it (`importerReopen` checked that the
                * path is one of this target's own). `ensureImportDirectory` recreates it if it
                * was swept, which is also the answer to OpenCode's `LocationNotFoundError`.
@@ -1140,6 +1137,9 @@ export class ScopeImporter extends Context.Service<
               // The importer draws the question dock and answers it (A7-Q), so its agent
               // may ask the operator through the harness's own question tool.
               operatorQuestions: true,
+              // Reading the program's pages is its job: on Claude Code, `WebFetch` is
+              // pre-approved for it, whatever the operator's settings allow otherwise.
+              fetchesPages: true,
               // The engagement folder, so the containment check can refuse an import
               // directory inside it. `undefined` says this target has none.
               workspace: input.request.workspacePath ?? undefined,
@@ -1553,8 +1553,8 @@ export class ScopeImporter extends Context.Service<
            * every session of every project and cannot be asked which were ours, so the
            * index is the only way an operator finds this one again, and an id recorded first
            * cannot be lost to a crash between creating the session and writing the row. The
-           * price is an entry for a session that never opened (a gate that would not
-           * install). That entry is not listed: it is marked once `createSession` returns
+           * price is an entry for a session that never opened (a directory refused, a
+           * harness that would not create it). That entry is not listed: it is marked once `createSession` returns
            * (`confirmImportSession`, `0025`), and the session list reads only marked ones, so
            * an id the harness never minted cannot be offered for a resume.
            *
@@ -1926,7 +1926,7 @@ export class ScopeImporter extends Context.Service<
         return accepted(
           entry,
           "opened",
-          "A new importer session was opened for this message: the importer has its rules, the three tools that let it write, and whatever its harness gives it for reading a page — all inside its own gated directory. It has read nothing else yet.",
+          "A new importer session was opened for this message: the importer has its rules, the three tools that let it write, and whatever its harness gives it for reading a page — all inside its own directory. It has read nothing else yet.",
           { added: started.pagesAdded, notAdded: started.pagesNotAdded },
         );
       });
@@ -2123,7 +2123,7 @@ export class ScopeImporter extends Context.Service<
              * composer was told and what happens here cannot disagree — which is the whole
              * point of it being a function rather than a branch in each place. It never
              * fails: a harness that cannot be asked, a transcript that was swept, a session
-             * killed before its first prompt, a directory this server does not gate — all
+             * killed before its first prompt, a directory this server did not make — all
              * four are a fresh session, with the reason in the sentence.
              */
             const reopen = yield* importerReopenFor({

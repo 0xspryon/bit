@@ -34,7 +34,6 @@ import { TargetStores } from "../persistence/targetStores";
 import { McpCredentials, type IssuedCredential } from "./credentials";
 import { MCP_PATH, McpCallCounter } from "./server";
 import { ControlPlaneEndpoint } from "../http/controlPlane";
-import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import { RecordObservation } from "./tools";
 
 const directory = mkdtempSync(join(tmpdir(), "bit-mcp-"));
@@ -160,19 +159,17 @@ class GoalCredential extends Context.Service<
 }
 
 const testLayer = Layer.mergeAll(
-  ControlPlaneEndpoint.layer({ policy: DEFAULT_POLICY }),
+  ControlPlaneEndpoint.layer({}),
   TestCredential.layer,
   StaleCredential.layer,
   RoundCredential.layer,
   GoalCredential.layer,
   McpCredentials.layer,
   McpCallCounter.layer,
-  PolicyDecisions.layer,
   ObservationStore.layer(databaseFile),
 ).pipe(
   Layer.provideMerge(McpCredentials.layer),
   Layer.provideMerge(McpCallCounter.layer),
-  Layer.provideMerge(PolicyDecisions.layer),
   Layer.provideMerge(ObservationStore.layer(databaseFile)),
   // The MCP write boundary resolves a store by the target id its credential carries, so
   // what the endpoint needs is a resolver. One entry over the file above, which is the

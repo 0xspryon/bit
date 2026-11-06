@@ -111,7 +111,6 @@ const KIND_LABELS: Record<string, string | undefined> = {
   "turn.carried": "Went on with the next message",
   /** A sub-agent the agent started, as one entry (A6 U14). See {@link SUBAGENT_KIND}. */
   subagent: "Sub-agent",
-  "action.denied": "Denied",
 };
 
 /**
@@ -208,7 +207,6 @@ export const outcomeTint = (
   outcome: string,
 ): "danger" | "success" | "warning" | "plain" => {
   switch (outcome) {
-    case "denied":
     case "failed":
       return "danger";
     case "succeeded":
