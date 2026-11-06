@@ -1251,7 +1251,18 @@ const openCodeSubagentState = (
   ...(call.model === undefined ? {} : { model: call.model }),
 });
 
-/** Remembers a call's child session, under both maps. */
+/**
+ * Remembers a call's child session, under both maps.
+ *
+ * V2(chat): a `subagent` call that continues an existing child (`sessionID` in its input,
+ * "send a follow-up to an existing subagent, running or finished") takes the child's
+ * events over from the call that started it, so the earlier card stops moving. Once the
+ * earlier call has ended that is right — the follow-up is a new card for new work — but a
+ * follow-up steered into a **running** background child joins the same job, and the
+ * earlier card then stays `running` until a replay reads the child's `idle` marker. V2 could
+ * keep every call per child and move each, or draw a follow-up as part of its first card.
+ * The default `general`/`explore` agents can send follow-ups; none was seen in A7-S.
+ */
 const adoptChild = (
   subagents: OpenCodeSubagents,
   callId: string,
@@ -1536,6 +1547,13 @@ export const openCodeChildNarration = (
 /**
  * A child session's stored messages read into its call on a replay (A7-S): its tool calls
  * counted and its last ones as lines, its newest reply, and when it started and last wrote.
+ *
+ * **A child whose newest entry is an `idle` marker has ended** (A7-S review 1), whatever
+ * the parent's messages say: OpenCode writes one each time a session goes quiet, with the
+ * outcome (`Session.Message.Idle`). That is the one record of a background child stopped
+ * at its session's end, whose notice was cancelled with the parent's inbox; read without
+ * it, the card said `running` for ever. `interrupted` reads as stopped, `failed` as failed
+ * with the harness's error, `succeeded` as finished with its last reply.
  */
 const readChildMessages = (
   call: OpenCodeSubagentCall,
@@ -1546,11 +1564,16 @@ const readChildMessages = (
   let lastText: string | null = null;
   let first: number | null = null;
   let last: number | null = null;
+  let quiet:
+    | { readonly outcome: unknown; readonly at: number | null; error: unknown }
+    | undefined;
   for (const entry of entries) {
     const record = (entry ?? {}) as {
       type?: unknown;
       time?: { created?: unknown; completed?: unknown } | undefined;
       content?: unknown;
+      outcome?: unknown;
+      error?: unknown;
     };
     const created = millisOf(record.time?.created);
     const completed = millisOf(record.time?.completed);
@@ -1558,6 +1581,11 @@ const readChildMessages = (
     if (completed !== undefined || created !== undefined) {
       last = completed ?? created ?? last;
     }
+    // Only the newest entry's: anything after a marker is the child working again.
+    quiet =
+      record.type === "idle"
+        ? { outcome: record.outcome, at: created ?? null, error: record.error }
+        : undefined;
     if (record.type !== "assistant" || !Array.isArray(record.content)) continue;
     for (const part of record.content) {
       const item = (part ?? {}) as {
@@ -1606,6 +1634,29 @@ const readChildMessages = (
     }
   }
   call.seen = seen;
+  if (call.status === "running" && quiet !== undefined) {
+    if (quiet.outcome === "succeeded") {
+      call.status = "finished";
+    } else if (quiet.outcome === "failed") {
+      const said = (quiet.error as { message?: unknown } | undefined)?.message;
+      call.status = "failed";
+      call.failure = {
+        reason: "The sub-agent failed",
+        error: capped(
+          typeof said === "string" && said.trim() !== ""
+            ? said
+            : "its session ended failed",
+          SUBAGENT_ERROR_MAX,
+        ),
+      };
+    } else if (quiet.outcome === "interrupted") {
+      call.status = "stopped";
+    }
+    if (call.status !== "running") {
+      call.activity = null;
+      call.endedAt = quiet.at;
+    }
+  }
   // A call still open when it ended reads as stopped, as `endSubagent` has it live.
   call.lines = lines
     .slice(-SUBAGENT_LINES_KEPT)
@@ -1628,6 +1679,24 @@ const readChildMessages = (
 /** Whether a `synthetic` entry's metadata is a sub-agent's completion notice at all. */
 const isSubagentNotice = (metadata: unknown): boolean =>
   (metadata as { source?: unknown } | undefined)?.source === "subagent";
+
+/**
+ * The child a sub-agent notice is about (`SubagentCompletion.deliver`'s `{ source:
+ * "subagent", childID, state }`), or `undefined` for any other entry: what an end waits for
+ * after stopping a background child. Any state counts — a child stopped as it finished
+ * tells its parent `completed` — so the caller says which notices are new enough.
+ */
+const noticeChild = (metadata: unknown): string | undefined => {
+  if (!isSubagentNotice(metadata)) return undefined;
+  const child = (metadata as { childID?: unknown }).childID;
+  return typeof child === "string" ? child : undefined;
+};
+
+/**
+ * How much earlier than an end's start a delivered notice may be stamped and still count
+ * as one its stops caused: OpenCode's clock is this machine's, read in another process.
+ */
+const NOTICE_CLOCK_SLACK = 1_000;
 
 /**
  * One stored assistant message's content as parts, in the live stream's vocabulary (A6 F10).
@@ -2003,6 +2072,25 @@ const MESSAGE_PAGE_SIZE = 200;
 
 /** Pages walked before `messages` gives up loudly. See that function for why it fails. */
 const MESSAGE_PAGE_CEILING = 500;
+
+/**
+ * The child sessions an end lists (`GET /api/session?parentID=`): one page, the server's
+ * own maximum. A session's agent starts a handful of sub-agents; past this many, the rest
+ * are the ones the stream or a replay saw (`endSession`).
+ */
+const CHILD_LIST_LIMIT = 200;
+
+/**
+ * How long an end waits for the notices of the background children it stopped to reach
+ * their parent, and how often it looks (A7-S review 1). OpenCode admits a stopped
+ * background child's `Subagent cancelled` notice into the parent's inbox once the child's
+ * job settles, after the interrupt has answered, and the notice **wakes the parent**
+ * (`SubagentCompletion.deliver` → `Session.synthetic`, which nothing can hold back). So an
+ * end that interrupted the parent first, or before the notice was in, would leave a turn
+ * that runs on the notice after the operator ended the import.
+ */
+const CHILD_NOTICE_SETTLE = 1_500;
+const CHILD_NOTICE_POLL: Duration.Input = "50 millis";
 
 /**
  * Per-operation request bounds.
@@ -2467,15 +2555,21 @@ export const openCodeHarness = (
 
       /**
        * Each watched session's sub-agents, as its event stream follows them (A7-S): what
-       * {@link stopSubagent} finds a sub-agent's child session in. Set when a stream is asked
-       * for, replaced by a later stream for the same session, and with a replay's read
-       * (`replayedSubagents`) as the fallback for a sub-agent started before the stream.
-       *
-       * V2(chat): never trimmed, like the other per-session maps here: one entry per session
-       * this process watched, each bounded by the sub-agent calls that session made.
+       * {@link stopSubagent} finds a sub-agent's child session in. Set when a stream starts,
+       * replaced by a later stream for the same session, **dropped when that stream ends**
+       * and when the session is ended (A7-S review 1: an entry outliving its stream made a
+       * replay offer a Stop the server then refused, and froze the card at the stream's last
+       * state). A replay's read (`replayedSubagents`) is the fallback for a sub-agent started
+       * before the stream.
        */
       const streamedSubagents = new Map<string, OpenCodeSubagents>();
-      /** The newest replay's read of each session's sub-agents, for the same use. */
+      /**
+       * The newest replay's read of each session's sub-agents, for the same use; dropped
+       * when the session is ended.
+       *
+       * V2(chat): kept for a session read but never held (another process's), one entry
+       * per such session, each bounded by the sub-agent calls that session made.
+       */
       const replayedSubagents = new Map<string, OpenCodeSubagents>();
 
       /**
@@ -3414,6 +3508,18 @@ export const openCodeHarness = (
        * session's one execution belongs to that later opening, and emptying it here would
        * cancel the operator's newer messages. A ref this process never handed out (a session
        * opened by a process before it) is ended as asked: nothing newer here can hold it.
+       *
+       * **Its running children are stopped first** (A7-S review 1). The parent's interrupt
+       * reaches a foreground child, not a background one, which runs as an execution of its
+       * own and went on making calls after the import ended. So every child session the
+       * server lists for this one (`session.list` by `parentID`, which covers a child the
+       * stream never saw) that `session.active` says is running is interrupted, and the end
+       * then waits, at most {@link CHILD_NOTICE_SETTLE}, for each stopped background child's
+       * notice to be in: a notice that came after the parent's interrupt would wake it for a
+       * turn of its own ({@link CHILD_NOTICE_SETTLE}). Only then is the inbox emptied and the
+       * parent interrupted, which cancels the notices or stops the turn they woke. A child
+       * list or a child's interrupt that fails is logged and the end goes on: the parent
+       * still has to be stopped.
        */
       const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
         "openCodeHarness.endSession",
@@ -3421,19 +3527,39 @@ export const openCodeHarness = (
         const latest = latestRef.get(session.id);
         if (latest !== undefined && latest !== session) return;
         const sessionID = session.id as Session.ID;
-        const waiting = yield* Effect.result(
+        const first = yield* Effect.result(
           bounded(
             "session.inbox.list",
             timeouts.control,
             api.session.inbox.list({ sessionID }),
           ),
         );
-        if (waiting._tag === "Failure") {
-          if (waiting.failure.status === 404) return;
-          return yield* Effect.fail(waiting.failure);
+        if (first._tag === "Failure") {
+          if (first.failure.status === 404) return;
+          return yield* Effect.fail(first.failure);
         }
+        const since = Date.now();
+        const stopped = yield* stopRunningChildren(session.id);
+        const missing =
+          stopped.length === 0
+            ? []
+            : yield* awaitChildNotices(session.id, stopped, since);
+        if (missing.length > 0) {
+          yield* Effect.logWarning(
+            "a background sub-agent stopped at the end of its session had not told its parent yet; the parent is interrupted anyway, and may wake once more for that notice",
+            { sessionId: session.id, children: missing },
+          );
+        }
+        const waiting =
+          stopped.length === 0
+            ? first.success
+            : yield* bounded(
+                "session.inbox.list",
+                timeouts.control,
+                api.session.inbox.list({ sessionID }),
+              );
         yield* Effect.forEach(
-          waiting.success,
+          waiting,
           (item) =>
             bounded(
               "session.inbox.cancel",
@@ -3447,7 +3573,151 @@ export const openCodeHarness = (
           timeouts.control,
           api.session.interrupt({ sessionID }),
         );
+        // Nothing of this session runs here now, so nothing of its sub-agents is live.
+        streamedSubagents.delete(session.id);
+        replayedSubagents.delete(session.id);
       });
+
+      /**
+       * Interrupts every child session of `sessionId` that is running now, and answers the
+       * ones that were, less those known to be foreground (whose end tells no one: the
+       * parent's call fails instead). See {@link endSession}.
+       */
+      const stopRunningChildren = (
+        sessionId: string,
+      ): Effect.Effect<string[]> =>
+        Effect.gen(function* () {
+          const known = [
+            streamedSubagents.get(sessionId),
+            replayedSubagents.get(sessionId),
+          ].flatMap((subagents) => [...(subagents?.calls.values() ?? [])]);
+          const foreground = new Set(
+            known.flatMap((call) =>
+              call.child !== undefined && !call.background ? [call.child] : [],
+            ),
+          );
+          const children = new Set(
+            known.flatMap((call) =>
+              call.child === undefined ? [] : [call.child],
+            ),
+          );
+          const listed = yield* Effect.result(
+            bounded(
+              "session.list",
+              timeouts.control,
+              api.session.list({
+                parentID: sessionId as Session.ID,
+                limit: CHILD_LIST_LIMIT,
+              }),
+            ),
+          );
+          if (listed._tag === "Success") {
+            for (const child of listed.success.data) children.add(child.id);
+          } else {
+            yield* Effect.logWarning(
+              "an ending session's child sessions could not be listed; only the sub-agents bit saw are stopped",
+              { sessionId, detail: listed.failure.message },
+            );
+          }
+          if (children.size === 0) return [];
+          const active = yield* Effect.result(
+            bounded("session.active", timeouts.control, api.session.active()),
+          );
+          // Not knowing which run, each is asked: an interrupt of an idle session is a no-op.
+          const running = [...children].filter(
+            (child) =>
+              active._tag === "Failure" || Object.hasOwn(active.success, child),
+          );
+          const answered = yield* Effect.forEach(
+            running,
+            (child) =>
+              bounded(
+                "session.interrupt",
+                timeouts.control,
+                api.session.interrupt({ sessionID: child as Session.ID }),
+              ).pipe(
+                Effect.map((result) =>
+                  result.interrupted && !foreground.has(child) ? [child] : [],
+                ),
+                Effect.catch((failure) =>
+                  Effect.as(
+                    Effect.logWarning(
+                      "a running sub-agent of an ending session would not stop; it may still be running",
+                      { sessionId, child, detail: failure.message },
+                    ),
+                    [],
+                  ),
+                ),
+              ),
+            { concurrency: "unbounded" },
+          );
+          return answered.flat();
+        });
+
+      /**
+       * Waits, at most {@link CHILD_NOTICE_SETTLE}, until the parent holds a notice for each
+       * stopped child: in its inbox, or already delivered into its newest messages (a notice
+       * that woke an idle parent is taken off the inbox at once). Answers the children whose
+       * notice never came. A read that fails counts as not yet.
+       */
+      const awaitChildNotices = (
+        sessionId: string,
+        children: readonly string[],
+        since: number,
+      ): Effect.Effect<string[]> =>
+        Effect.gen(function* () {
+          const sessionID = sessionId as Session.ID;
+          const deadline = since + CHILD_NOTICE_SETTLE;
+          let missing = [...children];
+          for (;;) {
+            const seen = new Set<string>();
+            const inbox = yield* Effect.result(
+              bounded(
+                "session.inbox.list",
+                timeouts.control,
+                api.session.inbox.list({ sessionID }),
+              ),
+            );
+            if (inbox._tag === "Success") {
+              for (const item of inbox.success) {
+                if (item.type !== "synthetic") continue;
+                const child = noticeChild(item.payload.metadata);
+                if (child !== undefined) seen.add(child);
+              }
+            }
+            if (missing.some((child) => !seen.has(child))) {
+              const recent = yield* Effect.result(
+                bounded(
+                  "message.list",
+                  timeouts.control,
+                  api.message.list({ sessionID, limit: 20, order: "desc" }),
+                ),
+              );
+              if (recent._tag === "Success") {
+                for (const entry of recent.success.data) {
+                  const record = entry as {
+                    type?: unknown;
+                    metadata?: unknown;
+                    time?: { created?: unknown };
+                  };
+                  const created = millisOf(record.time?.created);
+                  if (
+                    record.type !== "synthetic" ||
+                    created === undefined ||
+                    created < since - NOTICE_CLOCK_SLACK
+                  ) {
+                    continue;
+                  }
+                  const child = noticeChild(record.metadata);
+                  if (child !== undefined) seen.add(child);
+                }
+              }
+            }
+            missing = missing.filter((child) => !seen.has(child));
+            if (missing.length === 0 || Date.now() >= deadline) return missing;
+            yield* Effect.sleep(CHILD_NOTICE_POLL);
+          }
+        });
 
       /**
        * The session's narration: OpenCode's event stream, filtered and reduced, re-made
@@ -3509,7 +3779,6 @@ export const openCodeHarness = (
          * other sessions' events are this one's children's ({@link openCodeChildNarration}).
          */
         const subagents = openCodeSubagents();
-        streamedSubagents.set(sessionId, subagents);
         /**
          * The question ids this stream has narrated as waiting and not yet as settled: what
          * a re-list after a break is compared with (A7-Q review 2).
@@ -3647,6 +3916,26 @@ export const openCodeHarness = (
                 waitingHere.add(entry.detail.question.questionId);
               } else if (entry.detail._tag === "questionSettled") {
                 waitingHere.delete(entry.detail.questionId);
+              }
+            }),
+          ),
+          /*
+           * This stream's sub-agents are the session's live ones **while it runs**, and no
+           * longer (A7-S review 1): a replay after it reads each child afresh and offers no
+           * Stop, since the stream was what said a call is still running. The stream is the
+           * narrator of a session this process holds, interrupted as the session closes; a
+           * later stream for the same session replaces the entry, and this one's end leaves
+           * that one's alone.
+           */
+          Stream.onStart(
+            Effect.sync(() => {
+              streamedSubagents.set(sessionId, subagents);
+            }),
+          ),
+          Stream.ensuring(
+            Effect.sync(() => {
+              if (streamedSubagents.get(sessionId) === subagents) {
+                streamedSubagents.delete(sessionId);
               }
             }),
           ),

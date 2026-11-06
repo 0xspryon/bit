@@ -2770,8 +2770,162 @@ describe("ending an opencode session (A6 F5, from its review)", () => {
     expect(answer._tag).toBe("Success");
     expect(calls(recorded)).toEqual([
       "GET /api/session/ses_1/inbox",
+      // Its children are listed (A7-S review 1); a list that fails leaves the ones bit saw,
+      // here none, and the end goes on.
+      "GET /api/session",
       "DELETE /api/session/ses_1/inbox/msg_a",
       "DELETE /api/session/ses_1/inbox/msg_b",
+      "POST /api/session/ses_1/interrupt",
+    ]);
+  });
+
+  /** A stopped background child's notice, as the parent's inbox holds it. */
+  const notice = (id: string, child: string) => ({
+    id,
+    sessionID: "ses_1",
+    time: { created: 1_792_532_292_371 },
+    type: "synthetic",
+    payload: {
+      text: `<subagent sessionID="${child}" state="cancelled" description="Sleep">\nSubagent cancelled\n</subagent>`,
+      metadata: {
+        source: "subagent",
+        childID: child,
+        agent: "general",
+        state: "cancelled",
+      },
+    },
+    delivery: "steer",
+  });
+  const child = (id: string) => sessionInfo({ id, parentID: "ses_1" }).data;
+
+  test("A7-S review 1: a running child is interrupted first, its notice waited for and cancelled, and only then the parent", async () => {
+    /*
+     * The parent's interrupt does not reach a background child, which ran on after the
+     * import ended; and the child's `Subagent cancelled` notice wakes the parent, so it has
+     * to be in the inbox before the inbox is emptied and the parent interrupted. A child
+     * that is not running is not asked.
+     */
+    let kidStopped = false;
+    const { answer, recorded } = await ending((url, init) => {
+      const path = new URL(url).pathname;
+      if (path === "/api/session/ses_1/inbox") {
+        return json({
+          data: kidStopped
+            ? [waiting("msg_a"), notice("msg_n", "ses_kid")]
+            : [waiting("msg_a")],
+        });
+      }
+      if (path === "/api/session") {
+        expect(new URL(url).searchParams.get("parentID")).toBe("ses_1");
+        return json({
+          data: [child("ses_kid"), child("ses_done")],
+          cursor: {},
+        });
+      }
+      if (path === "/api/session/active") {
+        return json(activeSessions("ses_1", "ses_kid"));
+      }
+      if (path === "/api/session/ses_kid/interrupt") {
+        kidStopped = true;
+        return json({ interrupted: true });
+      }
+      if (path.includes("/inbox/") && init?.method === "DELETE") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (path === "/api/session/ses_1/interrupt") {
+        return json({ interrupted: true });
+      }
+      return json({}, 500);
+    });
+    expect(answer._tag).toBe("Success");
+    expect(calls(recorded)).toEqual([
+      "GET /api/session/ses_1/inbox",
+      "GET /api/session",
+      "GET /api/session/active",
+      "POST /api/session/ses_kid/interrupt",
+      // The notice is in: the wait is over at once.
+      "GET /api/session/ses_1/inbox",
+      "GET /api/session/ses_1/inbox",
+      "DELETE /api/session/ses_1/inbox/msg_a",
+      "DELETE /api/session/ses_1/inbox/msg_n",
+      "POST /api/session/ses_1/interrupt",
+    ]);
+  });
+
+  test("A7-S review 1: a notice that already woke the parent counts once it is in its messages; one that never comes is waited for a bounded time", async () => {
+    const delivered = {
+      id: "msg_n",
+      type: "synthetic",
+      time: { created: Date.now() },
+      text: "<subagent>…</subagent>",
+      metadata: { source: "subagent", childID: "ses_kid", state: "cancelled" },
+    };
+    const run = (messages: readonly unknown[]) =>
+      ending((url, init) => {
+        const path = new URL(url).pathname;
+        if (path === "/api/session/ses_1/inbox") return json({ data: [] });
+        if (path === "/api/session") {
+          return json({ data: [child("ses_kid")], cursor: {} });
+        }
+        if (path === "/api/session/active") {
+          return json(activeSessions("ses_kid"));
+        }
+        if (path === "/api/session/ses_kid/interrupt") {
+          return json({ interrupted: true });
+        }
+        if (path === "/api/session/ses_1/message") {
+          return json({ data: messages, cursor: {} });
+        }
+        if (
+          path === "/api/session/ses_1/interrupt" &&
+          init?.method === "POST"
+        ) {
+          return json({ interrupted: true });
+        }
+        return json({}, 500);
+      });
+    const quick = await run([delivered]);
+    expect(quick.answer._tag).toBe("Success");
+    expect(calls(quick.recorded).slice(4)).toEqual([
+      "GET /api/session/ses_1/inbox",
+      "GET /api/session/ses_1/message",
+      "GET /api/session/ses_1/inbox",
+      "POST /api/session/ses_1/interrupt",
+    ]);
+    // An old notice of the same child is not this stop's.
+    const started = Date.now();
+    const slow = await run([
+      { ...delivered, time: { created: started - 60_000 } },
+    ]);
+    const waited = Date.now() - started;
+    expect(slow.answer._tag).toBe("Success");
+    expect(waited).toBeGreaterThanOrEqual(1_400);
+    expect(waited).toBeLessThan(5_000);
+    expect(calls(slow.recorded).at(-1)).toBe(
+      "POST /api/session/ses_1/interrupt",
+    );
+  });
+
+  test("A7-S review 1: a child that will not stop is logged, and the parent is still stopped", async () => {
+    const { answer, recorded } = await ending((url) => {
+      const path = new URL(url).pathname;
+      if (path === "/api/session/ses_1/inbox") return json({ data: [] });
+      if (path === "/api/session") {
+        return json({ data: [child("ses_kid")], cursor: {} });
+      }
+      // Not knowing which run, every child is asked.
+      if (path === "/api/session/active") return json({}, 500);
+      if (path === "/api/session/ses_1/interrupt") {
+        return json({ interrupted: true });
+      }
+      return json({}, 500);
+    });
+    expect(answer._tag).toBe("Success");
+    expect(calls(recorded)).toEqual([
+      "GET /api/session/ses_1/inbox",
+      "GET /api/session",
+      "GET /api/session/active",
+      "POST /api/session/ses_kid/interrupt",
       "POST /api/session/ses_1/interrupt",
     ]);
   });
@@ -2828,7 +2982,8 @@ describe("ending an opencode session (A6 F5, from its review)", () => {
         ),
       ),
     );
-    expect(counts).toEqual({ afterFirst: 0, afterSecond: 3 });
+    // The inbox, the children's list, the cancel, the interrupt.
+    expect(counts).toEqual({ afterFirst: 0, afterSecond: 4 });
   });
 
   test("whether a message is held is read from the session's inbox", async () => {
@@ -4624,5 +4779,234 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
       ],
     });
     expect(JSON.stringify(seen)).not.toContain("rm");
+  });
+
+  /**
+   * A stream the test feeds, a stub that answers every interrupt, and the stored messages a
+   * replay reads: the parent's, and each child's by its id.
+   */
+  const watched = (stored: Record<string, readonly unknown[]> = {}) => {
+    let push: ((frame: string) => void) | undefined;
+    const events = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        push = (each) => {
+          controller.enqueue(new TextEncoder().encode(each));
+        };
+      },
+    });
+    const frame = (
+      session: string,
+      type: string,
+      data: Record<string, unknown>,
+    ) =>
+      push?.(
+        `data: ${JSON.stringify({
+          type,
+          created: 1_793_347_011_894,
+          durable: { aggregateID: session, seq: 1, version: 1 },
+          data: { sessionID: session, assistantMessageID: "msg_p", ...data },
+        })}\n\n`,
+      );
+    const { layer, recorded } = clientWith((url) => {
+      const path = new URL(url).pathname;
+      if (path === "/api/event") {
+        return Promise.resolve(
+          new Response(events, {
+            headers: { "content-type": "text/event-stream" },
+          }),
+        );
+      }
+      if (path.endsWith("/interrupt")) return json({ interrupted: true });
+      const listed = /^\/api\/session\/([^/]+)\/message$/.exec(path)?.[1];
+      if (listed !== undefined) {
+        return json({ data: stored[listed] ?? [], cursor: {} });
+      }
+      return json(sessionInfo());
+    });
+    /** The parent's background `subagent` call, launched and returned at once. */
+    const background = (callId: string, kid: string) => {
+      frame("ses_1", "session.tool.input.started", {
+        id: callId,
+        name: "subagent",
+      });
+      frame("ses_1", "session.tool.called", {
+        id: callId,
+        input: {
+          agent: "general",
+          description: "Sleep",
+          prompt: "sleep 30",
+          background: true,
+        },
+      });
+      frame("ses_1", "session.tool.success", {
+        id: callId,
+        content: [{ type: "text", text: "working in the background" }],
+        metadata: { sessionID: kid, status: "running" },
+      });
+    };
+    return { layer, recorded, frame, background };
+  };
+
+  const follow = (harness: AgentHarness["Service"], seen: SubagentState[]) =>
+    harness.sessionEvents("ses_1").pipe(
+      Stream.runForEach((entry) =>
+        Effect.sync(() => {
+          if (entry.detail._tag === "subagent") seen.push(entry.detail);
+        }),
+      ),
+      Effect.forkChild,
+    );
+
+  const until = (check: () => boolean) =>
+    Effect.gen(function* () {
+      for (let tries = 0; tries < 200 && !check(); tries += 1) {
+        yield* Effect.sleep("5 millis");
+      }
+    });
+
+  test("A7-S review 1: Stop all stops a background child, which the turn's Stop would not reach", async () => {
+    const { layer, recorded, background } = watched();
+    const seen: SubagentState[] = [];
+    const all = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const reading = yield* follow(harness, seen);
+              yield* Effect.sleep("30 millis");
+              background("call_bg", "ses_bg");
+              yield* until(() => seen.some((state) => state.background));
+              const stopped = yield* harness.stopSubagents("ses_1");
+              yield* Fiber.interrupt(reading);
+              return stopped;
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+    // Launched and returned: the call has settled, and its child runs on.
+    expect(seen.at(-1)).toMatchObject({
+      callId: "call_bg",
+      background: true,
+      status: "running",
+      stop: "own",
+    });
+    expect(all).toEqual(["call_bg"]);
+    expect(
+      recorded.urls
+        .filter((url) => url.includes("/interrupt"))
+        .map((url) => new URL(url).pathname),
+    ).toEqual(["/api/session/ses_bg/interrupt"]);
+  });
+
+  test("A7-S review 1: once the stream ends its sub-agents are no longer live: a replay offers no Stop and reads the child, whose idle marker ends the card", async () => {
+    // Shaped on the recorded answer's own entries, so the client's schema decodes them.
+    const recordedMessages = (await storedMessages()) as Record<
+      string,
+      unknown
+    >[];
+    const [user, assistant] = recordedMessages;
+    const tool =
+      (assistant?.["content"] as Record<string, unknown>[]).find(
+        (part) => part["type"] === "tool",
+      ) ?? {};
+    const parent = [
+      { ...user, id: "msg_u", text: "Sleep in the background." },
+      {
+        ...assistant,
+        id: "msg_1",
+        content: [
+          {
+            ...tool,
+            id: "call_bg",
+            name: "subagent",
+            state: {
+              status: "completed",
+              input: {
+                agent: "general",
+                description: "Sleep",
+                prompt: "sleep 30",
+                background: true,
+              },
+              content: [{ type: "text", text: "working in the background" }],
+              metadata: { sessionID: "ses_bg", status: "running" },
+            },
+          },
+        ],
+      },
+    ];
+    const kid = [
+      { ...user, id: "msg_ku", sessionID: "ses_bg", text: "sleep 30" },
+      {
+        ...assistant,
+        id: "msg_k1",
+        sessionID: "ses_bg",
+        content: [
+          {
+            ...tool,
+            id: "k1",
+            name: "shell",
+            state: {
+              status: "running",
+              input: { command: "sleep 30" },
+              metadata: {},
+            },
+          },
+        ],
+      },
+      {
+        id: "msg_kidle",
+        type: "idle",
+        time: { created: 1_793_347_099_000 },
+        outcome: "interrupted",
+      },
+    ];
+    const { layer, background } = watched({ ses_1: parent, ses_bg: kid });
+    const seen: SubagentState[] = [];
+    const answers = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const reading = yield* follow(harness, seen);
+              yield* Effect.sleep("30 millis");
+              background("call_bg", "ses_bg");
+              yield* until(() => seen.some((state) => state.background));
+              const whileLive = yield* harness.messages("ses_1");
+              yield* Fiber.interrupt(reading);
+              const after = yield* harness.messages("ses_1");
+              const stop = yield* harness.stopSubagent("ses_1", "call_bg");
+              return { whileLive, after, stop };
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+    const last = (entries: readonly MessageEntry[]) =>
+      entries
+        .flatMap((entry) => entry.parts)
+        .filter((part): part is SubagentState => part._tag === "subagent")
+        .at(-1);
+    // While the stream runs, the stream's state is the card's, and it can be stopped.
+    expect(last(answers.whileLive)).toMatchObject({
+      status: "running",
+      stop: "own",
+    });
+    // After: the child's own messages, read afresh, say it was interrupted.
+    expect(last(answers.after)).toMatchObject({
+      callId: "call_bg",
+      status: "stopped",
+      stop: "none",
+      calls: 1,
+      endedAt: 1_793_347_099_000,
+      activity: null,
+      lines: [
+        { tool: "shell", input: "sleep 30", result: "stopped", failed: true },
+      ],
+    });
+    // The replay's read is what a Stop finds now, and that is no running sub-agent.
+    expect(answers.stop).toBe("not_running");
   });
 });
