@@ -22,6 +22,7 @@ import {
 import {
   Deferred,
   Effect,
+  Fiber,
   Layer,
   Queue,
   Redacted,
@@ -100,12 +101,25 @@ type ProbeCore = Conversations<
   ProbeAccepted
 >;
 
+/** How a world's harness is held, so a test decides when a turn ends or an open lands. */
+interface WorldOptions {
+  /** Every turn runs for ever (the harness never goes idle). */
+  readonly holdTurns?: boolean;
+  /**
+   * A turn runs until the test lets it go idle (`goIdle`) or a Stop interrupts it, which
+   * the harness answers as a turn interrupted.
+   */
+  readonly gateTurns?: boolean;
+  /** An open's harness session is created only once the test lets it (`letOpen`). */
+  readonly gateOpens?: boolean;
+}
+
 /**
  * One world: a registered target, a stub harness with a narration queue, a probe core.
  * `holdTurns` keeps every turn running (the harness never goes idle), as a real turn is
  * while a message waits behind it.
  */
-const world = (options: { readonly holdTurns?: boolean } = {}) =>
+const world = (options: WorldOptions = {}) =>
   Effect.gen(function* () {
     let root = 0;
     root += 1;
@@ -133,15 +147,46 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
     const events = yield* Queue.unbounded<HarnessNarration>();
     const questions = scriptedQuestions();
     const prompts: string[] = [];
+    /** How each later message was delivered: a steer's urgency. */
+    const urgencies: string[] = [];
+    const interrupts: string[] = [];
+    /*
+     * The turn running now goes idle when this is done. A prompt to a session that has gone
+     * idle starts a new turn, with a new gate; one steered into a running turn joins it.
+     */
+    let idle = Deferred.makeUnsafe<void>();
+    const opens = Deferred.makeUnsafe<void>();
+    const goIdle = Effect.suspend(() => Deferred.succeed(idle, undefined));
     const harness = stubHarness({
       ...questions.members,
       sessionEvents: () => Stream.fromQueue(events),
       ...(options.holdTurns === true
         ? { waitForIdle: () => Effect.never }
         : {}),
-      prompt: (_sessionId, text) =>
+      ...(options.gateTurns === true
+        ? {
+            waitForIdle: () => Effect.suspend(() => Deferred.await(idle)),
+            interruptSession: (sessionId) =>
+              Effect.gen(function* () {
+                interrupts.push(sessionId);
+                yield* goIdle;
+                return true;
+              }),
+          }
+        : {}),
+      ...(options.gateOpens === true
+        ? {
+            createSession: (input) =>
+              Effect.as(Deferred.await(opens), {
+                id: input.resume ?? input.sessionId ?? "ses_unnamed",
+              }),
+          }
+        : {}),
+      prompt: (_sessionId, text, delivery) =>
         Effect.sync(() => {
+          if (Deferred.isDoneUnsafe(idle)) idle = Deferred.makeUnsafe<void>();
           prompts.push(text);
+          if (delivery?._tag === "steer") urgencies.push(delivery.urgency);
           return { delivered: true };
         }),
     });
@@ -155,6 +200,12 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
     const ended: { id: string; reason: LiveSessionCloseReason }[] = [];
     let minted = 0;
     const reopened: string[] = [];
+    /**
+     * Whether a new period's open points the session's older rows at it at once. Off, it
+     * is a successor whose confirmation has not been written yet: an old id is followed to
+     * it by the core's in-process successor link alone.
+     */
+    const confirming = { now: true };
 
     // Declared before the core so the binding's reopen can name it.
     const holder: { core: ProbeCore | undefined } = { core: undefined };
@@ -189,6 +240,7 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
             openedAt: Date.now(),
           });
           // Every row of the session now points at its newest period, as the index reads it.
+          if (!confirming.now) return;
           for (const [key, row] of rows) {
             if (row.harnessSessionId === sessionId) {
               rows.set(key, { ...row, latestId: id });
@@ -367,6 +419,11 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
       events,
       questions,
       prompts,
+      urgencies,
+      interrupts,
+      goIdle,
+      letOpen: Deferred.succeed(opens, undefined),
+      confirming,
       rows,
       ended,
       reopened,
@@ -383,7 +440,7 @@ const run = <A, E>(
   body: (
     probe: Effect.Success<ReturnType<typeof world>>,
   ) => Effect.Effect<A, E>,
-  options: { readonly holdTurns?: boolean } = {},
+  options: WorldOptions = {},
 ): Promise<A> =>
   Effect.runPromise(
     Effect.gen(function* () {
@@ -727,5 +784,202 @@ describe("the conversation core through a non-importer owner", () => {
     });
     expect(result.row?.model).toBe(result.other ?? "");
     expect(result.refused).toBeInstanceOf(ConversationModelRefused);
+  });
+  test("a message with no urgency is a queued steer; Send now is a preemptive one", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const { entry } = yield* probe.open("first");
+          const queued = yield* probe.send({
+            conversationId: entry.id,
+            text: "when you are done",
+          });
+          const now = yield* probe.send({
+            conversationId: entry.id,
+            text: "read this first",
+            urgency: "preemptive",
+          });
+          return {
+            queued,
+            now,
+            urgencies: probe.urgencies,
+            held: yield* probe.core.heldSteers(entry.id),
+          };
+        }),
+      { holdTurns: true },
+    );
+    expect(result.queued.conversation).toBe("continued");
+    expect(result.now.conversation).toBe("continued");
+    expect(result.urgencies).toEqual(["queued", "preemptive"]);
+    // Both wait beside the transcript while the turn runs.
+    expect(result.held).toBe(2);
+  });
+
+  test("the messages held beside a turn are let go once the session goes idle", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const { entry } = yield* probe.open("first");
+          yield* probe.send({ conversationId: entry.id, text: "and then?" });
+          yield* Effect.sleep("20 millis");
+          const whileRunning = yield* probe.core.heldSteers(entry.id);
+          yield* probe.goIdle;
+          let after = whileRunning;
+          for (let i = 0; i < 100 && after > 0; i += 1) {
+            yield* Effect.sleep("5 millis");
+            after = yield* probe.core.heldSteers(entry.id);
+          }
+          return { whileRunning, after };
+        }),
+      { gateTurns: true },
+    );
+    expect(result.whileRunning).toBe(1);
+    expect(result.after).toBe(0);
+  });
+
+  test("a message to a period still opening waits for the open, then lands in that period", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const opening = yield* Effect.forkChild(probe.open("first"));
+          // The row is written before the harness session exists, so a picker lists it.
+          for (let i = 0; i < 100 && !probe.rows.has("prb_1"); i += 1) {
+            yield* Effect.sleep("2 millis");
+          }
+          let answered = false;
+          const sending = yield* Effect.forkChild(
+            probe
+              .send({ conversationId: "prb_1", text: "while you open" })
+              .pipe(Effect.tap(() => Effect.sync(() => (answered = true)))),
+          );
+          yield* Effect.sleep("20 millis");
+          const early = answered;
+          yield* probe.letOpen;
+          const sent = yield* Fiber.join(sending);
+          yield* Fiber.join(opening);
+          return {
+            early,
+            sent,
+            reopened: probe.reopened,
+            prompts: probe.prompts,
+          };
+        }),
+      { gateOpens: true },
+    );
+    expect(result.early).toBe(false);
+    expect(result.sent.conversation).toBe("continued");
+    expect(result.sent.probeId).toBe("prb_1");
+    // Waited for, not reopened under a new id.
+    expect(result.reopened).toEqual([]);
+    expect(result.prompts).toEqual([
+      "open: first",
+      'follow-up to "first": while you open',
+    ]);
+  });
+
+  test("an old period id is followed by its row's latest period to the one live now", async () => {
+    const result = await run((probe) =>
+      Effect.gen(function* () {
+        const { entry } = yield* probe.open("first");
+        // An older period of the same session, from before a restart: no in-process link
+        // leads from it, only its row's latest period.
+        probe.rows.set("prb_0", {
+          targetId: TARGET,
+          harnessSessionId: entry.sessionId,
+          harnessInstanceId: STUB_INSTANCE.instanceId,
+          model: STUB_INSTANCE.defaultModel,
+          modelOptions: null,
+          endedReason: "shutdown",
+          latestId: entry.id,
+          openedAt: Date.now() - 1000,
+        });
+        const sent = yield* probe.send({
+          conversationId: "prb_0",
+          text: "from an old tab",
+        });
+        const stopped = yield* probe.core.stopTurn({
+          targetId: TARGET,
+          conversationId: "prb_0",
+        });
+        return { sent, stopped, reopened: probe.reopened };
+      }),
+    );
+    expect(result.sent.conversation).toBe("continued");
+    expect(result.sent.probeId).toBe("prb_1");
+    expect(result.stopped.conversationId).toBe("prb_1");
+    expect(result.reopened).toEqual([]);
+  });
+
+  test("a Stop or activity addressed to an old id reaches a successor whose row is not yet confirmed", async () => {
+    const result = await run((probe) =>
+      Effect.gen(function* () {
+        const { entry } = yield* probe.open("first");
+        yield* probe.core.sessions.close(entry.id, "shutdown");
+        // The successor's confirmation is not written: only the in-process link leads to it.
+        probe.confirming.now = false;
+        const reopened = yield* probe.send({
+          conversationId: entry.id,
+          text: "still there?",
+        });
+        const activity = yield* probe.core.activity({
+          targetId: TARGET,
+          conversationId: entry.id,
+        });
+        const stopped = yield* probe.core.stopTurn({
+          targetId: TARGET,
+          conversationId: entry.id,
+        });
+        return {
+          reopened,
+          latest: probe.rows.get(entry.id)?.latestId,
+          activity,
+          stopped,
+        };
+      }),
+    );
+    expect(result.reopened.probeId).toBe("prb_2");
+    // Still naming itself, not the successor.
+    expect(result.latest).toBe("prb_1");
+    expect(result.activity.conversationId).toBe("prb_2");
+    expect(result.activity.turn).not.toBe("not_live");
+    expect(result.stopped.conversationId).toBe("prb_2");
+    expect(result.stopped.outcome).not.toBe("not_live");
+  });
+
+  test("Stop and Stop all on a busy period interrupt its running turn", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const { entry } = yield* probe.open("first");
+          const target = { targetId: TARGET, conversationId: entry.id };
+          const busy = yield* probe.core.activity(target);
+          const stopped = yield* probe.core.stopTurn(target);
+          yield* probe.send({ conversationId: entry.id, text: "go on" });
+          const busyAgain = yield* probe.core.activity(target);
+          const all = yield* probe.core.stopAll(target);
+          return {
+            busy,
+            stopped,
+            busyAgain,
+            all,
+            interrupts: probe.interrupts,
+            sessionId: entry.sessionId,
+          };
+        }),
+      { gateTurns: true },
+    );
+    expect(result.busy.turn).toBe("running");
+    expect(result.stopped).toMatchObject({
+      conversationId: "prb_1",
+      outcome: "interrupted",
+      working: false,
+    });
+    expect(result.busyAgain.turn).toBe("running");
+    expect(result.all).toMatchObject({
+      conversationId: "prb_1",
+      outcome: "interrupted",
+      working: false,
+    });
+    expect(result.interrupts).toEqual([result.sessionId, result.sessionId]);
   });
 });
