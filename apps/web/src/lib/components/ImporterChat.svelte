@@ -303,20 +303,27 @@
    * composer, the transcript — not only from inside it or a card: it covers the right of
    * the chat, and the operator reaching for Esc should not first have to find it.
    *
-   * Not an Esc that is another control's: one inside the question dock (it gives the
-   * composer back, A7-Q), one an input method is using (`composing`), and one while a
-   * popover (a control with `aria-haspopup` that is expanded: the model, agent and session
-   * pickers, the context meter) or another modal dialog is open, which closes that alone.
-   * Those listen on `window`, after this would have, so this listens in the capture phase
-   * and asks the page rather than `defaultPrevented`. Focus stays where it was, unless it
-   * was in the drawer, where `closePanel` sends it to the chip.
+   * That includes an Esc inside the question dock (final review, an orchestrator
+   * decision): at 768 the drawer covers most of the dock, and an operator who clicked one of
+   * its visible options and pressed Esc meant the drawer, not to throw the question away —
+   * a dismissal cannot be undone. So the first Esc closes the drawer, and only one with the
+   * drawer closed reaches the dock (whose rules, A7-Q, are then as before). Clicks on the
+   * part of the dock left visible keep working; Tab cannot reach it from the drawer.
+   *
+   * Not an Esc that is another control's: one an input method is using (`composing`), and
+   * one while a popover (a control with `aria-haspopup` that is expanded: the model, agent
+   * and session pickers, the context meter, the dock's Jump to… list) or another modal
+   * dialog is open, which closes that alone. Those listen on `window`, after this would
+   * have, so this listens in the capture phase and asks the page rather than
+   * `defaultPrevented`; the dock and the shell's dock listener do check `defaultPrevented`,
+   * so the `preventDefault` here keeps this Esc from them. Focus stays where it was, unless
+   * it was in the drawer, where `closePanel` sends it to the chip.
    */
   $effect(() => {
     if (!panelOpen || !panelOverlay) return;
     const onkeydown = (event: KeyboardEvent): void => {
       if (event.key !== "Escape" || composing(event)) return;
       const on = event.target instanceof Element ? event.target : null;
-      if (on?.closest(".dock") != null) return;
       const drawer = document.querySelector('aside.overlay[role="dialog"]');
       const otherDialog = [
         ...document.querySelectorAll('[aria-modal="true"]'),

@@ -832,12 +832,16 @@ describe("the 560px rule follows a resize while the panel is open (A7-S review 1
 
   /** At 768px, with the panel open as a drawer. */
   const drawerAt768 = async (
-    options: { readonly question?: PendingQuestion } = {},
+    options: {
+      readonly question?: PendingQuestion;
+      readonly fake?: FakeServer;
+    } = {},
   ) => {
     const { size } = sized();
     size.window = 768;
     size.shell = 536;
-    const app = await continueWith(new FakeServer(), [RUNNING, FINISHED], {
+    const fake = options.fake ?? new FakeServer();
+    const app = await continueWith(fake, [RUNNING, FINISHED], {
       ...(options.question === undefined ? {} : { question: options.question }),
     });
     click(chip()!);
@@ -961,37 +965,89 @@ describe("the 560px rule follows a resize while the panel is open (A7-S review 1
     expect(panel()).toBeNull();
   });
 
-  test("A7-S review 4: an Esc inside the question dock is the dock's, and the drawer stays", async () => {
-    await drawerAt768({
-      question: {
-        questionId: "toolu_q",
-        harnessSessionId: "ses_newest",
-        fields: [
-          {
-            key: "Which hosts?",
-            header: "Hosts",
-            question: "Which hosts?",
-            kind: "text",
-            options: [],
-            custom: true,
-            required: false,
-          },
+  const CHOICE: PendingQuestion = {
+    questionId: "toolu_q",
+    harnessSessionId: "ses_newest",
+    fields: [
+      {
+        key: "Which hosts?",
+        header: "Hosts",
+        question: "Which hosts?",
+        kind: "one",
+        options: [
+          { label: "api.acme.test", description: null },
+          { label: "www.acme.test", description: null },
         ],
-        askedAt: NOW,
-        answerability: "live",
-        attemptId: null,
-        roundId: null,
-        goalId: null,
-        importId: "imp_newest",
+        custom: true,
+        required: false,
       },
-    });
-    const inDock = document.querySelector<HTMLElement>(
-      ".importer .dock textarea, .importer .dock input, .importer .dock button",
+    ],
+    askedAt: NOW,
+    answerability: "live",
+    attemptId: null,
+    roundId: null,
+    goalId: null,
+    importId: "imp_newest",
+  };
+
+  test("final review: with the drawer open, the first Esc in the question dock closes the drawer and keeps the question; the next is the dock's", async () => {
+    const fake = new FakeServer();
+    await drawerAt768({ fake, question: CHOICE });
+    // A click on an option the drawer leaves visible picks it, as it would without it.
+    const option = document.querySelector<HTMLInputElement>(
+      '.importer .dock .current input[data-option="0"]',
     );
-    expect(inDock).not.toBeNull();
-    key(inDock!, { key: "Escape" });
+    expect(option).not.toBeNull();
+    click(option!);
+    option!.focus();
+    await settle();
+    expect(option!.checked).toBe(true);
+    const first = key(option!, { key: "Escape" });
+    expect(first.defaultPrevented).toBe(true);
+    await settle();
+    expect(panel()).toBeNull();
+    expect(fake.countOf("dismissImporterQuestion")).toBe(0);
+    expect(document.querySelector(".importer .dock")).not.toBeNull();
+    // Focus stays on the option, which is still picked.
+    expect(document.activeElement?.outerHTML).toBe(option!.outerHTML);
+    expect(option!.checked).toBe(true);
+    // With the drawer closed, Esc is the dock's again: on an option, it dismisses.
+    key(option!, { key: "Escape" });
+    await settle();
+    expect(fake.countOf("dismissImporterQuestion")).toBe(1);
+  });
+
+  test("final review: with the drawer open, Esc in a written answer closes the drawer and keeps the words; an input method's Esc does neither", async () => {
+    const fake = new FakeServer();
+    await drawerAt768({ fake, question: CHOICE });
+    const own = document.querySelector<HTMLInputElement>(
+      ".importer .dock .current input.own",
+    );
+    expect(own).not.toBeNull();
+    own!.focus();
+    own!.value = "my own hosts";
+    own!.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    // An input method's Esc is its own: the drawer stays, and nothing is dismissed.
+    key(own!, { key: "Escape", isComposing: true });
     await settle();
     expect(panel()).not.toBeNull();
+    expect(fake.countOf("dismissImporterQuestion")).toBe(0);
+    // The first Esc is the drawer's: it closes, the box keeps focus and words.
+    key(own!, { key: "Escape" });
+    await settle();
+    expect(panel()).toBeNull();
+    expect(document.activeElement?.outerHTML).toBe(own!.outerHTML);
+    expect(own!.value).toBe("my own hosts");
+    expect(fake.countOf("dismissImporterQuestion")).toBe(0);
+    // Then the dock's own rules: Esc in words only leaves the box, the next dismisses.
+    key(own!, { key: "Escape" });
+    await settle();
+    expect(fake.countOf("dismissImporterQuestion")).toBe(0);
+    const dock = document.querySelector<HTMLElement>(".importer .dock")!;
+    key(document.activeElement ?? dock, { key: "Escape" });
+    await settle();
+    expect(fake.countOf("dismissImporterQuestion")).toBe(1);
   });
 
   test("A7-S review 3: a resize moves the panel between drawer and column, and a rail the panel took comes back when it becomes a drawer", async () => {

@@ -596,8 +596,9 @@
     <!--
       As a drawer over the chat, a modal dialog, so Tab stays in it and a wheel over it is
       its own (A7-S review 4). The rest of the chat is still under the pointer, so a click
-      there still works, Stop among it; Esc from anywhere but the question dock closes it.
+      there still works, Stop among it; Esc from anywhere, the question dock included, closes it.
       One element either way, so a resize between drawer and column does not remount it.
+      `aria-modal="true"` hides the dock and composer from assistive tech while a pointer can still use them; acceptable, since Esc from anywhere closes the drawer.
     -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <aside
