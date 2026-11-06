@@ -38,6 +38,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,10 +53,15 @@ import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import {
   gatedRoleDirectory,
+  hookSourcePath,
+  HOOK_SOURCES_FROM,
   installOpenCodeGate,
+  openCodeGateInstaller,
+  POLICY_HOOK_FILE,
   PolicyHookNotInstalled,
   POLICY_PLUGIN_PACKAGE,
   resolveThroughSymlinks,
+  SERVER_PACKAGE,
   type GatedDirectory,
   withPolicyPlugin,
 } from "./install";
@@ -220,6 +226,115 @@ describe("installing into a workspace", () => {
       }).pipe(Effect.orDie),
     );
     expect(readFileSync(paths.auditPath, "utf8")).toContain("an earlier run");
+  });
+});
+
+/* ── Where the hook sources are found ────────────────────────────────────────── */
+
+/**
+ * A6 F12: the built server (`bun dist/main.js`) looked for the gates two folders above
+ * `dist/`, in `apps/plugins/`, and refused every import `import_ungated`. Both layouts
+ * must reach the same file: the package's own `plugins/`.
+ */
+describe("the hook sources are found in either server layout", () => {
+  /** This server package's root: two folders above `src/policy/`. */
+  const SERVER_ROOT = join(import.meta.dir, "..", "..");
+
+  test("the dev layout (src/policy) and the build's (dist) find the same plugins", () => {
+    const expected = join(SERVER_ROOT, "plugins", POLICY_HOOK_FILE);
+    expect(existsSync(expected)).toBe(true);
+    expect(hookSourcePath(POLICY_HOOK_FILE)).toBe(expected);
+    expect(hookSourcePath(POLICY_HOOK_FILE, HOOK_SOURCES_FROM)).toBe(expected);
+    // Where the bundle's `import.meta.dir` is; the folder need not exist for the walk.
+    expect(hookSourcePath(POLICY_HOOK_FILE, join(SERVER_ROOT, "dist"))).toBe(
+      expected,
+    );
+    expect(hookSourcePath("claudeCodeGate.ts", join(SERVER_ROOT, "dist"))).toBe(
+      join(SERVER_ROOT, "plugins", "claudeCodeGate.ts"),
+    );
+  });
+
+  /** A copy of the package's shape: a manifest named `name`, and `plugins/<files>`. */
+  const fakePackage = (name: string, files: readonly string[]) => {
+    const root = mkdtempSync(join(tmpdir(), "bit-hook-sources-"));
+    directories.push(root);
+    const pkg = join(root, "apps", "server");
+    mkdirSync(join(pkg, "plugins"), { recursive: true });
+    mkdirSync(join(pkg, "src", "policy"), { recursive: true });
+    mkdirSync(join(pkg, "dist"), { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name }));
+    for (const file of files)
+      writeFileSync(join(pkg, "plugins", file), `// ${file}\n`);
+    return { root, pkg };
+  };
+
+  test("in a copy of the package, from either layout's folder", () => {
+    const { pkg } = fakePackage(SERVER_PACKAGE, ["hook.ts"]);
+    const expected = join(pkg, "plugins", "hook.ts");
+    expect(hookSourcePath("hook.ts", join(pkg, "src", "policy"))).toBe(
+      expected,
+    );
+    expect(hookSourcePath("hook.ts", join(pkg, "dist"))).toBe(expected);
+  });
+
+  test("another package's manifest on the way up is walked past", () => {
+    const { pkg } = fakePackage(SERVER_PACKAGE, ["hook.ts"]);
+    writeFileSync(
+      join(pkg, "dist", "package.json"),
+      JSON.stringify({ name: "something-else" }),
+    );
+    expect(hookSourcePath("hook.ts", join(pkg, "dist"))).toBe(
+      join(pkg, "plugins", "hook.ts"),
+    );
+  });
+
+  test("a plugins folder in a package that is not the server's is not ours", () => {
+    const { pkg } = fakePackage("@bit/web", ["hook.ts"]);
+    expect(hookSourcePath("hook.ts", join(pkg, "dist"))).toBeUndefined();
+  });
+
+  test("the server's package without the file is not found", () => {
+    const { pkg } = fakePackage(SERVER_PACKAGE, []);
+    expect(hookSourcePath("hook.ts", join(pkg, "dist"))).toBeUndefined();
+  });
+
+  test("a missing plugin refuses the install and writes nothing into the workspace", async () => {
+    const paths = scratch();
+    const { pkg } = fakePackage(SERVER_PACKAGE, []);
+    const refusal = await Effect.runPromise(
+      Effect.result(
+        openCodeGateInstaller(join(pkg, "dist"))({
+          workspace: paths.workspace,
+          policyUrl: "http://127.0.0.1:9/p",
+          auditPath: paths.auditPath,
+          freshAudit: true,
+        }),
+      ),
+    );
+    expect(refusal._tag).toBe("Failure");
+    if (refusal._tag === "Failure") {
+      expect(refusal.failure).toBeInstanceOf(PolicyHookNotInstalled);
+      expect(refusal.failure.message).toContain(
+        `plugins/${POLICY_HOOK_FILE} was not found`,
+      );
+    }
+    expect(readdirSync(paths.workspace)).toEqual([]);
+    expect(existsSync(paths.auditPath)).toBe(false);
+  });
+
+  test("the installed plugin is the package's file, byte for byte", async () => {
+    const paths = scratch();
+    await Effect.runPromise(
+      installOpenCodeGate({
+        workspace: paths.workspace,
+        policyUrl: "http://127.0.0.1:9/p",
+        auditPath: paths.auditPath,
+        freshAudit: true,
+      }).pipe(Effect.orDie),
+    );
+    expect(readFileSync(paths.hookPath, "utf8")).toBe(
+      readFileSync(join(SERVER_ROOT, "plugins", POLICY_HOOK_FILE), "utf8"),
+    );
   });
 });
 

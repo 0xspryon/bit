@@ -63,9 +63,11 @@ import { Effect } from "effect";
 import {
   asRefusal,
   excludeFromGit,
+  HOOK_SOURCES_FROM,
   mergeableConfigAt,
   PolicyHookNotInstalled,
   prepareAudit,
+  readHookSource,
   type GateInstall,
   type GateInstaller,
   type MergeableConfig,
@@ -81,14 +83,12 @@ export const CLAUDE_SETTINGS_PATH = join(".claude", "settings.local.json");
 /** Where the hook script is copied, relative to the workspace. */
 export const CLAUDE_GATE_PATH = join(".claude", "bit-policy", "gate.ts");
 
-/** The hook script's source, copied into whichever workspace needs it. */
-export const CLAUDE_GATE_SOURCE = join(
-  import.meta.dir,
-  "..",
-  "..",
-  "plugins",
-  "claudeCodeGate.ts",
-);
+/**
+ * The hook script's source, in the server package's `plugins/`, copied into whichever
+ * workspace needs it. Found by `hookSourcePath`, which is what lets the built server find
+ * it too (A6 F12).
+ */
+export const CLAUDE_GATE_FILE = "claudeCodeGate.ts";
 
 /**
  * The argv marker that identifies an entry as ours.
@@ -354,9 +354,14 @@ export const withPolicyHook = (
  * `"bun"`. A hook entry is spawned without a shell, so a bare name would depend on
  * whatever `PATH` the harness inherited, and the one thing worse than a gate that denies
  * is a gate that cannot be found.
+ *
+ * `sourcesFrom` is where `hookSourcePath` starts looking for the hook; only a test passes
+ * it. Production uses {@link installClaudeCodeGate}.
  */
-export const installClaudeCodeGate: GateInstaller = Effect.fnUntraced(
-  function* (input: GateInstall) {
+export const claudeCodeGateInstaller = (
+  sourcesFrom: string = HOOK_SOURCES_FROM,
+): GateInstaller =>
+  Effect.fnUntraced(function* (input: GateInstall) {
     return yield* Effect.tryPromise({
       try: async () => {
         const gatePath = join(input.workspace, CLAUDE_GATE_PATH);
@@ -378,9 +383,16 @@ export const installClaudeCodeGate: GateInstaller = Effect.fnUntraced(
           throw hooksDisabled(input.workspace, settingsPath, disabledLocally);
         }
 
+        // Read before anything is written, for the same reason: a hook this server cannot
+        // find refuses the run (`import_ungated` for an import) and leaves nothing behind.
+        const gate = await readHookSource(
+          input.workspace,
+          CLAUDE_GATE_FILE,
+          sourcesFrom,
+        );
         mkdirSync(join(gatePath, ".."), { recursive: true });
         await prepareAudit(input);
-        await Bun.write(gatePath, await Bun.file(CLAUDE_GATE_SOURCE).text());
+        await Bun.write(gatePath, gate);
         await Bun.write(
           settingsPath,
           `${JSON.stringify(
@@ -404,5 +416,7 @@ export const installClaudeCodeGate: GateInstaller = Effect.fnUntraced(
       },
       catch: asRefusal(input.workspace),
     });
-  },
-);
+  });
+
+/** The Claude Code gate installer, reading the hook from this server's own package. */
+export const installClaudeCodeGate: GateInstaller = claudeCodeGateInstaller();

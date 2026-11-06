@@ -614,6 +614,45 @@ refuses every Claude Code import with `import_ungated`: it resolves the policy h
 `apps/plugins/claudeCodeGate.ts`, which does not exist (`bun src/main.ts` works). Fix the
 resolution so the built server finds the gate. **Remind the operator when the plan is done.**
 
+**Done (2026-11-06).** Both harnesses were affected: each hook source was
+`join(import.meta.dir, "..", "..", "plugins", …)`, right from `src/policy/` and two folders
+too high from the bundle's `dist/`. Live on the old build, Claude Code was refused with
+`ENOENT … apps/plugins/claudeCodeGate.ts` and OpenCode with `… apps/plugins/policyHook.ts`,
+both as `import_ungated`. Now `policy/install.ts` has `hookSourcePath`, which walks up from
+the module's folder to the nearest `package.json` named `@bit/server` and takes that
+package's `plugins/<file>`. `readHookSource` reads it, or throws `PolicyHookNotInstalled`
+when it is missing, which an import still reports as `import_ungated`. Both installers read
+the source before they write anything, so a refused install leaves the workspace untouched.
+`claudeCodeGateInstaller(from)` and `openCodeGateInstaller(from)` take the start folder;
+only tests pass it. The hooks themselves did not change.
+
+We considered copying `plugins/` beside `dist/` during the build, or embedding the sources
+in the bundle as text. Both would make the built gate a snapshot that could drift from the
+file the dev server installs. Copying would also add a build step the gate depends on.
+Embedding would turn a missing source into a crash at load instead of a refused run, and
+TypeScript types a `.ts` text import as a module. The walk needs no build change, and the
+bundle already has to run inside the package (`--packages=external`).
+
+Tests: either layout's folder (the real package's `src/policy` and `dist`, and a copy of
+the package), walking past another package's manifest, a `plugins/` folder in a package that
+is not the server's, a missing file, and a refused install on each harness that writes
+nothing. An importer conversation whose real Claude Code installer finds no gate is refused
+`import_ungated` before a session exists. The installed files are byte for byte the package's.
+
+Live, with the built server (`bun run build`, then `bun dist/main.js`, using `HUNT_ROOT`,
+`WORKSPACE_ROOT`, `PORT`, `BIT_PASSWORD` and `HARNESS=claude-code,opencode`): a Claude Code
+importer on `claude-haiku-4-5` ran `echo` through Bash. The target's `policy-audit.log`
+recorded `Bash allowed unrestricted`, and the CLI transcript has a `PreToolUse:Bash`
+`hook_success` with "allowed by bit policy (unrestricted)". An OpenCode importer on
+`zai-coding-plan/glm-5.3-flash` ran `shell`, and the log recorded `shell allowed
+unrestricted`. Logs: `/run/media/hbt/work/f12-logs/live/`.
+
+The built server does not serve the web app. Serve the web build with
+`cd apps/web && BIT_SERVER_URL=http://127.0.0.1:<port> bunx vite preview`; its `/api` proxy
+is the dev server's (checked: `/api/v1/health` and a deep link both answer). A server that
+serves the built app itself, as the `browserApi.ts` header assumes, is deployment work and
+was not done here.
+
 ### Chat shell for goal/planner/worker (prep)
 
 **Done (2026-11-06), web only; the full wiring is a later task, not yet scheduled.** The

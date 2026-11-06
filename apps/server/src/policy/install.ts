@@ -50,7 +50,13 @@
  * into the workspace except the gate and the configuration that loads it: no fixture
  * files, no reformatting of keys we do not own.
  */
-import { mkdirSync, readlinkSync, realpathSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+} from "node:fs";
 import {
   basename,
   dirname,
@@ -284,6 +290,92 @@ export const asRefusal =
       ? cause
       : new PolicyHookNotInstalled({ workspace, detail: String(cause) });
 
+/* ── The hook sources ────────────────────────────────────────────────────────── */
+
+/** The package whose root holds `plugins/`: the one anchor both server layouts share. */
+export const SERVER_PACKAGE = "@bit/server";
+
+/**
+ * Where the server's hook sources are looked for from, unless a caller says otherwise.
+ *
+ * This module's own directory, which is not the same place in the two ways the server
+ * runs: `bun src/main.ts` loads it from `src/policy/`, and `bun dist/main.js` (the output
+ * of `bun run build`) from `dist/`, as one bundle. A path counted up from here by a fixed
+ * number of `..` therefore holds in one layout only, and it did: the build looked for the
+ * gates in `apps/plugins/` and refused every import `import_ungated` (A6 F12).
+ */
+export const HOOK_SOURCES_FROM = import.meta.dir;
+
+/**
+ * The server package's `plugins/<file>`, found by walking up from `from` to the nearest
+ * `package.json` named {@link SERVER_PACKAGE}; `undefined` when there is none above it or
+ * it has no such file.
+ *
+ * Both layouts sit inside that package, so both read **the same file on disk**, at the
+ * moment of the install: what the dev server installs is what the built one installs,
+ * including an edit made after the build. A walk rather than a list of candidate offsets,
+ * so a third layout (a bundle in a subfolder, a test's copy of the package) needs nothing
+ * here, and an unrelated `plugins/` folder elsewhere on the disk is never taken for ours:
+ * only the package's own name identifies it.
+ *
+ * Copying the plugins beside `dist/` at build time and embedding them in the bundle as
+ * text were the other two ways out. Both make the built gate a snapshot that can drift
+ * from the file the dev server installs, the first adds a build step the server's
+ * correctness would depend on, and the second makes a missing hook a crash at load
+ * rather than a refused run.
+ */
+export const hookSourcePath = (
+  file: string,
+  from: string = HOOK_SOURCES_FROM,
+): string | undefined => {
+  let directory = resolve(from);
+  for (;;) {
+    const manifest = join(directory, "package.json");
+    if (existsSync(manifest) && packageName(manifest) === SERVER_PACKAGE) {
+      const source = join(directory, "plugins", file);
+      return existsSync(source) ? source : undefined;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) return undefined;
+    directory = parent;
+  }
+};
+
+/** A manifest's `name`, or `undefined` when it has none or is not one we can read. */
+const packageName = (manifest: string): string | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(manifest, "utf8"));
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const name = (parsed as { name?: unknown }).name;
+    return typeof name === "string" ? name : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * The text of the hook source `file`, or {@link PolicyHookNotInstalled} for `workspace`.
+ *
+ * A hook source that cannot be found **refuses the run** (`import_ungated` for an import):
+ * installing a settings entry that names no script would be the one failure that looks
+ * like a working gate. Throws, as {@link mergeableConfigAt} does, for the installers'
+ * `Effect.tryPromise`.
+ */
+export const readHookSource = async (
+  workspace: string,
+  file: string,
+  from: string = HOOK_SOURCES_FROM,
+): Promise<string> => {
+  const source = hookSourcePath(file, from);
+  if (source === undefined) {
+    throw new PolicyHookNotInstalled({
+      workspace,
+      detail: `this server's policy hook source plugins/${file} was not found: no ${SERVER_PACKAGE} package above ${from} holds it, so the gate cannot be installed`,
+    });
+  }
+  return Bun.file(source).text();
+};
+
 /* ── Role directories ────────────────────────────────────────────────────────── */
 
 /**
@@ -488,14 +580,11 @@ export const gatedRoleDirectory = <E>(
 
 /* ── OpenCode ────────────────────────────────────────────────────────────────── */
 
-/** The OpenCode plugin's source, copied into whichever workspace needs it. */
-export const POLICY_HOOK_SOURCE = join(
-  import.meta.dir,
-  "..",
-  "..",
-  "plugins",
-  "policyHook.ts",
-);
+/**
+ * The OpenCode plugin's source, in the server package's `plugins/`, copied into whichever
+ * workspace needs it. Found by {@link hookSourcePath}.
+ */
+export const POLICY_HOOK_FILE = "policyHook.ts";
 
 /**
  * The package name our OpenCode plugin is configured under.
@@ -555,61 +644,72 @@ export const withPolicyPlugin = (
  *
  * Fails with {@link PolicyHookNotInstalled} rather than dying, so a caller starting a run
  * can refuse that run.
+ *
+ * `sourcesFrom` is where {@link hookSourcePath} starts looking for the plugin; only a test
+ * passes it. Production uses {@link installOpenCodeGate}.
  */
-export const installOpenCodeGate: GateInstaller = Effect.fnUntraced(function* (
-  input: GateInstall,
-) {
-  return yield* Effect.tryPromise({
-    try: async () => {
-      const opencodeDirectory = join(input.workspace, ".opencode");
-      const pluginDirectory = join(opencodeDirectory, "policy");
-      const configPath = join(opencodeDirectory, "opencode.json");
+export const openCodeGateInstaller = (
+  sourcesFrom: string = HOOK_SOURCES_FROM,
+): GateInstaller =>
+  Effect.fnUntraced(function* (input: GateInstall) {
+    return yield* Effect.tryPromise({
+      try: async () => {
+        const opencodeDirectory = join(input.workspace, ".opencode");
+        const pluginDirectory = join(opencodeDirectory, "policy");
+        const configPath = join(opencodeDirectory, "opencode.json");
 
-      const existing = (await mergeableConfigAt(
-        input.workspace,
-        configPath,
-      )) as OpencodeConfig | undefined;
-      // Captured before we write it: afterwards there is no way to tell whether the
-      // config file is ours or theirs.
-      const configIsOurs = existing === undefined;
+        const existing = (await mergeableConfigAt(
+          input.workspace,
+          configPath,
+        )) as OpencodeConfig | undefined;
+        // Captured before we write it: afterwards there is no way to tell whether the
+        // config file is ours or theirs.
+        const configIsOurs = existing === undefined;
 
-      mkdirSync(pluginDirectory, { recursive: true });
-      await prepareAudit(input);
-      await Bun.write(
-        join(pluginDirectory, "index.ts"),
-        await Bun.file(POLICY_HOOK_SOURCE).text(),
-      );
-      await Bun.write(
-        join(pluginDirectory, "package.json"),
-        `${JSON.stringify(
-          {
-            name: "bit-policy-hook",
-            private: true,
-            type: "module",
-            main: "index.ts",
-          },
-          null,
-          2,
-        )}\n`,
-      );
-      await Bun.write(
-        configPath,
-        `${JSON.stringify(
-          withPolicyPlugin(existing, {
-            policyUrl: input.policyUrl,
-            auditPath: input.auditPath,
-          }),
-          null,
-          2,
-        )}\n`,
-      );
-      await excludeFromGit(input.workspace, [
-        ".opencode/policy/",
-        // Only when there was nothing there and this install created it; see
-        // `excludeFromGit`. An operator's own opencode config stays theirs to commit.
-        ...(configIsOurs ? [".opencode/opencode.json"] : []),
-      ]);
-    },
-    catch: asRefusal(input.workspace),
+        // Read before anything is written: a plugin this server cannot find refuses the run
+        // and leaves the workspace as it was.
+        const plugin = await readHookSource(
+          input.workspace,
+          POLICY_HOOK_FILE,
+          sourcesFrom,
+        );
+        mkdirSync(pluginDirectory, { recursive: true });
+        await prepareAudit(input);
+        await Bun.write(join(pluginDirectory, "index.ts"), plugin);
+        await Bun.write(
+          join(pluginDirectory, "package.json"),
+          `${JSON.stringify(
+            {
+              name: "bit-policy-hook",
+              private: true,
+              type: "module",
+              main: "index.ts",
+            },
+            null,
+            2,
+          )}\n`,
+        );
+        await Bun.write(
+          configPath,
+          `${JSON.stringify(
+            withPolicyPlugin(existing, {
+              policyUrl: input.policyUrl,
+              auditPath: input.auditPath,
+            }),
+            null,
+            2,
+          )}\n`,
+        );
+        await excludeFromGit(input.workspace, [
+          ".opencode/policy/",
+          // Only when there was nothing there and this install created it; see
+          // `excludeFromGit`. An operator's own opencode config stays theirs to commit.
+          ...(configIsOurs ? [".opencode/opencode.json"] : []),
+        ]);
+      },
+      catch: asRefusal(input.workspace),
+    });
   });
-});
+
+/** The OpenCode gate installer, reading the plugin from this server's own package. */
+export const installOpenCodeGate: GateInstaller = openCodeGateInstaller();

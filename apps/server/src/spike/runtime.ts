@@ -60,9 +60,6 @@ export const WORKER_MODEL = OPENCODE_DEFAULT_MODEL;
 
 export const RUNTIME_DIR = join(process.cwd(), ".runtime");
 
-/** The policy hook's source. Re-exported; it lives with the installer now. */
-export { POLICY_HOOK_SOURCE } from "../policy/install";
-
 /** Paths the demos report and read back. Values, not a service's business. */
 export class SpikePaths extends Context.Service<
   SpikePaths,

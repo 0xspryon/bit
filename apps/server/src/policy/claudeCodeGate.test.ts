@@ -31,7 +31,15 @@ import {
   expect,
   test,
 } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,15 +52,17 @@ import { ObservationStore } from "../persistence/store";
 import { TargetStores } from "../persistence/targetStores";
 import {
   CLAUDE_CODE_MINIMUM,
+  CLAUDE_GATE_FILE,
   CLAUDE_GATE_PATH,
   CLAUDE_GATE_SENTINEL,
   CLAUDE_SETTINGS_PATH,
+  claudeCodeGateInstaller,
   compareVersions,
   installClaudeCodeGate,
   readableSettingsFiles,
   withPolicyHook,
 } from "./claudeCodeGate";
-import { installOpenCodeGate } from "./install";
+import { installOpenCodeGate, PolicyHookNotInstalled } from "./install";
 import {
   DEFAULT_POLICY,
   PERMISSIVE_POLICY,
@@ -205,6 +215,54 @@ describe("installing into a workspace", () => {
     // The audit file is created outside the workspace, so the worker cannot read it.
     expect(paths.auditPath.startsWith(paths.workspace)).toBe(false);
     expect(await Bun.file(paths.auditPath).exists()).toBe(true);
+  });
+
+  test("the gate written is the package's plugins/claudeCodeGate.ts, byte for byte (A6 F12)", async () => {
+    const paths = scratch();
+    await Effect.runPromise(
+      installClaudeCodeGate({
+        workspace: paths.workspace,
+        policyUrl: "http://127.0.0.1:9/p",
+        auditPath: paths.auditPath,
+        freshAudit: true,
+      }).pipe(Effect.orDie),
+    );
+    expect(readFileSync(paths.gatePath, "utf8")).toBe(
+      readFileSync(
+        join(import.meta.dir, "..", "..", "plugins", CLAUDE_GATE_FILE),
+        "utf8",
+      ),
+    );
+  });
+
+  test("a server whose package holds no gate refuses the install and writes nothing (A6 F12)", async () => {
+    const paths = scratch();
+    // The built server's layout, in a copy of the package that lost its plugins.
+    const pkg = join(paths.workspace, "..", "server");
+    mkdirSync(join(pkg, "dist"), { recursive: true });
+    writeFileSync(
+      join(pkg, "package.json"),
+      JSON.stringify({ name: "@bit/server" }),
+    );
+    const refusal = await Effect.runPromise(
+      Effect.result(
+        claudeCodeGateInstaller(join(pkg, "dist"))({
+          workspace: paths.workspace,
+          policyUrl: "http://127.0.0.1:9/p",
+          auditPath: paths.auditPath,
+          freshAudit: true,
+        }),
+      ),
+    );
+    expect(refusal._tag).toBe("Failure");
+    if (refusal._tag === "Failure") {
+      expect(refusal.failure).toBeInstanceOf(PolicyHookNotInstalled);
+      expect(refusal.failure.message).toContain(
+        `plugins/${CLAUDE_GATE_FILE} was not found`,
+      );
+    }
+    expect(readdirSync(paths.workspace)).toEqual([]);
+    expect(existsSync(paths.auditPath)).toBe(false);
   });
 
   test("the local settings file is the one written, not the committed one", async () => {

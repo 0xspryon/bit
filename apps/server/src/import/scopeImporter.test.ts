@@ -99,6 +99,8 @@ import { McpCallCounter } from "../mcp/server";
 import { FleetStore, HUNT_FILE } from "../persistence/fleet";
 import type { DatabaseError } from "../persistence/store";
 import { TargetStores, withTargetStore } from "../persistence/targetStores";
+import { claudeCodeGateInstaller } from "../policy/claudeCodeGate";
+import type { GateInstaller } from "../policy/install";
 import { DEFAULT_POLICY, PolicyDecisions } from "../policy/service";
 import { projectNarration } from "../run/liveTranscript";
 import { RunNarrations, type RunNarration } from "../run/narration";
@@ -313,6 +315,8 @@ interface Script {
   done: Promise<void>;
   /** Makes `createSession` fail, for a session that never opens. */
   failCreate: boolean;
+  /** The harness's gate installer; none when unset, as most tests want (A6 F12). */
+  installGate: GateInstaller | undefined;
   /** Makes the opening prompt fail, for a session the harness refuses to start. */
   failPrompt: boolean;
   /** Makes a later (steered) prompt fail, for a session that refuses a second message. */
@@ -399,6 +403,7 @@ const newScript = (readable: readonly string[]): Script => {
     streamBlocks: false,
     done: Promise.resolve(),
     failCreate: false,
+    installGate: undefined,
     failPrompt: false,
     failSteer: false,
     failInterrupt: false,
@@ -433,7 +438,10 @@ const scriptedHarness = (script: Script) => {
       minted += 1;
       return minted === 1 ? "ses_import" : `ses_import_${String(minted)}`;
     },
-    installGate: () => Effect.void,
+    installGate: (input) =>
+      script.installGate === undefined
+        ? Effect.void
+        : script.installGate(input),
     // What the agent is waiting on the operator for (A7-Q): `script.questions.ask`.
     ...script.questions.members,
     /*
@@ -2502,6 +2510,52 @@ describe("a conversation opened with no links", () => {
   test("the create-target path still answers none for no links and no message", async () => {
     const { started } = await importWith([], { links: [] });
     expect(started).toEqual({ _tag: "none" });
+  });
+});
+
+/**
+ * A6 F12: the built server could not find its gate, and refused every import. A gate that
+ * genuinely cannot be found must still refuse, as `import_ungated`, before a session exists.
+ */
+describe("a harness whose gate cannot be found", () => {
+  test("a conversation is refused import_ungated, and no session is created or indexed", async () => {
+    const built = world([PAGE_GOOD]);
+    // The real Claude Code installer, looking from a folder no server package is above.
+    const nowhere = join(base, "no-server-package-here");
+    mkdirSync(nowhere, { recursive: true });
+    built.script.installGate = claudeCodeGateInstaller(nowhere);
+    const runtime = ManagedRuntime.make(built.layer);
+    const opened = await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        yield* fleet.register({
+          targetId: TARGET,
+          name: "Acme Corp",
+          scopeNote: "",
+          workspacePath: workspace,
+        });
+        yield* fleet.migrateTarget(TARGET);
+        return yield* Effect.result(
+          (yield* ScopeImporter).converse({
+            targetId: TARGET,
+            targetName: "Acme Corp",
+            workspacePath: workspace,
+            text: "Read the program page.",
+          }),
+        );
+      }),
+    );
+    expect(opened._tag).toBe("Failure");
+    if (opened._tag !== "Failure") return;
+    expect(opened.failure._tag).toBe("ImporterConversationRefused");
+    expect(opened.failure).toMatchObject({ reason: "import_ungated" });
+    expect(String((opened.failure as { detail: string }).detail)).toContain(
+      "plugins/claudeCodeGate.ts was not found",
+    );
+    expect(built.script.created).toEqual([]);
+    expect(built.script.prompts).toEqual([]);
+    expect(await indexOf(runtime)).toEqual([]);
+    await runtime.dispose();
   });
 });
 
