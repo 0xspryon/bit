@@ -5667,11 +5667,14 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     expect(outcome.took).toBeLessThan(1_500);
   }, 10_000);
 
-  test("a CLI that fails on its own says why: its stderr reaches the stream's failure", async () => {
-    /*
-     * The SDK adds a stderr tail to "process exited with code N" only from a CLI it spawned
-     * itself; this harness spawns it, so the tail is kept here (A6 F5's third review).
-     */
+  /**
+   * The failure of a session whose CLI is `sh -c script`, run with `env`: a CLI that fails
+   * on its own, its stderr tail in the failure's message.
+   */
+  const failingCli = async (
+    script: string,
+    env: Record<string, string | undefined>,
+  ): Promise<Error> => {
     const sdk: ClaudeCodeSdk = {
       query: ({ prompt, options }) => {
         const spawn = options.spawnClaudeCodeProcess;
@@ -5679,8 +5682,8 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
           throw new Error("the harness spawned nothing itself");
         const child = spawn({
           command: "sh",
-          args: ["-c", "echo 'Error: not logged in' >&2; sleep 0.1; exit 3"],
-          env: { PATH: process.env["PATH"] },
+          args: ["-c", script],
+          env,
           signal: new AbortController().signal,
         });
         const exited = new Promise<number>((resolve) => {
@@ -5718,7 +5721,7 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
       subagentMessages: () => Promise.resolve([]),
       listSubagents: () => Promise.resolve([]),
     };
-    const failure = await Effect.runPromise(
+    return Effect.runPromise(
       Effect.scoped(
         Effect.flatMap(AgentHarness, (harness) =>
           Effect.gen(function* () {
@@ -5740,8 +5743,46 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
         ),
       ),
     );
+  };
+
+  test("a CLI that fails on its own says why: its stderr reaches the stream's failure", async () => {
+    /*
+     * The SDK adds a stderr tail to "process exited with code N" only from a CLI it spawned
+     * itself; this harness spawns it, so the tail is kept here (A6 F5's third review).
+     */
+    const failure = await failingCli(
+      "echo 'Error: not logged in' >&2; sleep 0.1; exit 3",
+      { PATH: process.env["PATH"] },
+    );
     expect(failure.message).toContain("exited with code 3");
     expect(failure.message).toContain("Error: not logged in");
+  }, 10_000);
+
+  test("the CLI is spawned without bit's own settings, and with the operator's (final review)", async () => {
+    /*
+     * The environment the SDK hands the spawner is the server's own plus its additions; the
+     * CLI, its shells and the operator's MCP servers it starts used to inherit `HUNT_ROOT`,
+     * `WORKSPACE_ROOT`, `PORT` and `HARNESS` from it. The CLI here prints what it got.
+     */
+    const failure = await failingCli(
+      `echo "seen:[$HUNT_ROOT][$WORKSPACE_ROOT][$PORT][$HARNESS][$BIT_PASSWORD][$UPLOAD_MAX_BYTES]" >&2; echo "kept:[$HOME][$ANTHROPIC_API_KEY][$CLAUDE_CODE_ENTRYPOINT]" >&2; sleep 0.1; exit 3`,
+      {
+        PATH: process.env["PATH"],
+        HUNT_ROOT: "/fleet",
+        WORKSPACE_ROOT: "/work",
+        PORT: "3000",
+        HARNESS: "claude-code",
+        BIT_PASSWORD: "browser-password",
+        UPLOAD_MAX_BYTES: "1",
+        HOME: "/home/operator",
+        ANTHROPIC_API_KEY: "operator-key",
+        CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
+      },
+    );
+    expect(failure.message).toContain("seen:[][][][][][]");
+    expect(failure.message).toContain(
+      "kept:[/home/operator][operator-key][sdk-ts]",
+    );
   }, 10_000);
 
   test("a CLI that dies on its own takes the tool it started in a session of its own with it", async () => {

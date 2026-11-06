@@ -40,6 +40,12 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+import {
+  BIT_ENVIRONMENT,
+  agentEnvironment,
+} from "./harness/agentEnvironment";
+import { HARNESS_ENVIRONMENT_ALLOWLIST } from "./harness/openCodeServer";
+
 /** `apps/server/src` → the repository root. */
 const repositoryRoot = join(import.meta.dir, "..", "..", "..");
 
@@ -208,5 +214,53 @@ describe("the dev command can set everything main.ts configures from", () => {
     // enumeration above cannot see it. Asserted by name instead: a `bun run dev` that
     // could not be given a password would refuse every sign-in.
     expect(passed).toContain("BIT_PASSWORD");
+  });
+});
+
+describe("an agent is not handed bit's own settings (final review, 2026-11-06)", () => {
+  const passed = turboConfig.tasks["dev"]?.passThroughEnv ?? [];
+
+  test("every variable the server configures itself from is on the scrub list", () => {
+    // `HOME` is the operator's, and the CLI cannot run without it; it is read only as the
+    // last fallback for `WORKSPACE_ROOT`.
+    const missing = serverReads().filter(
+      (read) => read.name !== "HOME" && !BIT_ENVIRONMENT.includes(read.name),
+    );
+    expect(missing.map((read) => `${read.name} (${read.where})`)).toEqual([]);
+    // And what `bun run dev` passes in, `BIT_PASSWORD` (read indirectly) among it.
+    expect(passed.filter((name) => !BIT_ENVIRONMENT.includes(name))).toEqual(
+      [],
+    );
+  });
+
+  test("OpenCode's allowlist names none of them", () => {
+    expect(
+      HARNESS_ENVIRONMENT_ALLOWLIST.filter((name) =>
+        BIT_ENVIRONMENT.includes(name),
+      ),
+    ).toEqual([]);
+  });
+
+  test("the scrub takes out bit's names and keeps the operator's", () => {
+    const scrubbed = agentEnvironment({
+      HUNT_ROOT: "/fleet",
+      WORKSPACE_ROOT: "/work",
+      PORT: "3000",
+      HARNESS: "claude-code",
+      BIT_PASSWORD: "secret",
+      HOME: "/home/operator",
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "operator-key",
+      CLAUDE_CONFIG_DIR: "/home/operator/.claude",
+      CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
+    });
+    expect(Object.keys(scrubbed).sort()).toEqual([
+      "ANTHROPIC_API_KEY",
+      "CLAUDE_CODE_ENTRYPOINT",
+      "CLAUDE_CONFIG_DIR",
+      "HOME",
+      "PATH",
+    ]);
+    expect(scrubbed["ANTHROPIC_API_KEY"]).toBe("operator-key");
   });
 });

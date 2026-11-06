@@ -178,6 +178,7 @@ import {
   type SubagentStatus,
   type TerminalOutcome,
 } from "./agentHarness";
+import { agentEnvironment } from "./agentEnvironment";
 import {
   attachmentReader,
   withAttachmentLines,
@@ -1068,8 +1069,11 @@ export const DEFAULT_INTERRUPT_TIMEOUT: Duration.Input = "3 seconds";
  *
  * Short, because `endSession` is on the close path of an operator's End and of shutdown,
  * and long enough for a CLI that handles `SIGTERM` to exit on its own — it does in tens of
- * milliseconds. Nothing of it can act on bit in the meantime either way: the policy gate
- * refuses an ended session's tool calls from the moment the spine ends it.
+ * milliseconds. Nothing of it can write to bit in the meantime: an ended session's MCP
+ * credential goes with its scope, and its writes are refused from the moment the spine ends
+ * it. (Until 2026-11-06 the policy gate refused its other tool calls too; it was removed at
+ * the operator's request, so a command the CLI has already started may run on in that
+ * second.)
  *
  * Polled every 25 ms, not faster: every look reads all of procfs, a few milliseconds of
  * blocked event loop with a few hundred processes on the machine, and a shutdown stops
@@ -1299,8 +1303,9 @@ const promptTokensOf = (usage: unknown): number => {
  * any usage is read, and `narrate` drops it whole.
  *
  * **It matters because this build pins `forwardSubagentText: true`** — without it a
- * subagent's text and thinking never reach the stream — and the policy gate's default
- * answer is `allow`, so a `Task` call is reachable on any run. A subagent has its own
+ * subagent's text and thinking never reach the stream — and nothing refuses a `Task` call
+ * (the operator's settings may allow it, and there is no policy gate since 2026-11-06), so
+ * one is reachable on any run. A subagent has its own
  * context: its prompt size is not this session's, and a meter that took its newest frame
  * would change subject without saying so, which is the one defect this meter is not allowed
  * to have.
@@ -3631,16 +3636,19 @@ export const claudeCodeHarness = (
        * started by this harness instead, `detached` so that it leads a process group of its
        * own and {@link stopCli} can stop it with every tool process it starts.
        *
-       * Everything the SDK decides is unchanged — the binary (the one it carries, which is
-       * what the version floor checked), the arguments, the environment, the directory.
+       * Everything the SDK decides is unchanged — the binary (the one it carries, whose
+       * build is logged as a diagnostic), the arguments, the directory — except that bit's
+       * own settings are taken out of the environment ({@link agentEnvironment}).
        * What moves here is the process, and the one thing the SDK's own spawn did with it
        * that a custom one does not: reading stderr. It is drained here, because an unread
        * pipe fills and stalls the CLI, and logged as before.
        *
        * Known limit of detaching, as for `opencode serve` (`openCodeServer.ts`): the CLI no
        * longer gets the terminal's `SIGINT` with the server, so it is stopped by this layer's
-       * finalizer, and if the server is killed outright it sees its stdin close — and its
-       * policy gate unreachable, which refuses every tool call.
+       * finalizer, and if the server is killed outright it sees its stdin close, and its
+       * MCP calls into bit fail with the server gone. (It used to find its policy gate
+       * unreachable as well, which refused every tool call; the gate was removed on
+       * 2026-11-06, the plan's "Policy gate removed" entry.)
        */
       const spawnOwnedCli =
         (record: SessionRecord) => (spawnOptions: SpawnOptions) => {
@@ -3648,7 +3656,8 @@ export const claudeCodeHarness = (
             ...(spawnOptions.cwd === undefined
               ? {}
               : { cwd: spawnOptions.cwd }),
-            env: spawnOptions.env,
+            // bit's own settings are not the agent's, nor its shells' and MCP servers'.
+            env: agentEnvironment(spawnOptions.env),
             stdio: ["pipe", "pipe", "pipe"],
             detached: true,
             windowsHide: true,

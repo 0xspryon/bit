@@ -434,8 +434,11 @@ const generatePassword = (): string => {
  *   `opencode.json` is still read: OpenCode finds it under the inherited `HOME`; only a
  *   config chosen by an `OPENCODE_*` variable in the server's shell is not.
  * - **Our own variables** — `HUNT_ROOT`, `PORT`, `WORKSPACE_ROOT`, `HARNESS`,
- *   `TARGET_ID` — are this process's configuration and mean nothing to the child, and
- *   `PORT` in particular is a name OpenCode also reads.
+ *   `TARGET_ID`, the rest of `agentEnvironment.ts`'s `BIT_ENVIRONMENT` — are this
+ *   process's configuration and mean nothing to the child, and `PORT` in particular is a
+ *   name OpenCode also reads. The Claude Code CLI is given its environment less the same
+ *   list (a denylist there, for the reason that module gives), and a test keeps this list
+ *   and that one disjoint.
  *
  * Adding a name here is a deliberate act: it says the harness needs it and that a
  * worker reading it out of its own environment is acceptable.
