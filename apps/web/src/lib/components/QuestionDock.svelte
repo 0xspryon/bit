@@ -159,7 +159,7 @@
   }
 
   function submit(): void {
-    if (readOnly || question.busy) return;
+    if (readOnly || question.busy || answeredCount === 0) return;
     const answers = draftAnswers(fields, draft);
     const wrong = questionAnswersProblem(fields, answers);
     if (wrong !== null) {
@@ -289,13 +289,17 @@
   }
 
   let sendLabel = $derived(
-    pending.answerability === "live"
-      ? answeredCount === 1
-        ? "Send 1 answer"
-        : `Send ${String(answeredCount)} answers`
-      : answeredCount === 1
-        ? "Send 1 answer as a message"
-        : `Send ${String(answeredCount)} answers as a message`,
+    answeredCount === 0
+      ? pending.answerability === "live"
+        ? "Send answers"
+        : "Send answers as a message"
+      : pending.answerability === "live"
+        ? answeredCount === 1
+          ? "Send 1 answer"
+          : `Send ${String(answeredCount)} answers`
+        : answeredCount === 1
+          ? "Send 1 answer as a message"
+          : `Send ${String(answeredCount)} answers as a message`,
   );
   let dismissTitle = $derived(
     pending.answerability === "live"
@@ -324,7 +328,7 @@
     <span class="bar" aria-hidden="true">
       {#if bar._tag === "segments"}
         {#each bar.segments as segment, at (at)}
-          <span class="segment {segment}"></span>
+          <span class="segment is-{segment}"></span>
         {/each}
       {:else}
         <span class="run"
@@ -539,7 +543,10 @@
           <kbd>1–{field.options.length + (field.custom ? 1 : 0)}</kbd>
           choose · <kbd>Enter</kbd> next
         {/if}
-        · <kbd>Esc</kbd> reply in chat instead
+        · <kbd>Esc</kbd>
+        {pending.answerability === "live"
+          ? "reply in chat instead"
+          : "put away"}
       {:else}
         <kbd>Esc</kbd> put away
       {/if}
@@ -563,10 +570,14 @@
         <IconAngleLeft /> Back
       </button>
       {#if last}
+        <!-- Nothing answered sends nothing: answering none is what Dismiss is for. -->
         <button
           type="button"
           class="primary"
-          disabled={question.busy || !mayMoveOn}
+          disabled={question.busy || !mayMoveOn || answeredCount === 0}
+          title={answeredCount === 0
+            ? "Answer at least one question, or dismiss them (Esc)"
+            : undefined}
           onclick={submit}
         >
           {question.busy ? "Sending…" : sendLabel}
@@ -646,10 +657,11 @@
     border-radius: 2px;
     background: var(--border-base);
   }
-  .segment.done {
+  /* `is-` prefixed: `.current` is also the question's region (scoped classes collide). */
+  .segment.is-done {
     background: var(--text-muted);
   }
-  .segment.current {
+  .segment.is-current {
     background: var(--text-base);
   }
   .run {

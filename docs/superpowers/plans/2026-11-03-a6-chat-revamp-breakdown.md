@@ -362,6 +362,25 @@ and bit's own routes).**
   session counted in Needs you until bit restarts (a `V2(chat):` note in
   `run/sessionActivity.ts`).
 
+**Done (2026-11-06), importer chat, both harnesses.** The contract is
+`packages/contracts/src/question.ts` (`PendingQuestion` with `answerability`, `LiveQuestion`,
+`QuestionAnswers`, `QuestionRefused`, and the one answer check `questionAnswersProblem`, used
+by the dock and the server). Drivers map their native request onto `HarnessQuestion`
+(`AgentHarness.pendingQuestions`, `answerQuestion`, `dismissQuestion`, and the `question` /
+`questionSettled` narration). Claude Code is offered `AskUserQuestion` only for a session
+opened with `operatorQuestions` (the importer's), through the answer hook above; OpenCode's
+event stream now names only the types its narration reads plus `form.*`, warns at boot on a
+server/client version skew, and re-lists forms on every connection. The importer's replay
+carries `question` (live from the harness, else what the transcript ends on), answer and
+dismiss are `POST …/importer-sessions/:importId/questions/:questionId/answer|dismiss`, and
+Needs you comes from the narration bus (`RunNarrations.waiting`). The narrator's end sends a
+final `connection` `closed`. The dock is the shell's own (`QuestionDock.svelte`), drawn for
+any chat whose session has a `question`; a chat may still pass `dock` to replace it.
+
+Not done in A7-Q: the transcript's row for the question call still reads "Ran 1 command ·
+AskUserQuestion" rather than E3's "Asked N questions · waiting on you"; the session chip's
+warning dot (E6's "each surface keeps its own local signal") is not drawn.
+
 **A7-S — Sub-agent cards and panel (M), A7-Q → A7-S. Decided by the operator (2026-11-05):
 replaces U14's "omit content".** A7's E7/E8.
 

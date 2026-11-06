@@ -113,7 +113,7 @@ describe("the dock in the composer's slot", () => {
     expect(region.getAttribute("aria-label")).toBe("The agent's questions");
     expect(text(region.querySelector(".counter"))).toBe("Question 1 of 2");
     expect(region.querySelectorAll(".bar .segment").length).toBe(2);
-    expect(region.querySelectorAll(".bar .segment.current").length).toBe(1);
+    expect(region.querySelectorAll(".bar .segment.is-current").length).toBe(1);
     // The full interface at any count: Jump to… is there for two questions too.
     expect(buttonNamed(root, "Jump to…").getAttribute("aria-haspopup")).toBe(
       "listbox",
@@ -308,6 +308,17 @@ describe("Jump to…, and Esc", () => {
 });
 
 describe("sending, and what cannot be sent", () => {
+  test("with nothing answered the last button sends nothing; answering none is Dismiss", async () => {
+    const { root, calls } = await asking({ fields: [field({ key: "Only" })] });
+    const send = root.querySelector<HTMLButtonElement>(".foot .primary");
+    expect(text(send)).toBe("Send answers");
+    expect(send?.disabled).toBe(true);
+    options(root)[0]?.focus();
+    press("Enter");
+    await settle();
+    expect(calls.join(",")).toBe("");
+  });
+
   test("nothing goes before the last question, whose button sends every answer", async () => {
     const { root, calls } = await asking();
     click(options(root)[0]!);
