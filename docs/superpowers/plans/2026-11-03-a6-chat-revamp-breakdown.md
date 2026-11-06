@@ -827,6 +827,291 @@ No route was added, and no contract was changed.
 - **All roles.** `app.liveConnection` is keyed by `usageScope`, so `connection` comes for
   free. The shell's `loadFile` is `app.loadUploadedFile`, which is per target.
 
+### Chat generalisation (slice 2)
+
+**Plan (2026-11-06), branch `chat-generalisation`.** The prep above made the importer's
+_shell_ shared. This slice makes the importer's _conversation_ shared, on the server, in the
+contracts and in the web state, so that the goal chat (A9 H2/H2b), a planner stage (H3/H3b)
+and a worker attempt (H4b) can be built on it with little new code. Nothing new is mounted:
+no goal binding, no goal migration, no goal routes, no planner or worker chat, no A8/A9 page.
+The goal chat as it stands (`GoalAgentChat.svelte`, `plan/goalConversation.ts`) is left
+alone, since it is to be rebuilt on this. The importer must look and behave exactly as
+before.
+
+#### What the boards need from the generic layer
+
+- **H2/H2b, goal Chat tab.** "The same chat used everywhere else": transcript, composer,
+  question dock, model picker, context meter. Several sessions per goal, a picker with a
+  state dot, newest first, New session (also a `+`), a dormant session that the next message
+  reopens with the "earlier context is unavailable" note. Every session is listed in Agent
+  sessions under Goal › Chat. The dock's question can carry a **tag** ("Critical action", in
+  warning). It is asked through bit's own `ask_operator` tool (the board's tool row says
+  `ask_operator · critical · waiting on you`), not the harness's question tool. Needs your
+  attention clears when the question is answered.
+- **H3/H3b, planner stage.** One fresh session per stage. Its transcript is read-only,
+  from replay plus live frames, with a marker at the top saying what the stage was given.
+  The closed composer reads "The planner can't be prompted. To redirect it, ask the goal
+  agent in Chat." Stop round, and a pulsing state.
+- **H4b, worker attempt.** A read-only "Worker transcript" per attempt.
+- **H4f / H6.** "The same agent / model selector as the chat composer" (agent chip + Harness
+  · Model · Reasoning), outside any chat.
+
+So there are three ways to mount: **interactive multi-session** (importer now, goal later),
+**read-only single session** (planner stage, worker attempt), and **the selector alone**.
+
+#### Vocabulary: owner, session, period
+
+The importer already has three identities, and the generic layer names them:
+
+- **Owner**: what the conversation belongs to. For the importer it is the target's
+  Auto-load chat. Later it is a goal, a planner stage (round + stage index) or a worker
+  attempt. The owner decides the routes, the row table, the credential kind, the prompts and
+  the narration subject.
+- **Session**: one harness session (`harness_session_id`). It is the picker's row and the
+  index's group key. It survives a restart if the harness still holds it.
+- **Period**: one _authority period_ on a session, which is one credential, one MCP
+  registration and one row. A period's id is what every route, every live frame and every
+  web call addresses. The importer's period id is the import id. Every reopen or resume mints
+  a new period with a new id and a new row. The old row keeps its `ended_reason`, which is
+  never cleared, and `latest_period` (`latest_import_id`) points an old id at the newest one.
+
+In the generic code the period id is called `conversationId`, which matches the
+`ConversationStopped`, `ConversationActivity`, `ConversationContext` and
+`ConversationModelSwitched` answers that already use that name for the import id.
+
+#### The map
+
+Each importer piece is sorted as **A** (role-agnostic), **B** (role-specific, behind the
+binding) or **C** (importer-only). Its generic home is in the last column.
+
+| Piece                                                                                                                                   | What it is                                                                                | Class                              | Home                                                                                                    |
+| --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Server**                                                                                                                              |                                                                                           |                                    |                                                                                                         |
+| `harness/liveAgentSessions.ts`                                                                                                          | registry, open permit, acquire order, deliver, interrupt, status, switch                  | A, already                         | unchanged                                                                                               |
+| `harness/{questions,turnStop,modelSwitch,sessionReopen}.ts`                                                                             | helpers                                                                                   | A, already                         | unchanged                                                                                               |
+| `ScopeImporter` held steers (`steers`, taken, `deliveries`)                                                                             | queued messages that are not yet in the transcript, take marks                            | A                                  | `conversation/conversations.ts`                                                                         |
+| settle loop (`settleTurn`)                                                                                                              | waits for idle and drops held steers; the importer's report and progress run on top of it | A + B hook                         | core loop, `onIdle` hook                                                                                |
+| `inFlight`, `successors`, `reopening`, `holdingNow`, `newerRun`                                                                         | following a period to the one that holds the session now                                  | A                                  | core                                                                                                    |
+| `send` (fast path, wait on an open, follow the newest period, join, reopen under the old id's permit)                                   | turn delivery                                                                             | A, with the B reopen plan          | core `send`, binding `reopen`                                                                           |
+| `narrate` (taken marks, `connection closed` frame)                                                                                      | narration                                                                                 | A, B subject                       | core, binding `subject`                                                                                 |
+| `stopTurn`, `stopAll`, `stopSubagent`                                                                                                   | turn control                                                                              | A                                  | core                                                                                                    |
+| `answerQuestion`, `dismissQuestion`, put-away, recheck, `questionNow`                                                                   | the pending question                                                                      | A                                  | core                                                                                                    |
+| `activity`, `context`                                                                                                                   | the poll and the meter                                                                    | A, plus the B `alsoRunning` hook   | core                                                                                                    |
+| `switchFrom`/`switchOne`                                                                                                                | model switch under the reopen permit                                                      | A, B row write                     | core, binding `rows.recordModel`                                                                        |
+| `stop` (operator end)                                                                                                                   | end the period                                                                            | A, plus B progress                 | core `end`, importer's `stop` wraps it                                                                  |
+| `import_sessions` row reads and writes                                                                                                  | the index                                                                                 | B                                  | binding `rows`                                                                                          |
+| importer credential and endpoint (`IMPORT_SESSION_ROLE`)                                                                                | authority                                                                                 | B                                  | binding `role`                                                                                          |
+| prompts (opening, resume, follow-up), agent pinning                                                                                     | framing                                                                                   | B                                  | binding `meta` + `reopen`                                                                               |
+| `ScopeImportProgress`, pages (`widenPages`, `operatorPages`), closing report, `start` from links                                        | the import's own work                                                                     | C                                  | stays in `import/`                                                                                      |
+| `importerConversation`, `importerReopenFor`                                                                                             | replay reader, reopen decision                                                            | B (generic shape, importer paths)  | stay in `import/`; the core is handed their answer                                                      |
+| route handlers (12)                                                                                                                     | thin: target check, then delegate                                                         | B                                  | stay per role (see Decisions)                                                                           |
+| **Contracts**                                                                                                                           |                                                                                           |                                    |                                                                                                         |
+| `ConversationStopped`, `ConversationActivity`, `ConversationContext`, `ConversationModel*`, `Question*`, `PendingQuestion`, `Subagent*` | answers                                                                                   | A, already                         | unchanged                                                                                               |
+| `ImporterMessageDraft`, `ImporterQueuedMessage`, `ImporterConversationStart`, `ImporterConversationSource`, `ImporterContinuation`      | conversation shapes                                                                       | A, named importer                  | `conversation.ts` as `Conversation*`, importer names kept as aliases                                    |
+| `ImporterTurnAccepted`, `ImporterConversationView`, `ImporterSessionView`                                                               | answers                                                                                   | A fields + B id + C (pages, tally) | generic field sets in `conversation.ts`, importer schemas spread them                                   |
+| `ImporterConversationRefused`, `ScopeImportNotFound`, `ImporterContinuationRefusal`                                                     | refusals                                                                                  | B                                  | stay importer's; the goal has its own                                                                   |
+| **Web**                                                                                                                                 |                                                                                           |                                    |                                                                                                         |
+| `ImporterSessions` (`importerSessions.svelte.ts`)                                                                                       | the multi-session state machine                                                           | A                                  | `conversationSessions.svelte.ts`, `ConversationSessions`                                                |
+| its starters, agent registry and pick, mock scenarios, stand-in reply                                                                   |                                                                                           | C                                  | `importerSessions.svelte.ts`, `ImporterSessions extends ConversationSessions`                           |
+| `ImporterServer` + `#importerServer` in `app.svelte.ts`                                                                                 | the way to the server                                                                     | A shape, B calls                   | `ConversationServer` (generic) built by `conversationServer.ts` from a per-role `ConversationEndpoints` |
+| `importerChat.ts` (`importerFeed`, `buildImporterChat`, history, standing, queued/taken/carried, send-now words, notices)               | merging replay and live, turns                                                            | A                                  | `conversationChat.ts` (`conversationFeed`, `buildConversationChat`)                                     |
+| tally line, `lastSessionSentence`, `indexedSession` from `ImporterSessionView`                                                          |                                                                                           | C/B                                | stay in `importerChat.ts`                                                                               |
+| `importerParked.ts`                                                                                                                     | words that did not land                                                                   | A, keyed by owner                  | `conversationParked.ts`, key by owner                                                                   |
+| `importerModelMemory.ts`                                                                                                                | the last model picked                                                                     | A, keyed by role                   | `modelMemory.ts`, key by role                                                                           |
+| `questionDock.ts`, `QuestionDock.svelte`, `subagents.ts`, `SubagentCard/Panel.svelte`, `chatShell.ts`, `ChatShell.svelte`               |                                                                                           | A, already                         | unchanged                                                                                               |
+| the `ChatSession` adapter inside `ImporterChat.svelte`                                                                                  | state → shell                                                                             | A                                  | `conversationChatSession.ts`, `chatSessionOf(state, words)`                                             |
+| `ImporterModelPicker.svelte`                                                                                                            | selector                                                                                  | A                                  | `ModelPicker.svelte`, mountable alone                                                                   |
+| TitleBar crumb + picker list                                                                                                            | session picker                                                                            | A with B labels                    | `SessionPicker.svelte` (crumb + list over a `ConversationSessions`)                                     |
+| live frame dispatch in `app.svelte.ts` (`noteTaken`, `noteActivity`, `noteConnection`, `noteQuestion`, `noteUsage`)                     | routing                                                                                   | A, B key                           | each mounted `ConversationSessions` routes by its binding's `routeOf(frame)`                            |
+
+#### Target shape
+
+**Server: `apps/server/src/conversation/conversations.ts`** (a real feature now, so the
+folder is warranted). `makeConversations<Meta, Row>(deps, binding)` is called inside a role's
+layer, as `makeLiveAgentSessions` is, and returns that role's conversation core:
+
+- `open(plan)` mints a period, records its row, forks its first turn, and answers once the
+  opening is known (or answers at once, for the create-target path).
+- `send({ targetId, conversationId, text, urgency, uploads })` is the importer's `send`
+  algorithm unchanged.
+- `heldMessages(id)` and `question(id, held, fromTranscript)` are what a replay adds to the
+  binding's transcript reading.
+- `stopTurn`, `stopAll`, `stopSubagent`, `answerQuestion`, `dismissQuestion`, `activity`,
+  `context`, `switchModel`, `end`, `holds` and `heldSteers` complete the set.
+
+The binding (`ConversationBinding<Meta, Row>`) is:
+
+- `role`: `LiveSessionRole` minus `afterClose`, which the core adds.
+- `subject(id)`: the narration subject, and the frame's subject ids for a question.
+- `rows`: `read(targetId, id)`, `record`, `confirm`, `markEnded` and `recordModel`, where the
+  row is `ConversationRow` (target, harness session, instance, model, options, ended reason,
+  agent id, latest period). Plain writes only, never around a harness call.
+- `notFound(targetId, id, purpose)`: the role's 404.
+- `words`: how a period is named in a sentence ("this session"), and how the agent is named
+  in a refusal ("the importer").
+- `reopen(row, input)`: the role's successor plan, for a period this process does not hold.
+  For the importer that is the agent check, carried pages, `importerReopenFor`, and the
+  resume/fresh notes.
+- `followUp(meta, text)`: how a later message is framed.
+- `hooks`: `delivered`, which may add fields to the accepted answer (the importer widens its
+  pages and resumes its progress); `idle`, the importer's report and settle; `alsoRunning`,
+  the importer's progress view.
+
+`ScopeImporter` keeps its exact service interface and becomes a binding plus its own work
+(progress, pages, report, `start` from links), so `scopeImporter.test.ts` runs unchanged as
+the importer's proof. The routes stay where they are.
+
+**Contracts: `packages/contracts/src/conversation.ts`.**
+
+- `ConversationMessageDraft` and `CONVERSATION_MESSAGE_MAX_CHARS`.
+- `ConversationStart`, `ConversationSource`, `ConversationContinuation` and
+  `ConversationQueuedMessage`.
+- `conversationTurnAcceptedFields` and `conversationViewFields` (each without the period
+  id, which a role names itself), and `conversationSessionFields`.
+- The `Importer*` names stay, as aliases of these or as schemas that spread the field sets,
+  so nothing on the wire changes.
+- `PendingQuestion.tag`, optional (`"critical"`): see Decisions.
+
+**Web.**
+
+- `conversationSessions.svelte.ts` holds `ConversationSessions<S extends ConversationSession>`
+  with a `ConversationBinding` (`routeOf(frame)`, `emptySession(now, id?)`, words) and a
+  `ConversationServer`. A feature the binding or server leaves out is a feature the chat
+  does not have: no `context` means no meter, no `switchModel` means no picker, no
+  `stopSubagent` means no card Stop, and no `answerQuestion` means no dock.
+- `conversationChat.ts` holds the turn building and the replay/live merge, keyed by period
+  id (`conversationId` on the session).
+- `conversationServer.ts` holds `conversationServer(app hooks, endpoints)`: the answer mapping
+  that `#importerServer` does today (sign-out on expiry, refusal text, unanswered, forgetting
+  a `lost` notice on open/resume/end, the turn watch). A role supplies only its
+  `ConversationEndpoints`: thin calls to `client.ts`.
+- `conversationChatSession.ts` holds `chatSessionOf(state, words)`, which builds the
+  `ChatSession` the shell takes from a `ConversationSessions`. `ImporterChat.svelte` uses it.
+- `readOnlyConversation.ts` holds `readOnlyChat({ replay, live, routeOf, closed })`: one
+  session's turns built from a replay plus live frames, with a closed composer. It is the
+  planner stage's and worker attempt's mount.
+- `ModelPicker.svelte` is the extracted picker (Harness · Model · Reasoning), with its state
+  passed in, mountable outside a chat. `SessionPicker.svelte` is the extracted crumb picker.
+
+#### The harness mechanics, and how each is generic
+
+- **Session identity.** The core keys everything by period id, and the binding owns the row.
+  A reopen mints a new period through `open` with `predecessor` set. `successors` and
+  `latest period` follow an old id forward, exactly as for imports today. The owner is a
+  parameter: the binding's `subject`, `rows` and `role`. Nothing in the core says "import".
+- **Live frames.** The web routes a frame to a session by `binding.routeOf(frame)`. For the
+  importer that is `frame.importId`, which is the period id. Replay/live merging
+  (`conversationFeed`) takes the period id and the floors, as `importerFeed` did. The
+  `lost` notice is keyed by `usageScope` (`import:<id>`). It is cleared on `closed`, on an
+  ended row and on an `opened`/`resumed` answer, now inside `conversationServer` rather than
+  in the importer's adapter, so every role gets the same rule.
+- **Turn control.** `urgency` (Send now or queued), taken/carried marks, Stop, Stop all,
+  sub-agent Stop, activity for turns the harness opens itself, a lost reply (`unanswered`,
+  parked words, the confirm loop) and a refused open (a refusal that keeps the words) are
+  all in `ConversationSessions` and in the core's `send`, unchanged.
+- **Pending questions.** There is one contract (`PendingQuestion`, answerability
+  `live`/`message`/`not_resumable`), with answer vs dismiss and put-away/recheck in the core.
+  `tag` is added as a field only.
+- **Context meter, model switch.** Optional on `ConversationServer` (`context`,
+  `switchModel`) and in the core (a role whose harness session has no meter simply does not
+  route `context`). Leaving one out removes the meter or the picker.
+
+#### Decisions
+
+1. **Routes stay per role, as thin wrappers over the core.** No generic
+   `/conversations/:owner/...` URL. _Why:_ `HttpApi` endpoints are static and typed. A
+   `:owner` parameter would turn every handler into a switch, every error into the union of
+   every role's not-found error, and the open payload into one shape for roles that differ
+   (the importer has an agent chip and a model pick; a goal's session opens on the goal's
+   pinned harness). The owner check also differs per role (import row vs goal row vs
+   attempt row). The handlers are already five lines each. _Rejected:_ generic URLs. They
+   would save one block of endpoint declarations per role and cost typed errors, plus a
+   client and test rename for no behaviour. _Cost:_ a goal adds about 12 endpoint
+   declarations and 12 five-line handlers. The shared schemas (`ConversationMessageDraft`,
+   `ConversationStopped`, …) mean those are declarations, not new shapes.
+2. **The core is a factory per role (`makeConversations`), not a service.** This follows
+   `makeLiveAgentSessions`, for its reasons: ids are unique only within a role, and a role's
+   sessions close with its own layer. _Rejected:_ one process-wide service keyed by
+   `(role, id)`.
+3. **`ScopeImporter`'s interface is unchanged.** Its tests are the proof that the importer
+   behaves as before, and its callers (`createTarget`, the routes, the toolkit's `holds`) do
+   not move. _Rejected:_ replacing it with the core plus free functions, which would rewrite
+   5,000 lines of tests for a rename.
+4. **Contract shapes are generic field sets that importer schemas spread; the importer
+   names stay.** _Why:_ nothing on the wire changes, and a goal's schema is
+   `{ goalId, conversationId, ...conversationTurnAcceptedFields }`. _Rejected:_ renaming
+   `importId` to `conversationId` on the importer's wire shapes. It is allowed, since nothing
+   is published, but it churns every server test for no gain, since the importer's period id
+   _is_ an import id.
+5. **The web session's period id is renamed `importId` → `conversationId`.** _Why:_ the
+   generic session type is shared, and a goal session's period is not an import. The rename
+   is forced on web tests that build sessions. Frame fixtures keep `importId`, which is the
+   wire's. _Rejected:_ keeping `importId` on the generic type with a comment.
+6. **`ImporterSessions extends ConversationSessions`.** The starters, agent registry, mock
+   scenarios and stand-in reply are importer-only and stay in the subclass. The subclass
+   uses only the base's public API. _Rejected:_ composition with forwarding getters, which
+   would be ~60 forwarding members that `TitleBar` and `ImporterChat` read today.
+7. **The question tag is a contract field with no behaviour.** `PendingQuestion.tag` is an
+   optional `"critical"` that the dock adapter passes through and nothing sets or draws. The
+   A9 implementer draws it (warning) and sets it from `ask_operator`. _Rejected:_ drawing it
+   now, which has no producer and no reviewed design for its placement in the dock.
+8. **The read-only mount is a function, not a mode of `ConversationSessions`.** A planner
+   stage or worker attempt has one session, no composer, no picker and no parked words. The
+   state machine would be ~90% dead weight there. `readOnlyChat` reuses `conversationFeed`
+   and `buildConversationChat`, which is where replay/live merging lives.
+
+#### Seams the boards need, and what this slice does about them
+
+- **A frame's period on a multi-session owner.** Frames name `goalId`, `roundId` or
+  `attemptId`, not a session. A goal with several sessions (H2b), or a round with several
+  stages (H3), cannot route a frame to one of them by those alone. `routeOf` is the seam.
+  _Recommendation:_ the goal binding publishes under a per-period subject and the frame
+  carries an optional `conversationId` (and a stage index for a round).
+  Not added now: nothing would set it.
+- **Needs your attention clears on answer.** The server's `waiting` set is per narration
+  subject. It already clears on `questionSettled`. A goal binding publishing under the goal
+  subject gets it.
+- **"Earlier context is unavailable" after a restart.** This is the core's `fresh` reopen
+  note, worded by the binding.
+
+#### What the goal binding will need (not built here)
+
+- **A periods table keyed by period, not goal**: `goal_conversation_periods (period_id PK,
+goal_id, target_id, harness_session_id, harness_instance_id, model, model_options,
+agent_id, opened_at, session_created_at, ended_at, ended_reason)`, the same columns and
+  `ended_reason` check as `import_sessions`, with `(goal_id, opened_at)` and
+  `(target_id, harness_session_id)` indexes.
+- **Retiring `goal_sessions` by a forward migration**:
+  1. Create the table.
+  2. `INSERT … SELECT` each `goal_sessions` row as one period, minting `period_id` from the
+     goal id (`'gper_' || goal_id`), with `session_created_at = opened_at` and
+     `ended_reason = NULL`.
+  3. Switch the store's readers.
+  4. A later forward migration drops `goal_sessions` once nothing reads it.
+     Never edit `0001`.
+- **Routes** (thin wrappers, decision 1), under `/targets/:targetId/goals/:goalId/sessions`:
+  list `GET`, open `POST`, and per period `/:conversationId/{messages GET|POST, stop,
+subagents/stop, subagents/:callId/stop, questions/:questionId/answer,
+questions/:questionId/dismiss, activity, context, model}`.
+- **Binding**: the goal credential and endpoint, `subject` (see the seam above), rows on the
+  new table, `reopen` from the goal's pinned agent, and prompts from `plan/goalPrompt.ts`.
+- **Web**: `ConversationEndpoints` for those routes (~60 lines), `routeOf`, an
+  `emptySession`, and `ChatShell` through `chatSessionOf`.
+- **Agent sessions**: the index union (`http/agentSessions.ts`) reads the new table under
+  Goal › Chat.
+
+#### Proofs without another chat
+
+- **Server**: `conversation/conversations.test.ts` with a test-only binding (owner kind
+  `probe`, its rows in memory, a stub harness). It lists periods, opens, sends (live,
+  queued, Send now), follows a reopen to a successor, stops, stops all, answers and
+  dismisses a question, merges held steers into a replay, and publishes `connection closed`.
+- **Web**: `test/conversationSessions.test.ts` with a test-only binding routed by `goalId`
+  (a non-importer owner). It covers listing, open, send, stop, question, live merge, and
+  `lost`/its clearing.
+- **Read-only**: `test/readOnlyConversation.test.ts` builds a worker-attempt-shaped session
+  from a replay plus live frames routed by `attemptId`, with the closed composer.
+
 ## Order
 
 Slices run **one at a time** on branch `a6-chat-revamp`, each committed by its implementer.
