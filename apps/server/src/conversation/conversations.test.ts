@@ -315,6 +315,8 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
       },
       words: {
         what: (id) => `probe ${id}`,
+        period: "probe",
+        aPeriod: "a probe",
         agent: "probe agent",
         undelivered: (detail) => `${detail}; closed`,
         unwritable: (detail) => `${detail}; kept`,

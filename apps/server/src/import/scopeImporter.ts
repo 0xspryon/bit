@@ -863,6 +863,8 @@ export class ScopeImporter extends Context.Service<
           accepted: turnAccepted,
           words: {
             what: (importId) => `import ${importId}`,
+            period: "import",
+            aPeriod: "an import",
             agent: "importer",
             undelivered: (detail) =>
               `${detail}. The harness would not take the message, so this import's session has been closed; your next message opens a fresh one under a new import.`,

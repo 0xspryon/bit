@@ -311,6 +311,9 @@ export interface ConversationBinding<
   readonly words: {
     /** A period, named in a sentence: `import imp_1`. */
     readonly what: (id: string) => string;
+    /** A period, as a noun with no id (`import`), and with its article (`an import`). */
+    readonly period: string;
+    readonly aPeriod: string;
     /** The agent, by role, for a sub-agent's sentences: `importer`. */
     readonly agent: string;
     /** A message the harness refused, after the harness's own sentence. */
@@ -469,10 +472,6 @@ export interface Conversations<Meta, NotFound, Refused, Accepted> {
   readonly holds: (id: string) => Effect.Effect<boolean>;
   /** How many messages this process holds beside one period's transcript. */
   readonly heldSteers: (id: string) => Effect.Effect<number>;
-  /** Whether a first turn or settle loop of this period is still running. */
-  readonly turning: (id: string) => boolean;
-  /** The first turn or settle loop of this period, if one runs. */
-  readonly turnOf: (id: string) => Fiber.Fiber<void> | undefined;
 }
 
 /** A join attempt that found nothing to join. Never leaves this module. */
@@ -820,7 +819,7 @@ export const makeConversations = <
       }
       // The open is known: a message that arrived while it was in flight may now ask again.
       yield* releaseOpening(input.id);
-      const alreadyOpen = `${words.what(input.id)} already had a session open in this process, so a second was not opened`;
+      const alreadyOpen = `this ${words.period} already had a session open in this process, so a second was not opened`;
       if (input.opening !== undefined) {
         yield* opened._tag === "Failure"
           ? Deferred.fail(input.opening, binding.openRefused(opened.failure))
@@ -1486,7 +1485,7 @@ export const makeConversations = <
       );
       if (read._tag === "Failure") {
         yield* Effect.logWarning(
-          `${words.what(input.conversationId)}'s record could not be read for its activity; answering for the period addressed`,
+          `${words.aPeriod}'s record could not be read for its activity; answering for the ${words.period} addressed`,
           {
             [binding.role.words.idKey]: input.conversationId,
             detail: read.failure.message,
@@ -1586,7 +1585,7 @@ export const makeConversations = <
         );
         if (answered._tag === "Failure") {
           yield* Effect.logDebug(
-            `${words.what(id)}'s harness could not report its context; answering unread`,
+            `${words.aPeriod}'s harness could not report its context; answering unread`,
             {
               [binding.role.words.idKey]: id,
               detail: answered.failure.message,
@@ -1987,7 +1986,5 @@ export const makeConversations = <
       switchModel,
       holds: (id) => Effect.sync(() => sessions.get(id) !== undefined),
       heldSteers: (id) => Effect.sync(() => steers.get(id)?.queued.size ?? 0),
-      turning: (id) => turns.has(id),
-      turnOf: (id) => turns.get(id),
     };
   });
