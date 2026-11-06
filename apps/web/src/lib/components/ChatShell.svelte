@@ -444,16 +444,6 @@
               {notice.text}
             </p>
           {/each}
-          <!--
-            A question arriving, said (A7-Q review 1): the dock takes the box's slot without
-            moving focus unless focus was in the box, so a reader elsewhere would not know.
-            Always drawn, so the region exists before its words change and is announced.
-          -->
-          <p class="visually-hidden" role="status">
-            {question === undefined
-              ? ""
-              : session.words.questionsAsked(question.pending.fields.length)}
-          </p>
           {#if question !== undefined}
             <!--
             A7-Q's question dock (E3/E4), in the box's slot: the box is not drawn while the
@@ -489,6 +479,17 @@
             />
           {/if}
           {@render below?.()}
+          <!--
+            A question arriving, said (A7-Q review 1): the dock takes the box's slot without
+            moving focus unless focus was in the box, so a reader elsewhere would not know.
+            Always drawn, so the region exists before its words change and is announced;
+            last, so the notices stay right above the box or the dock.
+          -->
+          <p class="visually-hidden" role="status">
+            {question === undefined
+              ? ""
+              : session.words.questionsAsked(question.pending.fields.length)}
+          </p>
         </div>
       {/snippet}
     </Chat>
