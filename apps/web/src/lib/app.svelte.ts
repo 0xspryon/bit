@@ -2782,7 +2782,30 @@ export class App {
     if (call._tag === "Unreachable") return;
     this.importerIndex = call.value.sessions;
     this.importerIndexTargetId = id;
+    // An ended import has no narration stream to be cut off: what was said about its
+    // connection is over with it (U13 review 6).
+    for (const view of call.value.sessions) {
+      if (view.endedReason !== null) this.#forgetConnection(view.importId);
+    }
     if (this.importerOpen) this.importer.syncIndexed(this.#indexedSessions());
+  }
+
+  /**
+   * Drops what the server last said about one import's narration connection (U13 review 6).
+   *
+   * A `lost` or `reconnecting` frame is cleared by a later `restored` on the same stream, and
+   * otherwise stood until a reload: after the session ended, when nothing is retrying, and
+   * after a message resumed it on a new stream that never broke and so never says
+   * `restored`. Both are facts this tab learns from the server — an `endedReason` on the
+   * index row or an `import_ended` replay, and an accepted message that `opened` or
+   * `resumed` the session — and each clears the entry here.
+   */
+  #forgetConnection(importId: string) {
+    const scope = `import:${importId}`;
+    if (!(scope in this.liveConnection)) return;
+    this.liveConnection = Object.fromEntries(
+      Object.entries(this.liveConnection).filter(([key]) => key !== scope),
+    );
   }
 
   /** The index as the Auto-load page holds sessions, harness names resolved. */
@@ -2820,7 +2843,13 @@ export class App {
     ): ImporterSent => {
       // A message opens a session, or reopens one this server had let go (A7 U8b review).
       this.#agentSessionsMoved(targetId);
-      if (call._tag === "Ok") return { _tag: "accepted", turn: call.value };
+      if (call._tag === "Ok") {
+        // Opened or resumed: a new narration stream, which has not broken (U13 review 6).
+        if (call.value.conversation !== "continued") {
+          this.#forgetConnection(call.value.importId);
+        }
+        return { _tag: "accepted", turn: call.value };
+      }
       if (call._tag === "Refused") {
         if (call.error._tag === "Unauthenticated") this.signOut("expired");
         return {
@@ -2965,7 +2994,16 @@ export class App {
           targetId,
           importId,
         );
-        if (call._tag === "Ok") return { view: call.value, floor };
+        if (call._tag === "Ok") {
+          // Ended, by the replay's word: its stream is gone with it (U13 review 6).
+          if (
+            call.value.continuation === "refused" &&
+            call.value.refusal.reason === "import_ended"
+          ) {
+            this.#forgetConnection(importId);
+          }
+          return { view: call.value, floor };
+        }
         if (call._tag === "Refused" && call.error._tag === "Unauthenticated") {
           this.signOut("expired");
         }

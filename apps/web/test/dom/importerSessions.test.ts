@@ -3047,6 +3047,65 @@ describe("the server's connection to the importer's narration (U13 review 5)", (
     expect(text()).not.toContain("reconnecting.");
   });
 
+  /** Types a message into the importer's box and presses Enter. */
+  const say = async (value: string): Promise<void> => {
+    const box = composer();
+    typeInto(box, value);
+    box.focus();
+    press("Enter");
+    await settle();
+  };
+
+  test("a lost connection's note goes once the session has ended (U13 review 6)", async () => {
+    const fake = new FakeServer();
+    const app = await continueWith(fake);
+    fake.watch.send(liveOpened());
+    fake.watch.send(connection("reconnecting"));
+    fake.watch.send(connection("lost"));
+    await settle();
+    expect(text()).toContain("could not be reconnected");
+
+    // Ended elsewhere: the index row says so on its next read, and nothing is retrying.
+    fake.onImporterSessions = () =>
+      ok({
+        sessions: SESSIONS.map((each) =>
+          each.importId === "imp_newest"
+            ? { ...each, endedAt: 1_700_000_300_000, endedReason: "operator" }
+            : each,
+        ),
+      });
+    await app.loadImporterSessions("acme-corp");
+    await settle();
+    expect(app.liveConnection["import:imp_newest"]).toBeUndefined();
+    expect(text()).not.toContain("could not be reconnected");
+  });
+
+  test("a message that resumes the session on a new stream clears the old stream's note (U13 review 6)", async () => {
+    const fake = new FakeServer();
+    const app = await continueWith(fake);
+    fake.watch.send(liveOpened());
+    fake.watch.send(connection("reconnecting"));
+    fake.watch.send(connection("lost"));
+    await settle();
+    expect(text()).toContain("could not be reconnected");
+
+    // A message the server took as a plain follow-up says nothing about the stream.
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({ targetId, importId, conversation: "continued" }),
+      );
+    await say("Still there?");
+    expect(text()).toContain("could not be reconnected");
+
+    // One that resumed it opened a new stream, which never broke and so never says
+    // `restored`: the note about the old one goes.
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(importerTurnAccepted({ targetId, importId, conversation: "resumed" }));
+    await say("Carry on");
+    expect(app.liveConnection["import:imp_newest"]).toBeUndefined();
+    expect(text()).not.toContain("could not be reconnected");
+  });
+
   test("another import's break is not this thread's, and its return reads nothing here", async () => {
     const fake = new FakeServer();
     await continueWith(fake);
