@@ -9172,6 +9172,211 @@ describe("sub-agent cards: lines, activity, count and Stop (A7-S)", () => {
     });
   });
 
+  /** A card's Stop on one background sub-agent, with the CLI's answer to it, as measured. */
+  const cardStop = (
+    harness: AgentHarness["Service"],
+    driver: { emit: (message: SDKMessage) => void },
+    callId: string,
+    taskId: string,
+    notify = true,
+  ) =>
+    Effect.gen(function* () {
+      const answer = yield* harness.stopSubagent(ID, callId);
+      if (notify) {
+        driver.emit(
+          frame({
+            type: "system",
+            subtype: "task_notification",
+            task_id: taskId,
+            tool_use_id: callId,
+            status: "stopped",
+            output_file: "",
+            summary: "Sleep then read",
+          }),
+        );
+      }
+      return answer;
+    });
+
+  test("A7-S review 2: a turn the CLI opens about other work — a timer the operator asked for — runs while a stopped sub-agent's quell is armed, which then fires on its own turn", async () => {
+    const counts = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: ID,
+            multiTurn: true,
+          });
+          yield* harness.prompt(ID, "go");
+          yield* Effect.promise(() => driver.pulled(1));
+          driver.emit(agentCall(BG, true, "Sleep, then read."));
+          driver.emit(taskStarted(BG, "a_bg", true));
+          driver.startTask("b_timer", "local_bash");
+          yield* Effect.sleep("20 millis");
+          // The card's Stop, and the CLI slow to say so.
+          yield* cardStop(harness, driver, BG, "a_bg", false);
+          yield* harness.stopSubagents(ID);
+          yield* harness.interruptSession(ID);
+          driver.emitResult();
+          yield* Effect.sleep("20 millis");
+          const afterStopAll = driver.seen.interrupts;
+          // Inside the window, the timer finishes, and the CLI opens its turn.
+          driver.endTask("b_timer", "completed");
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const timer = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          // Then the stopped sub-agent's notification, and its turn.
+          driver.endTask("a_bg", "stopped");
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const stopped = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          return { afterStopAll, timer, stopped };
+        }),
+      { notificationQuellMillis: 10_000 },
+    );
+    expect(counts).toEqual({ afterStopAll: 1, timer: 1, stopped: 2 });
+  });
+
+  test("A7-S review 2: one quell per stopped sub-agent: each one's own turn is stopped once, and a turn between them about nothing it can name runs", async () => {
+    const counts = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: ID,
+            multiTurn: true,
+          });
+          yield* harness.prompt(ID, "go");
+          yield* Effect.promise(() => driver.pulled(1));
+          driver.emit(agentCall(BG, true, "Sleep, then read."));
+          driver.emit(taskStarted(BG, "a_bg", true));
+          driver.emit(agentCall("toolu_bg2", true, "Sleep, then list."));
+          driver.emit(taskStarted("toolu_bg2", "a_bg2", true));
+          driver.emit(agentCall(FG, false, "Read it."));
+          driver.emit(taskStarted(FG, "a_fg", false));
+          yield* Effect.sleep("20 millis");
+          yield* cardStop(harness, driver, BG, "a_bg");
+          yield* cardStop(harness, driver, "toolu_bg2", "a_bg2", false);
+          yield* harness.stopSubagents(ID);
+          yield* harness.interruptSession(ID);
+          // The turn's Stop ends the foreground one with it: no turn of its own follows.
+          driver.endTask("a_fg", "stopped");
+          driver.emitResult();
+          yield* Effect.sleep("20 millis");
+          // The first one's turn.
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const first = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          // A turn of the CLI's own about no task it names.
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const between = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          // The second one's notification, late, and its turn.
+          driver.emit(
+            frame({
+              type: "system",
+              subtype: "task_notification",
+              task_id: "a_bg2",
+              tool_use_id: "toolu_bg2",
+              status: "stopped",
+              output_file: "",
+              summary: "Sleep then list",
+            }),
+          );
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const second = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          // The agent continues it (a new run of the same task), and that run's end is
+          // news the operator has not stopped: its turn runs.
+          driver.emit(taskStarted("toolu_bg2", "a_bg2", true));
+          driver.emit(
+            frame({
+              type: "system",
+              subtype: "task_notification",
+              task_id: "a_bg2",
+              tool_use_id: "toolu_bg2",
+              status: "stopped",
+              output_file: "",
+              summary: "Sleep then list",
+            }),
+          );
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const repeat = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          return { first, between, second, repeat };
+        }),
+      { notificationQuellMillis: 10_000 },
+    );
+    expect(counts).toEqual({ first: 2, between: 2, second: 3, repeat: 3 });
+  });
+
+  test("A7-S review 2: an operator message accepted after Stop all disarms it: the stopped sub-agent's turn, coming after, runs", async () => {
+    const counts = await withTurnDriven(
+      (harness, driver) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: ID,
+            multiTurn: true,
+          });
+          yield* harness.prompt(ID, "go");
+          yield* Effect.promise(() => driver.pulled(1));
+          driver.emit(agentCall(BG, true, "Sleep, then read."));
+          driver.emit(taskStarted(BG, "a_bg", true));
+          yield* Effect.sleep("20 millis");
+          // The card's Stop, and the CLI slow to say so.
+          yield* cardStop(harness, driver, BG, "a_bg", false);
+          yield* harness.stopSubagents(ID);
+          yield* harness.interruptSession(ID);
+          driver.emitResult();
+          yield* Effect.sleep("20 millis");
+          const afterStopAll = driver.seen.interrupts;
+          yield* harness.prompt(ID, "what now?", {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: "aaaaaaaabbbbbbbbccccccccdddddddd",
+          });
+          yield* Effect.promise(() => driver.pulled(2));
+          driver.emitResult();
+          yield* Effect.sleep("20 millis");
+          driver.emit(
+            frame({
+              type: "system",
+              subtype: "task_notification",
+              task_id: "a_bg",
+              tool_use_id: BG,
+              status: "stopped",
+              output_file: "",
+              summary: "Sleep then read",
+            }),
+          );
+          driver.startUnrequestedTurn();
+          yield* Effect.sleep("20 millis");
+          const after = driver.seen.interrupts;
+          driver.endUnrequestedTurn();
+          return { afterStopAll, after };
+        }),
+      { notificationQuellMillis: 10_000 },
+    );
+    expect(counts).toEqual({ afterStopAll: 1, after: 1 });
+  });
+
   test("A7-S review 1: Stop all with no card's Stop before it arms nothing: a turn the CLI opens after it runs", async () => {
     const interrupts = await withTurnDriven(
       (harness, driver) =>

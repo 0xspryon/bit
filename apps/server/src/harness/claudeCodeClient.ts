@@ -868,15 +868,35 @@ interface SessionRecord {
   readonly tasks: Map<string, TrackedTask>;
   /**
    * The background sub-agents this process stopped on their own (`stopSubagent`, a card's
-   * Stop), by task id, until the CLI next opens a turn of its own: the turn it opens to tell
-   * the agent (A7-S Step 0). What Stop all reads to arm {@link quellUntil}.
+   * Stop), by task id, until a turn opens that their notification is in: the turn the CLI
+   * opens to tell the agent (A7-S Step 0). What Stop all reads to arm {@link quellFor}.
    */
   readonly stoppedHere: Set<string>;
   /**
-   * Until when, in `Date.now()` milliseconds, a turn the CLI opens on its own is stopped as
-   * it opens; 0 when not armed. Armed by Stop all (`stopSubagents`) while
-   * {@link stoppedHere} holds a sub-agent (A7-S review 1): its notification turn was still
-   * to come after the Stop all, ~2.5 s later, and the agent answered about it.
+   * The background tasks whose `task_notification` has arrived since a turn last opened, by
+   * task id: what the next turn the CLI opens on its own is about (A7-S review 2).
+   *
+   * Measured (CLI 2.1.310, haiku, fix round 2): a notification turn's first frame is a bare
+   * `system/init` — no `origin`, no task id, nothing of the notification's — and it comes
+   * 60–100 ms after the task's `task_notification`, or, when a turn was running, after
+   * that turn's `result`. So the notifications between two turn openings are what the
+   * second one is about. Emptied at every turn opening, the operator's included.
+   */
+  readonly notified: Set<string>;
+  /**
+   * The stopped sub-agents ({@link stoppedHere}) a Stop all armed a quell for: the CLI's
+   * own turn about them is stopped as it opens, once, and only if it is about nothing else
+   * ({@link notified}). An entry goes when its turn opens, and all go at
+   * {@link quellUntil} or when the operator's next message is accepted.
+   */
+  readonly quellFor: Set<string>;
+  /**
+   * Until when, in `Date.now()` milliseconds, {@link quellFor} holds; 0 when not armed.
+   * Armed by Stop all (`stopSubagents`) while {@link stoppedHere} holds a sub-agent (A7-S
+   * review 1): its notification turn was still to come after the Stop all, ~2.5 s later,
+   * and the agent answered about it. A bound, not the rule: before review 2 it was the
+   * whole rule, and a timer the operator asked for after the Stop all had its own
+   * notification turn stopped 4.4 s later.
    */
   quellUntil: number;
   /** The query has been closed; nothing more will arrive. */
@@ -934,6 +954,11 @@ interface OwnedCli {
 interface TrackedTask {
   /** The CLI's `task_type` (`local_agent`, `local_bash`, …), or `unknown`. */
   readonly type: string;
+  /**
+   * `task_started`'s `is_backgrounded`: a background task's notification opens a turn of
+   * the CLI's own when no turn is running (see {@link SessionRecord.notified}).
+   */
+  readonly background: boolean;
   /** The run this entry is, when the CLI named one: absent from CLIs that predate it. */
   readonly runId: string | undefined;
 }
@@ -3324,10 +3349,13 @@ const trackTask = (record: SessionRecord, message: SDKMessage): void => {
     if (lateRun(record.tasks.get(message.task_id), message.run_id)) return;
     record.tasks.set(message.task_id, {
       type: message.task_type ?? "unknown",
+      background: message.is_backgrounded === true,
       runId: message.run_id,
     });
   } else if (message.subtype === "task_notification") {
-    if (lateRun(record.tasks.get(message.task_id), message.run_id)) return;
+    const tracked = record.tasks.get(message.task_id);
+    if (lateRun(tracked, message.run_id)) return;
+    if (tracked?.background === true) record.notified.add(message.task_id);
     record.tasks.delete(message.task_id);
   }
 };
@@ -3715,30 +3743,47 @@ export const claudeCodeHarness = (
        * session did (DECISIONS.md §15), and the prompt is never resubmitted.
        */
       /**
-       * A turn the CLI opened on its own (no message of the operator's is waiting for an
-       * answer), at its first frame: the notification turn of a sub-agent a card's Stop
-       * stopped, which is that Stop's to tell the agent, so {@link SessionRecord.stoppedHere}
-       * is emptied; and **stopped at once** while a Stop all's window is open
-       * ({@link SessionRecord.quellUntil}), since the operator stopped everything after it.
+       * A turn opened, at its first frame. What it is about is the background tasks that
+       * notified since the last opening ({@link SessionRecord.notified}): those leave
+       * {@link SessionRecord.stoppedHere}, since this turn is where the agent hears of them.
+       *
+       * A turn the CLI opened **on its own** (no message of the operator's waiting) is
+       * **stopped at once** when a Stop all armed a quell for every task it is about
+       * ({@link SessionRecord.quellFor}), inside the window: the notification turn of a
+       * sub-agent a card's Stop stopped, which the operator then stopped everything after.
+       * One about anything else — a timer the operator asked for after the Stop all, say
+       * (A7-S review 2) — runs, as does one about nothing bit can name.
        *
        * The `interrupt()` is the one a Stop sends, marked the same way, so the turn's
        * `result` reads `interrupted`; it is not waited for, since this is the pump's own
        * loop, and one the CLI refuses is logged and leaves the turn to run.
        *
-       * V2(chat): told apart by having no operator message waiting, not by what the turn
-       * is about — the SDK names neither the task nor the notification at the turn's
-       * `system/init`. Inside the window nothing else can open one: Stop all stopped every
-       * task, so none is left to finish and notify.
+       * V2(chat): matched by order, not by content — the SDK names neither the task nor the
+       * notification at the turn's `system/init` (measured), so "the notifications since
+       * the last opening" stands in. A notification the CLI folds into a running turn
+       * between tool rounds stays in {@link SessionRecord.notified} until the next opening,
+       * where it can only keep a quell from firing, never make one fire on other work. And an
+       * operator message accepted after the Stop all disarms the quell, so a stopped
+       * sub-agent whose notification turn comes after it is answered by the agent.
        */
-      const quell = (record: SessionRecord, live: HarnessQuery): void => {
-        record.stoppedHere.clear();
-        if (Date.now() >= record.quellUntil) return;
+      const turnOpened = (record: SessionRecord, live: HarnessQuery): void => {
+        const about = [...record.notified];
+        record.notified.clear();
+        for (const taskId of about) record.stoppedHere.delete(taskId);
+        if (record.unanswered.size > 0) return;
+        const armed =
+          Date.now() < record.quellUntil &&
+          about.length > 0 &&
+          about.every((taskId) => record.quellFor.has(taskId));
+        for (const taskId of about) record.quellFor.delete(taskId);
+        if (record.quellFor.size === 0) record.quellUntil = 0;
+        if (!armed) return;
         record.interrupted = true;
         record.interruptMoved = false;
         void Effect.runPromise(
           Effect.logInfo(
-            "a turn Claude Code opened on its own after a Stop all, about a sub-agent a card's Stop had stopped, is stopped as it opens",
-            { sessionId: record.sessionId },
+            "a turn Claude Code opened on its own after a Stop all, to tell the agent of a sub-agent a card's Stop had stopped, is stopped as it opens",
+            { sessionId: record.sessionId, tasks: about },
           ),
         ).catch(() => undefined);
         live.interrupt().catch((cause: unknown) => {
@@ -3788,7 +3833,7 @@ export const claudeCodeHarness = (
                     ) {
                       record.idle = Deferred.makeUnsafe<void, HarnessFailure>();
                     }
-                    if (record.unanswered.size === 0) quell(record, live);
+                    turnOpened(record, live);
                   }
                   if (message.type === "result") {
                     record.outcome = outcome;
@@ -4248,6 +4293,8 @@ export const claudeCodeHarness = (
           interruptMoved: false,
           tasks: new Map<string, TrackedTask>(),
           stoppedHere: new Set<string>(),
+          notified: new Set<string>(),
+          quellFor: new Set<string>(),
           quellUntil: 0,
           closed: false,
           cli: undefined,
@@ -4630,6 +4677,9 @@ export const claudeCodeHarness = (
         const uuid = claudeCodeMessageId(delivery.messageId);
         record.unanswered.add(uuid);
         record.untaken.set(uuid, delivery.messageId);
+        // The operator spoke after the Stop all: what the CLI opens next may be theirs to see.
+        record.quellFor.clear();
+        record.quellUntil = 0;
         if (delivery.urgency === "preemptive") record.sentNow.add(uuid);
         offer(userMessage(record, content, uuid, delivery));
         return { delivered: true };
@@ -5396,8 +5446,8 @@ export const claudeCodeHarness = (
        *
        * **But a sub-agent a card's Stop already stopped has its notification turn still to
        * come** (A7-S review 1, measured: ~2.5 s after the Stop all, and haiku answered it).
-       * So Stop all arms {@link SessionRecord.quellUntil}, and the pump stops that turn as it
-       * opens ({@link quell}).
+       * So Stop all arms {@link SessionRecord.quellFor} with those sub-agents, and the pump
+       * stops the turn about them as it opens ({@link turnOpened}).
        */
       const stopSubagents: AgentHarness["Service"]["stopSubagents"] = (
         sessionId,
@@ -5409,6 +5459,9 @@ export const claudeCodeHarness = (
             !record.closed &&
             record.stoppedHere.size > 0
           ) {
+            record.quellFor.clear();
+            for (const taskId of record.stoppedHere)
+              record.quellFor.add(taskId);
             record.quellUntil = Date.now() + notificationQuellMillis;
           }
           return [];
