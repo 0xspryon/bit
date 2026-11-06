@@ -74,6 +74,7 @@
     empty,
     layout = "panel",
     subagent,
+    questionLive,
   }: {
     /** The heading, and the list's accessible name. */
     label: string;
@@ -176,6 +177,12 @@
      * `ChatItem`'s U14 entry as before.
      */
     subagent?: Snippet<[ChatRow]> | undefined;
+    /**
+     * Whether the session's harness waits on a question now (A7-S review 1), so a run of
+     * question calls with no answer says "waiting on you" only while it does
+     * (`toolRunSummary`). Absent where the chat does not know.
+     */
+    questionLive?: boolean | undefined;
   } = $props();
 
   /**
@@ -394,7 +401,7 @@
             kind, time and ids, which is what a panel among other things on a page is for.
           -->
           <ol class="items">
-            {#each threadEntries(group.rows) as entry (entry.key)}
+            {#each threadEntries(group.rows, questionLive) as entry (entry.key)}
               {#if entry._tag === "tools"}
                 <ToolRun rows={entry.rows} summary={entry.summary} />
               {:else if subagent !== undefined && entry.row.item.kind === SUBAGENT_KIND}

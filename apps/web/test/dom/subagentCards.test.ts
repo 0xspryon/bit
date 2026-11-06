@@ -828,6 +828,23 @@ describe("a question call's row and the session chip (A7-Q's E3/E6 leftovers, do
     expect(runLine()).toBe(">_ Asked 2 questions · waiting on you");
   });
 
+  test("A7-S review 1: a question call cut off by a restart, or no longer waited on, is not waiting on you", async () => {
+    // After a restart the call has no answer and never will: the replay offers its answers
+    // as a message, and the harness waits on nothing.
+    await continueWith(new FakeServer(), [], {
+      items: [operator("Ask me."), call("toolu_q", "AskUserQuestion", ASKED)],
+      question: { ...pending, answerability: "message" },
+    });
+    expect(runLine()).toBe(">_ Asked 2 questions");
+    for (const each of mounted) each.destroy();
+    mounted = [];
+    // Put away, or the session ended: nothing waits.
+    await continueWith(new FakeServer(), [], {
+      items: [operator("Ask me."), call("toolu_q", "AskUserQuestion", ASKED)],
+    });
+    expect(runLine()).toBe(">_ Asked 2 questions");
+  });
+
   test("answered, it is the questions asked alone; any other tool is still a command", async () => {
     await continueWith(new FakeServer(), [], {
       items: [

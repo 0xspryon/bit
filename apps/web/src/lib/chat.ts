@@ -919,8 +919,8 @@ export interface ToolRunSummary {
   readonly pending: boolean;
   /**
    * When every call in the run is the harness's question tool (A7-Q's E3): how many
-   * questions they asked, and whether one has no answer yet — the agent waits on the
-   * operator. `undefined` for any other run.
+   * questions they asked, and whether one has no answer yet **while the harness still
+   * waits** — the agent waits on the operator. `undefined` for any other run.
    */
   readonly asked?:
     { readonly questions: number; readonly waiting: boolean } | undefined;
@@ -982,8 +982,19 @@ const toolRowName = (row: ChatRow): string => {
   return call.toolName ?? call.tool ?? call.headline;
 };
 
-/** What a run of tool rows says when folded: see {@link ToolRunSummary}. */
-export const toolRunSummary = (rows: readonly ChatRow[]): ToolRunSummary => {
+/**
+ * What a run of tool rows says when folded: see {@link ToolRunSummary}.
+ *
+ * `questionLive` is whether the session's harness is waiting on a question now (its
+ * `answerability` is `live`), where the chat knows: a question call with no answer is
+ * waiting on the operator only then (A7-S review 1). One cut off by a restart, or by the
+ * session's end, has no answer and never will, and is no longer anyone's to answer here.
+ * `undefined` for a chat that does not know, which reads an unanswered call as waiting.
+ */
+export const toolRunSummary = (
+  rows: readonly ChatRow[],
+  questionLive?: boolean,
+): ToolRunSummary => {
   const names: string[] = [];
   let refused = 0;
   let unresolved = 0;
@@ -1019,7 +1030,8 @@ export const toolRunSummary = (rows: readonly ChatRow[]): ToolRunSummary => {
           asked: {
             questions: rows.reduce((sum, row) => sum + questionsIn(row), 0),
             // A call with no answer yet: the harness is still waiting on the operator.
-            waiting: rows.some((row) => row.result === null),
+            waiting:
+              questionLive !== false && rows.some((row) => row.result === null),
           },
         }
       : {}),
@@ -1052,6 +1064,8 @@ export const toolRunAttention = (summary: ToolRunSummary): readonly string[] =>
  */
 export const threadEntries = (
   rows: readonly ChatRow[],
+  /** See {@link toolRunSummary}. */
+  questionLive?: boolean,
 ): readonly ThreadEntry[] => {
   const entries: ThreadEntry[] = [];
   let run: ChatRow[] = [];
@@ -1062,7 +1076,7 @@ export const threadEntries = (
         _tag: "tools",
         key: `tools:${first.key}`,
         rows: run,
-        summary: toolRunSummary(run),
+        summary: toolRunSummary(run, questionLive),
       });
     }
     run = [];

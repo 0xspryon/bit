@@ -387,6 +387,7 @@
       footer={footer ?? closing}
       {footnote}
       {subagent}
+      questionLive={question?.pending.answerability === "live"}
     >
       {#snippet controls()}
         {#if stopOffered(session)}
