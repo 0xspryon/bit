@@ -534,6 +534,17 @@ the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harnes
   all: OpenCode interrupts each running child, then the turn's Stop (which cancels inbox
   notices first); Claude Code asks nothing extra (the turn's `interrupt()` stops background
   agents with no turn after it, where `stopTask` each would open one).
+- **Decision (orchestrator, review 3): below about 900px of viewport the E8 chip is
+  compact** — its icon and the two counts, with the full words in its accessible name and
+  title (`SUBAGENT_CHIP_COMPACT_QUERY`). The title bar's session chip is the part that
+  gives way after that (its name ellipses), so the right group never pushes the page
+  sideways.
+- **Decision (orchestrator, review 3): where the chat column would be under 560px beside
+  the panel even with the rail hidden, the panel overlays the chat as a drawer** instead of
+  reflowing it (`panelOverlays`: the window's width less 400 under 560, so below 960px):
+  the same 400px and grouping; Esc or × closes it, and focus returns to the chip; selecting
+  a row closes the drawer and scrolls to the card. A drawer needs no room, so the rail is
+  not put away for it (and a rail the panel took comes back when a resize makes it one).
 - **E3/E6 leftovers of A7-Q, done here:** a run of question-tool calls reads "Asked N
   questions · waiting on you" (waiting while a call has no result), and the session chip
   carries a warning dot while the session waits on the operator.
@@ -577,6 +588,26 @@ the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harnes
   turn's aborted step as "Stopped when you ended this session." Test teardowns and probes
   signal a recorded pid only while its start time matches; killed runs leave no probe
   folders.
+
+- **Review 3 fix round (2026-11-06, `6a2c74c`..):** Claude Code's Stop all arms the quell
+  with every background task running as it arms, as well as the card-stopped sub-agents:
+  the turn's Stop then stops them, and live their notifications landed before the stopped
+  sub-agent's turn opened, so that turn was about both and was not quelled. A task that
+  ends other than `stopped` leaves the quell, and one started after the Stop all is never
+  armed; the operator-message disarm stays. OpenCode's Stop all takes the End's order:
+  foreground children are spared for the parent's interrupt, background ones stopped,
+  their notices let in and only those cancelled from the parent's inbox (the operator's
+  queued messages stay, as a Stop holds them), then the route's Stop interrupts the parent.
+  An ended import's replay claims an aborted step for the End only when it was cut at or
+  after the recorded end time (`endedByOperatorAt`), so a Stop all's or a restart's keeps
+  its own reading. The two layout rules above (compact chip, drawer). Live: on haiku the
+  `r3-mixbg` and `r3-timer` repros are quelled (tasks `[A, C]` and `[A, C, timer]`, no reply),
+  and a message before or 0.3 s after Stop all, Send now, a queued message and a timer asked
+  for after Stop all are all answered; on GLM, Stop all with a foreground and a background
+  child took 218 ms and left one aborted step (the turn's own, holding the foreground call)
+  and no notice, a later End kept its reading, and an End that cut a running turn still reads
+  as the End's; at 768×1024, 820, 900, 1024×768 and 1440×900 the page never scrolls sideways,
+  panel open or closed. Shots in `/run/media/hbt/work/a7sf3-shots/`.
 
 **F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
 refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
