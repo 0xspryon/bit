@@ -4,8 +4,8 @@
  * touching the core.
  *
  * The owner here is a test-only **probe**: its rows live in a map, its credential is a
- * goal's (the kind a goal binding will mint), and its frames go out under the goal subject,
- * keyed by period id. Everything else — the registry, the narration bus, the credentials,
+ * goal's grant for the owner {@link OWNER} — whose id is not any period's — revoked by the
+ * period's own token, and its frames go out under the goal subject, keyed by period id. Everything else — the registry, the narration bus, the credentials,
  * the role directory — is the production code, over a stub harness.
  */
 import { afterAll, describe, expect, test } from "bun:test";
@@ -19,7 +19,16 @@ import {
   type ConversationQueuedMessage,
   type PendingQuestion,
 } from "@bit/contracts";
-import { Deferred, Effect, Layer, Queue, Scope, Stream, Context } from "effect";
+import {
+  Deferred,
+  Effect,
+  Layer,
+  Queue,
+  Redacted,
+  Scope,
+  Stream,
+  Context,
+} from "effect";
 
 import {
   makeConversations,
@@ -40,7 +49,7 @@ import {
   STUB_INSTANCE,
   stubHarness,
 } from "../harness/stubHarness";
-import { McpCredentials } from "../mcp/credentials";
+import { McpCredentials, type IssuedCredential } from "../mcp/credentials";
 import { FleetStore } from "../persistence/fleet";
 import { RunNarrations, type RunNarration } from "../run/narration";
 
@@ -52,6 +61,8 @@ afterAll(() => {
 });
 
 const TARGET = "probe-target";
+/** The probe owner: every period here is one of its sessions, as a goal's would be. */
+const OWNER = "goal_probe";
 const URLS = {
   mcp: "http://127.0.0.1:9/mcp",
   plannerMcp: "http://127.0.0.1:9/planner",
@@ -139,6 +150,8 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
     ]);
 
     const rows = new Map<string, ProbeRow>();
+    /** Each period's credential, as the probe minted it. */
+    const issued = new Map<string, IssuedCredential>();
     const ended: { id: string; reason: LiveSessionCloseReason }[] = [];
     let minted = 0;
     const reopened: string[] = [];
@@ -211,13 +224,31 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
     > = {
       role: {
         endpoint: (urls) => urls.goalMcp,
-        issue: (input) =>
-          credentials.issueWithoutExpiry({
-            _tag: "goal",
-            targetId: input.targetId,
-            goalId: input.id,
+        // A goal grant names the goal, not the period: the owner's id, never the period's.
+        issue: (period) =>
+          credentials
+            .issueWithoutExpiry({
+              _tag: "goal",
+              targetId: period.targetId,
+              goalId: period.ownerId,
+            })
+            .pipe(
+              Effect.tap((credential) =>
+                Effect.sync(() => issued.set(period.periodId, credential)),
+              ),
+            ),
+        // By the period's own token: `revokeGoal` would take every period of the owner.
+        revokePeriod: (period) =>
+          Effect.gen(function* () {
+            const credential = issued.get(period.periodId);
+            if (credential === undefined) return 0;
+            const live = yield* credentials.resolve(
+              Redacted.value(credential.token),
+            );
+            if (live === undefined) return 0;
+            yield* credentials.revoke(credential.token);
+            return 1;
           }),
-        revokeStray: credentials.revokeGoal,
         words: {
           unregisterRefused: "probe: unregister refused",
           strayCredential: "probe: stray credential",
@@ -225,6 +256,7 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
           idKey: "probeId",
         },
       },
+      ownerOf: () => OWNER,
       // A non-importer subject: the frames say `goalId`, which is the period id here.
       subject: (id) => ({ _tag: "goal", goalId: id }),
       questionSubject: (id) => ({
@@ -336,6 +368,8 @@ const world = (options: { readonly holdTurns?: boolean } = {}) =>
       rows,
       ended,
       reopened,
+      issued,
+      credentials,
       listen,
       close: Scope.close(scope, { _tag: "Success", value: undefined } as never),
       send: (input: Omit<ConversationSend, "targetId">) =>
@@ -514,6 +548,40 @@ describe("the conversation core through a non-importer owner", () => {
       (item) => item.entry.type === "bit.connection.closed",
     );
     expect(closed?.subject).toEqual({ _tag: "goal", goalId: "prb_1" });
+  });
+
+  test("ending one of an owner's periods revokes its credential only; the other keeps its authority", async () => {
+    const result = await run((probe) =>
+      Effect.gen(function* () {
+        const first = (yield* probe.open("first")).entry;
+        const second = (yield* probe.open("second")).entry;
+        const tokenOf = (id: string) => {
+          const credential = probe.issued.get(id);
+          return credential === undefined
+            ? ""
+            : Redacted.value(credential.token);
+        };
+        const before = {
+          first: yield* probe.credentials.resolve(tokenOf(first.id)),
+          second: yield* probe.credentials.resolve(tokenOf(second.id)),
+        };
+        yield* probe.core.end(TARGET, first.id);
+        return {
+          ids: [first.id, second.id],
+          before,
+          first: yield* probe.credentials.resolve(tokenOf(first.id)),
+          second: yield* probe.credentials.resolve(tokenOf(second.id)),
+          live: yield* probe.core.holds(second.id),
+        };
+      }),
+    );
+    expect(result.ids).toEqual(["prb_1", "prb_2"]);
+    // Both grants are the owner's, under its own id, not either period's.
+    expect(result.before.first).toMatchObject({ _tag: "goal", goalId: OWNER });
+    expect(result.before.second).toMatchObject({ _tag: "goal", goalId: OWNER });
+    expect(result.first).toBeUndefined();
+    expect(result.second).toMatchObject({ _tag: "goal", goalId: OWNER });
+    expect(result.live).toBe(true);
   });
 
   test("Stop, Stop all and activity answer for the period holding the session", async () => {

@@ -221,13 +221,24 @@ export type LiveSessionOpenFailure =
 export interface LiveSessionRole<Meta> {
   /** Which of the role endpoints this session's MCP registration points at. */
   readonly endpoint: (urls: WorkerUrls) => string;
-  /** Mints the session's credential, in the session's own scope. */
+  /**
+   * Mints the session's credential, in the session's own scope. `meta` is the open's own
+   * ({@link OpenPlan.meta}), for a surface whose grant names more than the id (the
+   * conversation core's owner).
+   */
   readonly issue: (input: {
     readonly id: string;
     readonly targetId: string;
+    readonly meta: Meta;
   }) => Effect.Effect<IssuedCredential, CredentialRefused, Scope.Scope>;
-  /** Revokes every grant of this surface's kind for one id, answering how many there were. */
-  readonly revokeStray: (id: string) => Effect.Effect<number>;
+  /**
+   * Revokes every grant of this surface's kind for one id, answering how many there were.
+   * `entry` is the closed session's target and meta, as {@link issue} had them.
+   */
+  readonly revokeStray: (
+    id: string,
+    entry: { readonly targetId: string; readonly meta: Meta },
+  ) => Effect.Effect<number>;
   /**
    * Runs after a session is closed and its revoke checked, with why it was closed. Must
    * not fail. Not run for a stale close (see `closeSession`).
@@ -781,7 +792,7 @@ export const makeLiveAgentSessions = <Meta>(
         return;
       }
       if ((builds.get(entry.id) ?? 0) === buildsAtClose) {
-        const stray = yield* role.revokeStray(entry.id);
+        const stray = yield* role.revokeStray(entry.id, entry);
         if (stray > 0) {
           yield* Effect.logError(role.words.strayCredential, {
             [role.words.idKey]: entry.id,
@@ -965,7 +976,11 @@ export const makeLiveAgentSessions = <Meta>(
     ) =>
       Effect.gen(function* () {
         const harness = plan.harness;
-        const credential = yield* role.issue({ id, targetId: plan.targetId });
+        const credential = yield* role.issue({
+          id,
+          targetId: plan.targetId,
+          meta: plan.meta,
+        });
         const serverName = bitMcpServerName(id);
         yield* Effect.acquireRelease(
           harness.registerMcpServer(created.id, serverName, {

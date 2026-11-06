@@ -806,13 +806,14 @@ export class ScopeImporter extends Context.Service<
             // makes this session's three tools unreachable from a worker, a planner or a goal
             // agent. What stands behind the missing clock is an `operator` end (`0026`,
             // `0027`), which the toolkit reads before every write.
-            issue: (input) =>
+            issue: (period) =>
               credentials.issueWithoutExpiry({
                 _tag: IMPORT_SESSION_ROLE,
-                targetId: input.targetId,
-                importId: input.id,
+                targetId: period.targetId,
+                importId: period.periodId,
               }),
-            revokeStray: credentials.revokeImport,
+            // An importer grant is one import's, so revoking by import is by period.
+            revokePeriod: (period) => credentials.revokeImport(period.periodId),
             words: {
               unregisterRefused:
                 "a harness would not take back the scope importer's MCP registration; the credential behind it is revoked either way",
@@ -822,6 +823,8 @@ export class ScopeImporter extends Context.Service<
               idKey: "importId",
             },
           },
+          // The owner is the target's Auto-load chat: one per target.
+          ownerOf: (opened) => opened.targetId,
           subject: (importId) => ({ _tag: "import", importId }),
           questionSubject: (importId) => ({
             attemptId: null,

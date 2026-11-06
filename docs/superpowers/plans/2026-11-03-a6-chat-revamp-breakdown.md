@@ -1093,8 +1093,17 @@ agent_id, opened_at, session_created_at, ended_at, ended_reason)`, the same colu
   list `GET`, open `POST`, and per period `/:conversationId/{messages GET|POST, stop,
 subagents/stop, subagents/:callId/stop, questions/:questionId/answer,
 questions/:questionId/dismiss, activity, context, model}`.
-- **Binding**: the goal credential and endpoint, `subject` (see the seam above), rows on the
-  new table, `reopen` from the goal's pinned agent, and prompts from `plan/goalPrompt.ts`.
+- **A per-period grant.** The core mints and revokes through `ConversationRole`, which gets
+  the owner id and the period id (`ConversationPeriod`) and must revoke **by period only**:
+  the core's operator end and the registry's belt-and-braces check both call
+  `revokePeriod`. Today's goal grant (`{ _tag: "goal", targetId, goalId }`) names only the
+  goal, and `revokeGoal` (`mcp/credentials.ts`) revokes every grant of the goal, so ending
+  one goal session would take the authority of all of them. The goal binding needs a grant
+  carrying the goal id and the period id, with a revoke by period beside it. `revokeGoal`
+  stays for ending the goal. Not added here: nothing would mint it.
+- **Binding**: the goal credential and endpoint, `ownerOf` (the goal id), `subject` (see the
+  seam above), rows on the new table, `reopen` from the goal's pinned agent, and prompts from
+  `plan/goalPrompt.ts`.
 - **Web**: `ConversationEndpoints` for those routes (~60 lines), `routeOf`, an
   `emptySession`, and `ChatShell` through `chatSessionOf`.
 - **Agent sessions**: the index union (`http/agentSessions.ts`) reads the new table under

@@ -108,11 +108,46 @@ import {
   type QuestionSubjectIds,
 } from "../harness/questions";
 import type { HarnessResolver } from "../harness/resolver";
+import type { CredentialRefused, IssuedCredential } from "../mcp/credentials";
 import { turnStopped, turnStopRefusal } from "../harness/turnStop";
 import type { NarrationSubject, RunNarrations } from "../run/narration";
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import type { WorkerUrls } from "../run/supervisor";
 import type { ReadUpload } from "../upload/uploads";
+
+/**
+ * One period's authority, as its owner mints and revokes it (review 1 of slice 2): the owner
+ * it belongs to and the period itself. An owner can hold several periods at once (a goal's
+ * sessions), so a grant names both and is revoked by the period.
+ */
+export interface ConversationPeriod {
+  /** What the period belongs to: the importer's target, a goal. */
+  readonly ownerId: string;
+  /** The period: one credential, one MCP registration, one row. */
+  readonly periodId: string;
+  readonly targetId: string;
+}
+
+/**
+ * The owner's authority, to the core: the registry's role (`LiveSessionRole`) with the
+ * credential pair keyed by period.
+ */
+export interface ConversationRole {
+  /** Which of the role endpoints a period's MCP registration points at. */
+  readonly endpoint: (urls: WorkerUrls) => string;
+  /** Mints one period's credential, in the session's own scope. */
+  readonly issue: (
+    period: ConversationPeriod,
+  ) => Effect.Effect<IssuedCredential, CredentialRefused, Scope.Scope>;
+  /**
+   * Revokes the grant of **this period only**, answering how many there were. Never every
+   * grant of the owner: ending one of a goal's sessions must leave its others their
+   * authority. The core's operator end and the registry's belt-and-braces check both call it.
+   */
+  readonly revokePeriod: (period: ConversationPeriod) => Effect.Effect<number>;
+  /** The log lines, in the owner's own words. */
+  readonly words: LiveSessionRole<unknown>["words"];
+}
 
 /** A store's failure, as a binding's row reads answer it. */
 export interface StoreFailure {
@@ -212,8 +247,16 @@ export interface ConversationBinding<
   Extra,
   Accepted,
 > {
-  /** The credential, endpoint and log words: the registry's role, less `afterClose`. */
-  readonly role: Omit<LiveSessionRole<Meta>, "afterClose">;
+  /** The credential, endpoint and log words, keyed by period. */
+  readonly role: ConversationRole;
+  /**
+   * Which owner a period belongs to, from what its open was given: the importer's target,
+   * a goal's id. Passed to {@link ConversationRole} beside the period.
+   */
+  readonly ownerOf: (input: {
+    readonly targetId: string;
+    readonly meta: Meta;
+  }) => string;
   /** The narration subject a period's frames are published under. */
   readonly subject: (id: string) => NarrationSubject;
   /** The same subject, as a question's four ids. */
@@ -524,10 +567,24 @@ export const makeConversations = <
     const deliveries = new Map<string, number>();
     const deliveriesTo = (id: string): number => deliveries.get(id) ?? 0;
 
+    /** One period's authority ids, from what its open was given. */
+    const periodOf = (
+      id: string,
+      opened: { readonly targetId: string; readonly meta: Meta },
+    ): ConversationPeriod => ({
+      ownerId: binding.ownerOf(opened),
+      periodId: id,
+      targetId: opened.targetId,
+    });
+
     const sessions = yield* makeLiveAgentSessions<Meta>(
       { endpoints: deps.endpoints },
       {
-        ...binding.role,
+        endpoint: binding.role.endpoint,
+        words: binding.role.words,
+        issue: (input) => binding.role.issue(periodOf(input.id, input)),
+        revokeStray: (id, entry) =>
+          binding.role.revokePeriod(periodOf(id, entry)),
         afterClose: (entry, reason) =>
           Effect.andThen(
             // What the session held queued went with it, and is not this process's to
@@ -568,7 +625,12 @@ export const makeConversations = <
      */
     const inFlight = new Map<
       string,
-      { readonly targetId: string; readonly known: Deferred.Deferred<void> }
+      {
+        readonly targetId: string;
+        /** What the open was given: whose period it is, for an end before it publishes. */
+        readonly meta: Meta;
+        readonly known: Deferred.Deferred<void>;
+      }
     >();
     const releaseOpening = (id: string) =>
       Effect.suspend(() => {
@@ -795,6 +857,7 @@ export const makeConversations = <
         yield* Effect.sync(() => {
           inFlight.set(input.id, {
             targetId: input.targetId,
+            meta: input.plan.meta,
             known: Deferred.makeUnsafe<void>(),
           });
           if (input.predecessor !== undefined) {
@@ -1871,8 +1934,23 @@ export const makeConversations = <
         const entry = sessions.get(id);
         const turn = turns.get(id);
         if (entry === undefined && turn === undefined) return false;
-        // The credential first, so a session mid-call finds its next call refused.
-        yield* binding.role.revokeStray(id);
+        /*
+         * The credential first, so a session mid-call finds its next call refused. **This
+         * period's grant only** (review 1 of slice 2): another period of the same owner keeps
+         * its authority. Named by the session's open, or by the open still in flight; with
+         * neither, the open failed and its scope took its credential with it.
+         */
+        const opened =
+          entry ??
+          (() => {
+            const held = inFlight.get(id);
+            return held === undefined
+              ? undefined
+              : { targetId: held.targetId, meta: held.meta };
+          })();
+        if (opened !== undefined) {
+          yield* binding.role.revokePeriod(periodOf(id, opened));
+        }
         // Recorded as the operator's **here**, after the revoke and before anything is
         // interrupted: interrupting a first turn still opening makes the registry close it
         // as `open_failed`, and the first recorded end wins.
