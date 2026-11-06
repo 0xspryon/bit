@@ -52,8 +52,11 @@ describe("a read-only transcript from a replay and the live feed", () => {
     working: true,
     agent: "worker",
     live: [
-      // Published before the replay was asked for: the replay holds it, so it is not twice.
-      live(2, "Reading the handler.", ATTEMPT),
+      // Published before the replay was asked for: below the floor, so not twice.
+      live(1, "Reading the handler.", ATTEMPT),
+      // Its last frame published **after** the floor (the settled re-read landed first),
+      // but the replay holds its block: the replay's, so not twice either.
+      { ...live(4, "Reading the handler.", ATTEMPT), blockId: "blk_2" },
       // After the floor: the live tail.
       live(5, "The token wins over the header.", ATTEMPT),
       // Another attempt's words on the same target.

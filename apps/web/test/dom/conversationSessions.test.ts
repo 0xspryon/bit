@@ -15,6 +15,9 @@ import type {
 } from "@bit/contracts";
 
 import type { Call } from "../../src/lib/client";
+import { CARRIED_NOTE } from "../../src/lib/conversationChat";
+import type { ParkedMessages } from "../../src/lib/conversationParked";
+import { TAKEN_KIND } from "../../src/lib/chat";
 import {
   NO_HISTORY,
   type ConversationReplayView,
@@ -34,7 +37,7 @@ import {
 } from "../../src/lib/conversationSessions.svelte";
 import { usageScope } from "../../src/lib/chat";
 import { IMPORTER_BINDING } from "../../src/lib/importerSessions.svelte";
-import { AT, ok, replayItem } from "../fakeServer";
+import { AT, ok, refused, replayItem, unreachable } from "../fakeServer";
 import { click, mountInto, press, settle as drawn, type Mounted } from "./dom";
 
 const { default: ProbeChat } = await import("./fixtures/ProbeChat.svelte");
@@ -133,6 +136,14 @@ const world = (
   const forgotten: string[] = [];
   let live: readonly LiveItem[] = [];
   let turn: "idle" | "running" = "idle";
+  /** What the next open or send answers instead of `next`, once: a refusal, a lost answer. */
+  let scripted: (() => Promise<Call<ProbeTurn, object>>) | undefined;
+  const takeScripted = () => {
+    const answer = scripted;
+    scripted = undefined;
+    return answer;
+  };
+  const parkedWrites: ParkedMessages[] = [];
   let next: ProbeTurn = {
     periodId: "gper_1",
     sessionId: "ses_1",
@@ -146,13 +157,25 @@ const world = (
     detail: "Nothing was running.",
   };
   const full: ConversationEndpoints<ProbeTurn> = {
-    open: (text) => {
+    open: async (text) => {
       calls.push(`open ${text}`);
-      return Promise.resolve({ call: ok(next) });
+      const answer = takeScripted();
+      return { call: answer === undefined ? ok(next) : await answer() };
     },
-    send: (id, text, urgency) => {
+    send: async (id, text, urgency) => {
       calls.push(`send ${id} ${text} ${urgency ?? "queued"}`);
-      return Promise.resolve(ok(next));
+      const answer = takeScripted();
+      return answer === undefined ? ok(next) : await answer();
+    },
+    stopSubagent: (id, callId) => {
+      calls.push(`stopSubagent ${id} ${callId}`);
+      return Promise.resolve(
+        ok({
+          conversationId: id,
+          callId,
+          detail: "The sub-agent was stopped.",
+        }),
+      );
     },
     history: (id) => {
       calls.push(`history ${id}`);
@@ -215,10 +238,18 @@ const world = (
       moved: () => undefined,
       forgetConnection: (id) => forgotten.push(id),
       highWater: () => 0,
-      reread: () => Promise.resolve(),
+      reread: () => {
+        calls.push("reread");
+        return Promise.resolve();
+      },
       wait: () => Promise.resolve(),
       after: () => () => undefined,
-      parked: { read: () => ({}), write: () => undefined },
+      parked: {
+        read: () => ({}),
+        write: (parked) => {
+          parkedWrites.push(parked);
+        },
+      },
       harnessName: () => "Probe harness",
       harnessDriver: () => undefined,
     },
@@ -234,6 +265,11 @@ const world = (
     server,
     calls,
     forgotten,
+    parkedWrites,
+    /** The next open or send is answered by `answer` instead. */
+    answerOnce: (answer: () => Promise<Call<ProbeTurn, object>>) => {
+      scripted = answer;
+    },
     setLive: (items: readonly LiveItem[]) => {
       live = items;
     },
@@ -618,5 +654,177 @@ describe("the generic chat state through a goal-shaped owner", () => {
     expect(probe.calls.some((call) => call.startsWith("context"))).toBe(false);
     expect(Object.keys(probe.state.contexts)).toEqual([]);
     expect(await probe.state.switchModel("probe/other", undefined)).toBe(false);
+  });
+  test("a refused open keeps the words in the box, with the server's sentence", async () => {
+    const probe = world();
+    probe.state.begin([], probe.server);
+    probe.answerOnce(() =>
+      Promise.resolve(refused({ _tag: "ProbeRefused", reason: "busy" })),
+    );
+    probe.state.draft = "Start on the login flow";
+    probe.state.send();
+    await settle();
+    expect(probe.calls).toContain("open Start on the login flow");
+    expect(probe.state.draft).toBe("Start on the login flow");
+    expect(probe.state.refused).toBe(true);
+    // The server's sentence (the app's refusal text; its fallback here).
+    expect(probe.state.notice).toBe("That message was not delivered.");
+    expect(probe.state.current?.conversationId).toBeUndefined();
+  });
+
+  test("an open with no answer is unanswered, not refused: the words come back, and the list is looked in", async () => {
+    const probe = world();
+    probe.state.begin([], probe.server);
+    probe.answerOnce(() => Promise.resolve(unreachable("connection reset")));
+    probe.state.draft = "Start on the login flow";
+    probe.state.send();
+    await settle();
+    expect(probe.state.draft).toBe("Start on the login flow");
+    expect(probe.state.notice).toContain("No server answered");
+    // Whether it arrived is looked for in the list: the session it may have opened.
+    expect(probe.calls).toContain("reread");
+  });
+
+  test("a reply refused once the operator went to another session is parked on its own, and given back there", async () => {
+    const probe = world();
+    probe.state.begin(
+      [listed("ses_old", "gper_0", AT - 10_000), listed("ses_1", "gper_1", AT)],
+      probe.server,
+    );
+    probe.state.open("ses_1");
+    await settle();
+    let release: () => void = () => undefined;
+    probe.answerOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve(refused({ _tag: "ProbeRefused", reason: "busy" }));
+        }),
+    );
+    probe.state.draft = "Skip the admin pages";
+    probe.state.send();
+    await settle();
+    probe.state.open("ses_old");
+    release();
+    await settle();
+    expect(probe.state.parked["ses_1"]?.text).toBe("Skip the admin pages");
+    expect(probe.state.parked["ses_1"]?.outcome).toBe("refused");
+    expect(probe.parkedWrites.at(-1)?.["ses_1"]?.text).toBe(
+      "Skip the admin pages",
+    );
+    expect(probe.state.draft).toBe("");
+    probe.state.open("ses_1");
+    expect(probe.state.draft).toBe("Skip the admin pages");
+  });
+
+  test("a message sent mid-turn waits marked queued until a take routed by goalId; a carry is the turn's note", async () => {
+    const probe = world();
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.running(true);
+    probe.answerNext({
+      periodId: "gper_1",
+      sessionId: "ses_1",
+      conversation: "continued",
+      messageId: "msg_a",
+    });
+    probe.state.draft = "First";
+    probe.state.send();
+    await settle();
+    probe.answerNext({
+      periodId: "gper_1",
+      sessionId: "ses_1",
+      conversation: "continued",
+      messageId: "msg_b",
+    });
+    probe.state.draft = "Second";
+    probe.state.send();
+    await settle();
+    const subjects = () =>
+      probe.state.groups.map(
+        (group) => `${group.subject.message}:${String(group.subject.queued)}`,
+      );
+    expect(subjects()).toEqual([
+      "What is in scope?:false",
+      "First:false",
+      "Second:true",
+    ]);
+    // Another owner's take of the same message id is not this one's.
+    const take = (route: Partial<LiveItem>): LiveItem => ({
+      ...replayItem(8, TAKEN_KIND, "", { ...route, messageIds: ["msg_b"] }),
+      id: "activity:8",
+    });
+    probe.state.noteTaken(take({ importId: "gper_1" }));
+    expect(subjects().at(-1)).toBe("Second:true");
+    const taken = take({ goalId: "gper_1" });
+    // The harness ended the first turn before it wrote anything, and sent it on with the
+    // next. (The feed is read when the state changes: the take is that change.)
+    probe.setLive([
+      taken,
+      {
+        ...replayItem(9, "turn.carried", "", {
+          goalId: "gper_1",
+          messageIds: ["msg_a"],
+        }),
+        id: "activity:9",
+      },
+    ]);
+    probe.state.noteTaken(taken);
+    expect(subjects().at(-1)).toBe("Second:false");
+    const first = probe.state.groups[1]?.prose;
+    expect(first !== undefined && "note" in first ? first.note : "").toBe(
+      CARRIED_NOTE,
+    );
+  });
+
+  test("a sub-agent's Stop goes to the period; an owner without the ability asks nothing", async () => {
+    const probe = world();
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    expect(probe.state.abilities.stopSubagent).toBe(true);
+    await probe.state.stopSubagent("call_7");
+    expect(probe.calls).toContain("stopSubagent gper_1 call_7");
+    expect(probe.state.notice).toBe("The sub-agent was stopped.");
+
+    const without = world({ leaveOut: ["stopSubagent"] });
+    without.state.begin([listed("ses_1", "gper_1", AT)], without.server);
+    without.state.open("ses_1");
+    await settle();
+    expect(without.state.abilities.stopSubagent).toBe(false);
+    await without.state.stopSubagent("call_7");
+    expect(without.calls.some((call) => call.startsWith("stopSubagent"))).toBe(
+      false,
+    );
+  });
+
+  test("a closed frame routed by goalId reads the list and the replay again, and docks no later question", async () => {
+    const probe = world();
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    const before = probe.calls.length;
+    const closed = (route: Partial<LiveConnection>): LiveConnection =>
+      ({
+        _tag: "connection",
+        state: "closed",
+        detail: "",
+        at: AT,
+        attemptId: null,
+        roundId: null,
+        goalId: null,
+        importId: null,
+        ...route,
+      }) as LiveConnection;
+    // An importer's frame for the same id is not this owner's.
+    probe.state.noteConnection(closed({ importId: "gper_1" }));
+    await settle();
+    expect(probe.calls.slice(before)).toEqual([]);
+    probe.state.noteConnection(closed({ goalId: "gper_1" }));
+    await settle();
+    expect(probe.calls.slice(before)).toEqual(["reread", "history gper_1"]);
+    probe.state.noteQuestion(asked());
+    expect(probe.state.question).toBeUndefined();
   });
 });

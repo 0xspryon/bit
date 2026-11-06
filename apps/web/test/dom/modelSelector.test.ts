@@ -54,17 +54,28 @@ describe("the model selector, alone", () => {
     if (other === undefined) throw new Error("no second model");
     click(other);
     await settle();
-    expect(picked.some((each) => each.startsWith("model "))).toBe(true);
+    const otherModel = first.models.find(
+      (each) => each.id !== first.defaultModel,
+    );
+    expect(picked).toEqual([`model ${otherModel?.id ?? ""}`]);
+    // A pick may close the list: open it again for the harness.
+    if (chip.getAttribute("aria-expanded") !== "true") {
+      click(chip);
+      await settle();
+    }
     const harnesses = [
       ...document.querySelectorAll<HTMLElement>('[role="option"]'),
     ];
+    const secondInstance = instances[1];
+    expect(secondInstance).toBeDefined();
     const second = harnesses.find(
       (row) => row.getAttribute("aria-selected") === "false",
     );
-    if (second !== undefined) {
-      click(second);
-      await settle();
-      expect(picked.some((each) => each.startsWith("instance "))).toBe(true);
-    }
+    // Unconditional: a selector with two harnesses offers the one not picked.
+    expect(second).toBeDefined();
+    if (second === undefined) return;
+    click(second);
+    await settle();
+    expect(picked.at(-1)).toBe(`instance ${secondInstance?.instanceId ?? ""}`);
   });
 });
