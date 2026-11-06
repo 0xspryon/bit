@@ -20,6 +20,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -39,21 +40,70 @@ import {
 const SCRATCH_ROOT = "/tmp/opencode/bit-harness";
 mkdirSync(SCRATCH_ROOT, { recursive: true });
 
+/**
+ * Probe folders a run killed from outside left behind, older than a day, are removed before
+ * this run makes its own (A7-S review 2: 116 had piled up). A day, so a run still going in
+ * another process keeps its own; a folder that will not go is left for the next run.
+ */
+const STALE_PROBE_AGE = 24 * 60 * 60 * 1000;
+for (const name of readdirSync(SCRATCH_ROOT)) {
+  if (!name.startsWith("probe-")) continue;
+  const folder = join(SCRATCH_ROOT, name);
+  try {
+    if (Date.now() - statSync(folder).mtimeMs > STALE_PROBE_AGE) {
+      rmSync(folder, { recursive: true, force: true });
+    }
+  } catch {
+    // Gone already, or not ours to remove.
+  }
+}
+
 const scratches: string[] = [];
 /** Pid files written by the probes of the test currently running. */
 let pidFiles: string[] = [];
 
-const readPids = (file: string): number[] => {
+/**
+ * A process's start time, from `/proc/<pid>/stat` (field 22, clock ticks since boot), or
+ * `undefined` when there is no such process. Read after the last `)`, since the command
+ * name before it may hold spaces. What tells a recorded pid from a later process that got
+ * the same number (A7-S review 2).
+ */
+const startTimeOf = (pid: number): string | undefined => {
+  try {
+    const stat = readFileSync(`/proc/${String(pid)}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Each recorded process as `pid starttime`, one a line (see {@link PID_PRELUDE}); the start
+ * time `undefined` where the probe could not read one.
+ */
+const readRecords = (
+  file: string,
+): { readonly pid: number; readonly started: string | undefined }[] => {
   try {
     return readFileSync(file, "utf8")
       .split("\n")
-      .map((line) => Number(line.trim()))
-      .filter((pid) => Number.isSafeInteger(pid) && pid > 1);
+      .map((line) => {
+        const [pid, started] = line.trim().split(" ");
+        return {
+          pid: Number(pid),
+          started:
+            started === undefined || started === "" ? undefined : started,
+        };
+      })
+      .filter(({ pid }) => Number.isSafeInteger(pid) && pid > 1);
   } catch {
     // The probe never got as far as writing one.
     return [];
   }
 };
+
+const readPids = (file: string): number[] =>
+  readRecords(file).map(({ pid }) => pid);
 
 const alive = (pid: number): boolean => {
   try {
@@ -82,12 +132,23 @@ const waitAllGone = async (pids: readonly number[], within: number) => {
  */
 const reapProbes = () => {
   for (const file of pidFiles) {
-    for (const pid of readPids(file)) {
+    for (const { pid, started } of readRecords(file)) {
+      /*
+       * Only a pid that is still the process recorded (A7-S review 2): one alive with
+       * another start time is a later process that got the number, and is left alone. One
+       * gone may still name its group, whose number cannot be handed out while a member
+       * lives, so the group is still signalled.
+       */
+      const now = startTimeOf(pid);
+      if (now !== undefined && started !== undefined && now !== started) {
+        continue;
+      }
       try {
         process.kill(-pid, "SIGKILL");
       } catch {
         // Not a group leader, or already gone.
       }
+      if (now === undefined) continue;
       try {
         process.kill(pid, "SIGKILL");
       } catch {
@@ -98,13 +159,27 @@ const reapProbes = () => {
   pidFiles = [];
 };
 
-afterEach(reapProbes);
+/**
+ * Each test's probe folders go with the test, not with the file (A7-S review 2): a run
+ * killed from outside runs neither, and with the removal at the file's end every folder
+ * its finished tests made was left behind, 116 of them. Now only the test in flight at the
+ * kill can leave one, and its probe, if alive, removes it ({@link PID_PRELUDE}); the sweep
+ * at the top takes any left over a day.
+ */
+const removeScratches = () => {
+  for (const directory of scratches.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+};
+
+afterEach(() => {
+  reapProbes();
+  removeScratches();
+});
 
 afterAll(() => {
   reapProbes();
-  for (const directory of scratches) {
-    rmSync(directory, { recursive: true, force: true });
-  }
+  removeScratches();
 });
 
 /**
@@ -134,7 +209,13 @@ const fakeBinary = (
 };
 
 /*
- * **A probe dies with the test run** (A7-S review 1). The teardown above SIGKILLs every
+ * **A probe dies with the test run** (A7-S review 1).
+ *
+ * Each recorded pid carries its start time (A7-S review 2), and a pid is signalled only
+ * while it is still that process: the probe's sweep runs after its runner has gone, by
+ * which time a recorded number may belong to something else. The runner is checked the
+ * same way, so a test process whose number was handed on is gone. A probe that does sweep
+ * then removes its own folder, which no teardown will. The teardown above SIGKILLs every
  * recorded pid, but a run killed from outside (`timeout`, the 1 GB scope's OOM kill) runs no
  * teardown, and each probe is detached into its own group, so nothing else reaches it: a
  * `fake-opencode serve` and its TERM-ignoring holder were found alive two hours after such
@@ -144,25 +225,43 @@ const fakeBinary = (
  * probe's group polls the runner itself (`holdsPipeOpen`).
  */
 const PID_PRELUDE = `
-import { appendFileSync, readFileSync as readRecorded } from "node:fs";
+import { appendFileSync, readFileSync as readRecorded, rmSync as removeFolder } from "node:fs";
+import { dirname as folderOf } from "node:path";
 const pidFile = (Bun.argv.find((a) => a.startsWith("--pidfile=")) ?? "").slice(10);
-const recordPid = (pid) => { if (pidFile !== "") appendFileSync(pidFile, pid + "\\n"); };
+const startOf = (pid) => {
+  try {
+    const stat = readRecorded("/proc/" + pid + "/stat", "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+};
+const recordPid = (pid) => {
+  if (pidFile !== "") appendFileSync(pidFile, pid + " " + (startOf(pid) ?? "") + "\\n");
+};
 recordPid(process.pid);
 const runner = Number(
   (Bun.argv.find((a) => a.startsWith("--runner=")) ?? "--runner=0").slice(9),
 );
+const runnerStarted = runner > 1 ? startOf(runner) : undefined;
 if (runner > 1) {
   setInterval(() => {
-    try {
-      process.kill(runner, 0);
-      return;
-    } catch {}
+    const now = startOf(runner);
+    if (now !== undefined && now === runnerStarted) return;
     let recorded = "";
     try { recorded = readRecorded(pidFile, "utf8"); } catch {}
-    for (const pid of recorded.split("\\n").map(Number)) {
+    for (const line of recorded.split("\\n")) {
+      const [number, started] = line.trim().split(" ");
+      const pid = Number(number);
       if (!(pid > 1) || pid === process.pid) continue;
+      const current = startOf(pid);
+      if (current !== undefined && (started ?? "") !== "" && current !== started) continue;
       try { process.kill(-pid, "SIGKILL"); } catch {}
+      if (current === undefined) continue;
       try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+    if (pidFile !== "") {
+      try { removeFolder(folderOf(pidFile), { recursive: true, force: true }); } catch {}
     }
     process.kill(process.pid, "SIGKILL");
   }, 200).unref();
@@ -230,6 +329,61 @@ writeFileSync(
 
 const spawn = (options: Parameters<typeof spawnServer>[0]) =>
   spawnServer(options);
+
+describe("a probe outliving its test run (A7-S review 2)", () => {
+  test("kills only what is still the process it recorded, then removes its own folder", async () => {
+    const loop = (): Bun.Subprocess =>
+      Bun.spawn({
+        cmd: [
+          "sh",
+          "-c",
+          `while kill -0 ${String(process.pid)} 2>/dev/null; do sleep 0.2; done`,
+        ],
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+    const reused = loop();
+    const recorded = loop();
+    const runner = Bun.spawn({
+      cmd: ["sleep", "0.5"],
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const fake = readyServer();
+    // One recorded under another start time — its number since handed to a new process —
+    // and one recorded as it is.
+    writeFileSync(
+      fake.pidFile,
+      `${String(reused.pid)} 1\n${String(recorded.pid)} ${startTimeOf(recorded.pid) ?? ""}\n`,
+    );
+    const probe = Bun.spawn({
+      cmd: [
+        fake.path,
+        `--pidfile=${fake.pidFile}`,
+        `--runner=${String(runner.pid)}`,
+        "--port=0",
+      ],
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    try {
+      await runner.exited;
+      const gone = await waitAllGone([probe.pid, recorded.pid], 3_000);
+      expect(gone).toEqual([]);
+      expect(alive(reused.pid)).toBe(true);
+      expect(readdirSync(SCRATCH_ROOT)).not.toContain(
+        fake.cwd.slice(SCRATCH_ROOT.length + 1),
+      );
+    } finally {
+      reused.kill("SIGKILL");
+      recorded.kill("SIGKILL");
+      probe.kill("SIGKILL");
+    }
+  });
+});
 
 describe("the password scrub at the spawn boundary", () => {
   test("the child is launched with --stdio and a piped stdin, and sees only the allowlist", async () => {

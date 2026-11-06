@@ -48,7 +48,16 @@ mkdirSync(SCRATCH_ROOT, { recursive: true });
 const BOUNDS: ReapBounds = { terminateGrace: 400, killGrace: 1_500, poll: 10 };
 
 const scratches: string[] = [];
-let spawned: number[] = [];
+/**
+ * What each test spawned, with its identity (`processIdentity`) as first seen: the teardown
+ * signals a pid only while it is still that process (A7-S review 2), never a later one that
+ * got the number.
+ */
+let spawned: { readonly pid: number; readonly identity: string | undefined }[] =
+  [];
+const own = (pid: number): void => {
+  spawned.push({ pid, identity: processIdentity(pid) });
+};
 
 /**
  * A stand-in's endless loop, **for as long as this test process lives** (A7-S review 1):
@@ -124,7 +133,7 @@ const sleeper = async (
     stderr: "ignore",
     detached: true,
   });
-  spawned.push(process_.pid);
+  own(process_.pid);
   const ready = await waitUntil(() => existsSync(readyFile));
   expect(ready).toBe(true);
   return { pid: process_.pid, childPidFile };
@@ -157,12 +166,17 @@ const reap = (directory: string) =>
   Effect.runPromise(reapOwnedProcesses(directory, BOUNDS));
 
 afterEach(async () => {
-  for (const pid of spawned) {
+  for (const { pid, identity } of spawned) {
+    const now = processIdentity(pid);
+    // Alive as another process: the number was handed on, and that one is not ours.
+    if (now !== undefined && identity !== undefined && now !== identity)
+      continue;
     try {
       process.kill(-pid, "SIGKILL");
     } catch {
       // Not a group leader, or already gone.
     }
+    if (now === undefined) continue;
     try {
       process.kill(pid, "SIGKILL");
     } catch {
@@ -297,7 +311,7 @@ describe("reapOwnedProcesses", () => {
       pid: probe.pid,
       command: "opencode serve --port=1",
     });
-    spawned.push(child);
+    own(child);
 
     await reap(directory);
 
@@ -459,7 +473,7 @@ describe("stopOwnedChild", () => {
       stderr: "ignore",
       detached: true,
     });
-    spawned.push(child.pid);
+    own(child.pid);
     const tree = trackProcessTree(child.pid, leadsOwnGroup(child.pid));
     expect(await waitUntil(() => existsSync(readyFile))).toBe(true);
     const stoppable = {
@@ -478,7 +492,7 @@ describe("stopOwnedChild", () => {
       true,
     );
     const pid = recordedChildPid(file) as number;
-    spawned.push(pid);
+    own(pid);
     return pid;
   };
 
@@ -515,7 +529,7 @@ describe("stopOwnedChild", () => {
 
     expect(outcome).toBe("killed");
     expect(late).toBeDefined();
-    if (late !== undefined) spawned.push(late);
+    if (late !== undefined) own(late);
     expect(
       late === undefined ? undefined : processIdentity(late),
     ).toBeUndefined();
@@ -531,7 +545,7 @@ describe("stopOwnedChild", () => {
       stderr: "ignore",
       detached: true,
     });
-    spawned.push(child.pid);
+    own(child.pid);
     const tree = trackProcessTree(child.pid, leadsOwnGroup(child.pid));
     const tool = await pidIn(toolFile);
     await child.exited;
