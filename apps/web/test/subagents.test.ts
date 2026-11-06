@@ -39,8 +39,15 @@ describe("sub-agent words (A7-S)", () => {
     expect(
       subagentMeta(view({ status: "failed", endedAt: 59_000 }), 999_999),
     ).toBe("failed at 58s");
-    expect(subagentMeta(view({ status: "stopped", startedAt: null }), 0)).toBe(
-      "stopped",
+    expect(
+      subagentMeta(view({ status: "stopped", startedAt: null, endedAt: 5 }), 0),
+    ).toBe("stopped");
+    expect(
+      subagentMeta(view({ status: "stopped", endedAt: 59_000 }), 999_999),
+    ).toBe("stopped at 58s");
+    // Gone with its session's harness, which kept no time for it (A7-S review 2).
+    expect(subagentMeta(view({ status: "stopped", endedAt: null }), 0)).toBe(
+      "stopped with the session",
     );
     expect(callsLabel(null)).toBe("");
   });

@@ -398,6 +398,40 @@ describe("Stop all, in Stop's place (A7-S, E7)", () => {
     expect(fake.countOf("stopImporterTurn")).toBe(0);
   });
 
+  test("A7-S review 2: a card a replay still draws running that bit cannot stop from here — dead work in a session nobody holds — is no reason for Stop all", async () => {
+    await continueWith(new FakeServer(), [
+      view({ callId: "toolu_dead", stop: "none" }),
+      FINISHED,
+    ]);
+    const pills = [
+      ...document.querySelectorAll<HTMLButtonElement>(".importer button.stop"),
+    ].filter((each) => each.closest(".card") === null);
+    expect(pills.map((each) => text(each))).toEqual([]);
+  });
+
+  test("A7-S review 2: a foreground one, which the turn's Stop takes with it, is", async () => {
+    await continueWith(new FakeServer(), [FOREGROUND]);
+    const pills = [
+      ...document.querySelectorAll<HTMLButtonElement>(".importer button.stop"),
+    ].filter((each) => each.closest(".card") === null);
+    expect(pills.map((each) => text(each))).toEqual(["Stop all"]);
+  });
+
+  test("A7-S review 2: a sub-agent stopped with its session's harness says so where its time would be", async () => {
+    await continueWith(new FakeServer(), [
+      view({
+        callId: "toolu_gone",
+        status: "stopped",
+        endedAt: null,
+        activity: null,
+        stop: "none",
+      }),
+    ]);
+    expect(text(document.querySelector(".card"))).toContain(
+      "stopped with the session",
+    );
+  });
+
   test("with no sub-agent running there is no Stop all", async () => {
     await continueWith(new FakeServer(), [FINISHED, FAILED]);
     const pills = [

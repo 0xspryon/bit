@@ -7533,6 +7533,94 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     });
   });
 
+  test("A7-S review 2: replay of a session continued under a new CLI: a background sub-agent the old CLI ran died with it, and has no Stop", async () => {
+    // The server restarted with CONTINUE_ON_START: the session is held again, by a CLI that
+    // never ran the sub-agent, which was never notified.
+    const stored = (await transcript()).filter(
+      (entry) => !JSON.stringify(entry).includes("<task-notification>"),
+    );
+    const entries = await withHarness(
+      {
+        transcript: stored,
+        messages: [result(SESSION, "success")],
+        stayOpen: true,
+      },
+      (harness) =>
+        Effect.gen(function* () {
+          yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            resume: SESSION,
+            multiTurn: true,
+          });
+          yield* harness.prompt(SESSION, "The server restarted.");
+          yield* Effect.sleep("30 millis");
+          return yield* harness.messages(SESSION);
+        }),
+    );
+    expect(
+      newest(entries.flatMap((entry) => entry.parts)).get(BACKGROUND),
+    ).toMatchObject({
+      status: "stopped",
+      stop: "none",
+      endedAt: null,
+      activity: null,
+    });
+  });
+
+  test("A7-S review 2: a background sub-agent this process's CLI ran, still running when the session was ended, stopped when the end closed it", async () => {
+    const live = (await frames()).filter(
+      (frame) =>
+        !(
+          frame.type === "system" &&
+          (frame.subtype === "task_notification" ||
+            frame.subtype === "task_updated") &&
+          (frame as { tool_use_id?: unknown }).tool_use_id === BACKGROUND
+        ) &&
+        (frame as { parent_tool_use_id?: unknown }).parent_tool_use_id !==
+          BACKGROUND,
+    );
+    const stored = (await transcript()).filter(
+      (entry) => !JSON.stringify(entry).includes("<task-notification>"),
+    );
+    const { before, after, held, entries } = await withHarness(
+      { transcript: stored, messages: live, stayOpen: true },
+      (harness) =>
+        Effect.gen(function* () {
+          const ref = yield* harness.createSession({
+            title: "conversation",
+            model: "claude-haiku-4-5",
+            directory: "/tmp/ws",
+            sessionId: SESSION,
+            multiTurn: true,
+          });
+          yield* harness.prompt(SESSION, "go");
+          yield* Effect.sleep("50 millis");
+          const held = newest(
+            (yield* harness.messages(SESSION)).flatMap((entry) => entry.parts),
+          ).get(BACKGROUND);
+          const before = Date.now();
+          yield* harness.endSession(ref);
+          const after = Date.now();
+          return {
+            before,
+            after,
+            held,
+            entries: yield* harness.messages(SESSION),
+          };
+        }),
+    );
+    // Held, its CLI runs it: running, with its own Stop.
+    expect(held).toMatchObject({ status: "running", stop: "own" });
+    const ended = newest(entries.flatMap((entry) => entry.parts)).get(
+      BACKGROUND,
+    );
+    expect(ended).toMatchObject({ status: "stopped", stop: "none" });
+    expect(ended?.endedAt).toBeGreaterThanOrEqual(before);
+    expect(ended?.endedAt).toBeLessThanOrEqual(after);
+  });
+
   test("live: a background sub-agent stays running past its turn's end, until its task's notification", async () => {
     // The measured order for a sub-agent still working when its turn ends (2.1.310, the
     // background-agent probe): its frames and its task's end arrive after the `result`.

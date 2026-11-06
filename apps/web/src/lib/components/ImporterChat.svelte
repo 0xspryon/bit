@@ -536,7 +536,14 @@
      */
     get stopAll() {
       return {
-        running: subagentsBy.running.length,
+        /*
+         * Only what bit can stop from here (A7-S review 2): a card a replay still draws
+         * running with no Stop of any kind — dead work in a session nobody holds — offered
+         * a Stop all the server could only answer with "nothing to stop".
+         */
+        running: subagentsBy.running.filter(
+          (entry) => entry.view.stop !== "none",
+        ).length,
         stop: () => void importer.stop(true),
         title: "Stop the importer's sub-agents, then its turn",
       };

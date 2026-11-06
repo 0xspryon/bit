@@ -5217,4 +5217,113 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
     // The replay's read is what a Stop finds now, and that is no running sub-agent.
     expect(answers.stop).toBe("not_running");
   });
+
+  test("A7-S review 2: replay after a restart: a child cut off by the shutdown — an aborted step, or no marker and not running — is stopped; one OpenCode still runs is not", async () => {
+    const recordedMessages = (await storedMessages()) as Record<
+      string,
+      unknown
+    >[];
+    const [user, assistant] = recordedMessages;
+    const tool =
+      (assistant?.["content"] as Record<string, unknown>[]).find(
+        (part) => part["type"] === "tool",
+      ) ?? {};
+    const launch = (callId: string, kid: string) => ({
+      ...tool,
+      id: callId,
+      name: "subagent",
+      state: {
+        status: "completed",
+        input: {
+          agent: "general",
+          description: `Sleep ${kid}`,
+          prompt: "sleep 30",
+          background: true,
+        },
+        content: [{ type: "text", text: "working in the background" }],
+        metadata: { sessionID: kid, status: "running" },
+      },
+    });
+    const parent = [
+      { ...user, id: "msg_u", text: "Sleep in the background, three times." },
+      {
+        ...assistant,
+        id: "msg_1",
+        content: [
+          launch("call_aborted", "ses_aborted"),
+          launch("call_gone", "ses_gone"),
+          launch("call_alive", "ses_alive"),
+        ],
+      },
+    ];
+    const working = (kid: string, extra: Record<string, unknown> = {}) => [
+      { ...user, id: `msg_${kid}_u`, sessionID: kid, text: "sleep 30" },
+      {
+        ...assistant,
+        id: `msg_${kid}_1`,
+        sessionID: kid,
+        ...extra,
+        content: [
+          {
+            ...tool,
+            id: `${kid}_k1`,
+            name: "shell",
+            state: {
+              status: "running",
+              input: { command: "sleep 30" },
+              metadata: {},
+            },
+          },
+        ],
+      },
+    ];
+    const { layer } = watched(
+      {
+        ses_1: parent,
+        ses_aborted: working("ses_aborted", {
+          time: { created: 1_793_347_011_000, completed: 1_793_347_012_000 },
+          error: { type: "aborted", message: "Step interrupted" },
+        }),
+        ses_gone: working("ses_gone"),
+        ses_alive: working("ses_alive"),
+      },
+      (path) =>
+        path === "/api/session/active"
+          ? json(activeSessions("ses_alive", "ses_aborted"))
+          : undefined,
+    );
+    const entries = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) => harness.messages("ses_1")),
+          layer,
+        ),
+      ),
+    );
+    const states = new Map(
+      entries
+        .flatMap((entry) => entry.parts)
+        .filter((part): part is SubagentState => part._tag === "subagent")
+        .map((part) => [part.callId, part]),
+    );
+    expect(states.get("call_aborted")).toMatchObject({
+      status: "stopped",
+      stop: "none",
+      endedAt: 1_793_347_012_000,
+      activity: null,
+    });
+    expect(states.get("call_gone")).toMatchObject({
+      status: "stopped",
+      stop: "none",
+      endedAt: null,
+      lines: [
+        { tool: "shell", input: "sleep 30", result: "stopped", failed: true },
+      ],
+    });
+    // Still running in OpenCode: running, and with nobody here holding it, no Stop.
+    expect(states.get("call_alive")).toMatchObject({
+      status: "running",
+      stop: "none",
+    });
+  });
 });

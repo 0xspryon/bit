@@ -1554,6 +1554,12 @@ export const openCodeChildNarration = (
  * at its session's end, whose notice was cancelled with the parent's inbox; read without
  * it, the card said `running` for ever. `interrupted` reads as stopped, `failed` as failed
  * with the harness's error, `succeeded` as finished with its last reply.
+ *
+ * **So does one whose newest entry is an aborted assistant message** (A7-S review 2): a
+ * child cut off by OpenCode's shutdown stores its step as `error: {type: "aborted"}`
+ * (`session/runner/step.ts`, "Step interrupted") and writes no marker after it, so a replay
+ * after a restart drew it running with a Stop all nobody could answer. Read as stopped,
+ * at the message's end.
  */
 const readChildMessages = (
   call: OpenCodeSubagentCall,
@@ -1576,6 +1582,9 @@ const readChildMessages = (
       error?: unknown;
     };
     const created = millisOf(record.time?.created);
+    const aborted =
+      record.type === "assistant" &&
+      (record.error as { type?: unknown } | undefined)?.type === "aborted";
     const completed = millisOf(record.time?.completed);
     if (created !== undefined) first ??= created;
     if (completed !== undefined || created !== undefined) {
@@ -1585,7 +1594,13 @@ const readChildMessages = (
     quiet =
       record.type === "idle"
         ? { outcome: record.outcome, at: created ?? null, error: record.error }
-        : undefined;
+        : aborted
+          ? {
+              outcome: "interrupted",
+              at: millisOf(record.time?.completed) ?? created ?? null,
+              error: undefined,
+            }
+          : undefined;
     if (record.type !== "assistant" || !Array.isArray(record.content)) continue;
     for (const part of record.content) {
       const item = (part ?? {}) as {
@@ -3224,6 +3239,11 @@ export const openCodeHarness = (
             { concurrency: 4, discard: true },
           );
           const live = subagents.live ?? false;
+          yield* endUnlistedChildren(
+            [...subagents.calls].flatMap(([callId, call]) =>
+              streamed?.calls.has(callId) === true ? [] : [call],
+            ),
+          );
           return newestSubagents(entries, (callId) => {
             const call =
               streamed?.calls.get(callId) ?? subagents.calls.get(callId);
@@ -3231,6 +3251,43 @@ export const openCodeHarness = (
               ? undefined
               : openCodeSubagentState(callId, call, live);
           });
+        });
+
+      /**
+       * A replay's sub-agents that this process's stream for the session does not follow —
+       * every one, for a session not held — are stopped when their messages leave them
+       * running and `session.active` does not list their child (A7-S review 2). No stream
+       * here will tell their cards, and a child OpenCode's shutdown cut off may have stored
+       * nothing that says so (no `idle` marker, and not always an aborted step): after a
+       * restart its card read running, with a Stop all nobody could answer. A resumed
+       * session's new stream never saw the children of the run before it either. One read
+       * for the replay, and only when such a child is left running; a read that fails
+       * leaves the cards as the messages drew them.
+       *
+       * The time it stopped is not known, so its card says it stopped with the session.
+       */
+      const endUnlistedChildren = (
+        calls: readonly OpenCodeSubagentCall[],
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const running = calls.filter(
+            (call) => call.status === "running" && call.child !== undefined,
+          );
+          if (running.length === 0) return;
+          const active = yield* Effect.result(
+            bounded("session.active", timeouts.control, api.session.active()),
+          );
+          if (active._tag === "Failure") {
+            yield* Effect.logWarning(
+              "which sessions OpenCode is running could not be read; a replayed sub-agent still running in its messages is drawn as running",
+              { detail: active.failure.message },
+            );
+            return;
+          }
+          for (const call of running) {
+            if (Object.hasOwn(active.success, call.child as string)) continue;
+            endOpenCodeSubagent(call, "stopped", null);
+          }
         });
 
       /**

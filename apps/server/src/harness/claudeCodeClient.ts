@@ -902,6 +902,12 @@ interface SessionRecord {
   /** The query has been closed; nothing more will arrive. */
   closed: boolean;
   /**
+   * When, in `Date.now()` milliseconds, this process closed the query, which takes the CLI
+   * and every sub-agent in it down: the time a sub-agent still running then stopped at
+   * (A7-S review 2), for its card. Undefined while open.
+   */
+  closedAt: number | undefined;
+  /**
    * The CLI subprocess, once the SDK has had this harness spawn it (`spawnOwnedCli`).
    *
    * Owned here rather than left to the SDK so that ending a session can stop it *now*:
@@ -3487,6 +3493,7 @@ export const claudeCodeHarness = (
         Effect.sync(() => {
           if (record.closed) return;
           record.closed = true;
+          record.closedAt = Date.now();
           Deferred.doneUnsafe(record.ended, Effect.void);
           record.release?.();
           // Wakes the input iterable, which may be parked on an empty queue: it checks
@@ -4297,6 +4304,7 @@ export const claudeCodeHarness = (
           quellFor: new Set<string>(),
           quellUntil: 0,
           closed: false,
+          closedAt: undefined,
           cli: undefined,
           stderrTail: "",
           cliFailed: false,
@@ -5118,26 +5126,58 @@ export const claudeCodeHarness = (
         return newestSubagents(flat, (callId) => {
           const call = record?.subagents.get(callId) ?? subagents.get(callId);
           if (call === undefined) return undefined;
+          const owned = ownedByCli(record, callId, call);
           return subagentState(
             callId,
-            live || call.status !== "running" ? call : endedWithCli(call),
-            live,
+            owned || call.status !== "running"
+              ? call
+              : endedWithCli(
+                  call,
+                  // Only this CLI's own sub-agent stopped when this process closed it.
+                  record?.subagents.has(callId) === true
+                    ? (record.closedAt ?? null)
+                    : null,
+                ),
+            owned,
           );
         });
       });
 
       /**
-       * A sub-agent still running when its transcript ends, in a session this process no
-       * longer holds, as **stopped** (A7-S review 1): a Claude Code sub-agent runs inside the
-       * CLI, and a session is let go of only with its CLI and process group stopped
+       * Whether the CLI this process runs for the session now is the one running a
+       * sub-agent: its stream followed the call ({@link SessionRecord.subagents}) or it holds
+       * the call's task ({@link SessionRecord.tasks}). **Not whether the session is held**
+       * (A7-S review 2): a session continued after a restart (`CONTINUE_ON_START`) is held
+       * by a new CLI, and a background sub-agent the old one ran died with it, never
+       * notified — held, it read as running with a Stop the CLI then refused.
+       */
+      const ownedByCli = (
+        record: SessionRecord | undefined,
+        callId: string,
+        call: SubagentCall,
+      ): boolean =>
+        record !== undefined &&
+        !record.closed &&
+        (record.subagents.has(callId) ||
+          (call.taskId !== undefined && record.tasks.has(call.taskId)));
+
+      /**
+       * A sub-agent still running when its transcript ends, and not run by the session's
+       * CLI now ({@link ownedByCli}), as **stopped** (A7-S review 1): a Claude Code sub-agent
+       * runs inside the CLI, and a CLI goes only with its process group stopped
        * (`endSession`) or with this server gone, which takes the CLI down too (see
        * {@link spawnOwnedCli}). A background one stopped that way is never notified, so its
-       * transcript alone would leave its card running for ever. A copy: the live record's
+       * transcript alone would leave its card running for ever. `at` is when this process
+       * closed the CLI, when it did; a CLI that went with an earlier server leaves no time,
+       * and the card says it stopped with the session (review 2). A copy: the live record's
        * call is left as it was.
        */
-      const endedWithCli = (call: SubagentCall): SubagentCall => {
+      const endedWithCli = (
+        call: SubagentCall,
+        at: number | null,
+      ): SubagentCall => {
         const ended: SubagentCall = { ...call, lines: [...call.lines] };
-        endSubagent(ended, "stopped", null);
+        endSubagent(ended, "stopped", at);
         return ended;
       };
 

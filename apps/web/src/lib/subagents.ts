@@ -78,9 +78,17 @@ export const callsLabel = (calls: number | null): string =>
 /**
  * The card's right-hand line, E7's: `1m 12s · 9 calls` while running or finished,
  * `failed at 0m 58s` for a failed one, `stopped at …` for a stopped one.
+ *
+ * A stopped one with no end time stopped when its session's harness went — a Claude Code
+ * CLI that went with an earlier server, an OpenCode child cut off by its server's shutdown —
+ * and the harness kept no time for it, so it says so (A7-S review 2) rather than a bare
+ * `stopped`.
  */
 export const subagentMeta = (view: SubagentView, now: number): string => {
   const clock = subagentClock(view, now);
+  if (view.status === "stopped" && view.endedAt === null) {
+    return "stopped with the session";
+  }
   if (view.status === "failed" || view.status === "stopped") {
     return clock === "" ? view.status : `${view.status} at ${clock}`;
   }
