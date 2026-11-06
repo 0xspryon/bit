@@ -1949,6 +1949,7 @@ const replayOf = (
           harnessSessionId: row.harnessSessionId,
           harnessInstanceId: row.harnessInstanceId,
           endedReason: row.endedReason,
+          endedAt: row.endedAt,
           confirmedAt: row.confirmedAt,
           agentId: row.agentId,
         },

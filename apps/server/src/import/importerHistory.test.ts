@@ -57,6 +57,7 @@ const recorded = (
   harnessSessionId: SESSION,
   harnessInstanceId: STUB_INSTANCE.instanceId,
   endedReason: null,
+  endedAt: null,
   confirmedAt: 1_700_000_000_000,
   agentId: "importer",
   ...over,
@@ -431,10 +432,15 @@ describe("an import the operator ended", () => {
         text: "",
         error: "Step interrupted",
         aborted: true,
+        at: 1_700_000_100_000,
+        endedAt: 1_700_000_100_050,
       }),
     ];
     const ended = await read({
-      recorded: recorded({ endedReason: "operator" }),
+      recorded: recorded({
+        endedReason: "operator",
+        endedAt: 1_700_000_100_000,
+      }),
       messages,
     });
     expect(ended.items.map((item) => `${item.headline}: ${item.body}`)).toEqual(
@@ -444,6 +450,19 @@ describe("an import the operator ended", () => {
       ],
     );
     expect(ended.items.some((item) => item.outcome === "failed")).toBe(false);
+    // A stop cut before the end was recorded — a Stop all's, say — is not the end's (A7-S
+    // review 3).
+    const earlier = await read({
+      recorded: recorded({
+        endedReason: "operator",
+        endedAt: 1_700_000_100_051,
+      }),
+      messages,
+    });
+    expect(earlier.items.at(-1)).toMatchObject({
+      headline: "error",
+      outcome: "failed",
+    });
     const shutdown = await read({
       recorded: recorded({ endedReason: "shutdown" }),
       messages,

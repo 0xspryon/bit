@@ -964,11 +964,16 @@ export const projectReplay = (input: {
   readonly users: ReplayUserEntries;
   readonly fallbackAt: number;
   /**
-   * The operator ended the session (A7-S review 2): a stop the harness recorded in its last
-   * turn ({@link MessageEntry.aborted}) is that end's, drawn as the turn's interrupt marker
-   * with {@link ENDED_STOP_NOTE}, not as an error the harness stopped the turn with.
+   * When the operator ended the session, in epoch milliseconds, or absent when they did not
+   * (A7-S reviews 2 and 3): a stop the harness recorded in its last turn
+   * ({@link MessageEntry.aborted}) that ended at or after this time is that end's, drawn as
+   * the turn's interrupt marker with {@link ENDED_STOP_NOTE}, not as an error the harness
+   * stopped the turn with. One that ended before it — a Stop's, a Stop all's, a restart's —
+   * keeps its own reading: review 3 saw a Stop all's aborted step relabelled by a later End.
+   * The end is recorded before anything is interrupted (`ScopeImporter.stop`), so every
+   * step the end's stop cut finished after it.
    */
-  readonly endedByOperator?: boolean;
+  readonly endedByOperatorAt?: number | undefined;
 }): ReplayProjection => {
   const items: LiveItem[] = [];
   let blank = 0;
@@ -995,10 +1000,11 @@ export const projectReplay = (input: {
   let turnErrors = new Set<string>();
   /**
    * Where the last turn starts — the newest message anybody sent — for the end's stop
-   * ({@link input.endedByOperator}); -1 when the operator did not end the session.
+   * ({@link input.endedByOperatorAt}); -1 when the operator did not end the session.
    */
   let lastTurn = -1;
-  if (input.endedByOperator === true) {
+  const endedAt = input.endedByOperatorAt;
+  if (endedAt !== undefined) {
     input.entries.forEach((entry, at) => {
       if (entry.type === "user" && entry.marker === undefined) lastTurn = at;
     });
@@ -1105,8 +1111,10 @@ export const projectReplay = (input: {
     if (
       entry.error !== undefined &&
       entry.aborted === true &&
-      input.endedByOperator === true &&
-      index > lastTurn
+      endedAt !== undefined &&
+      index > lastTurn &&
+      // When the step was cut: its end where the harness keeps one, else its start.
+      (entry.endedAt ?? entry.at ?? -Infinity) >= endedAt
     ) {
       // The stop the operator's end made, once, however many entries record it.
       if (!endStopDrawn) note(at, "interrupted", ENDED_STOP_NOTE, false);

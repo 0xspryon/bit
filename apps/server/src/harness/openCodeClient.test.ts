@@ -4770,7 +4770,7 @@ describe("the question dock's OpenCode half: forms (A7-Q)", () => {
 /* ── Stopping a sub-agent (A7-S) ─────────────────────────────────────────────── */
 
 describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => {
-  test("a sub-agent the stream saw start is stopped by interrupting its child, and Stop all asks each running one", async () => {
+  test("a sub-agent the stream saw start is stopped by interrupting its child, and Stop all leaves a foreground one to the parent's interrupt", async () => {
     const frame = (
       session: string,
       type: string,
@@ -4882,13 +4882,14 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
       before: "not_running",
       one: "stopped",
       nobody: "not_running",
-      // Still running as far as the stream knows (no end has come), so asked again.
-      all: ["call_a"],
+      // A foreground one: the parent's interrupt, the route's Stop next, stops it (A7-S
+      // review 3), so Stop all does not interrupt it on its own.
+      all: [],
     });
     const interrupts = recorded.urls.filter((url) =>
       url.includes("/interrupt"),
     );
-    expect(interrupts).toHaveLength(2);
+    expect(interrupts).toHaveLength(1);
     expect(
       interrupts.every((url) => url.includes("/api/session/ses_kid/interrupt")),
     ).toBe(true);
@@ -5018,7 +5019,16 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
     });
 
   test("A7-S review 1: Stop all stops a background child, which the turn's Stop would not reach", async () => {
-    const { layer, recorded, background } = watched();
+    const kid = (id: string) => sessionInfo({ id, parentID: "ses_1" }).data;
+    const { layer, recorded, background } = watched({}, (path) =>
+      path === "/api/session"
+        ? json({ data: [kid("ses_bg")], cursor: {} })
+        : path === "/api/session/active"
+          ? json(activeSessions("ses_1", "ses_bg"))
+          : path === "/api/session/ses_1/inbox"
+            ? json({ data: [] })
+            : undefined,
+    );
     const seen: SubagentState[] = [];
     const all = await Effect.runPromise(
       Effect.scoped(
@@ -5051,6 +5061,163 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
         .filter((url) => url.includes("/interrupt"))
         .map((url) => new URL(url).pathname),
     ).toEqual(["/api/session/ses_bg/interrupt"]);
+  });
+
+  /**
+   * Review 3's Stop all: a background and a foreground child running, and an operator
+   * message queued in the parent's inbox. The stub lists both children, keeps each running
+   * until it is interrupted, and enqueues the background one's notice once it is.
+   */
+  const stopAllStub = (refuse = false) => {
+    const stopped = new Set<string>();
+    const notice = {
+      id: "msg_n",
+      sessionID: "ses_1",
+      time: { created: 1_792_532_292_371 },
+      type: "synthetic",
+      payload: {
+        text: '<subagent sessionID="ses_bg" state="cancelled">\nSubagent cancelled\n</subagent>',
+        metadata: { source: "subagent", childID: "ses_bg", state: "cancelled" },
+      },
+      delivery: "steer",
+    };
+    const queued = {
+      id: "msg_u",
+      sessionID: "ses_1",
+      time: { created: 1_792_532_292_300 },
+      type: "user",
+      payload: { text: "and then the API hosts" },
+      delivery: "queue",
+    };
+    const kid = (id: string) => sessionInfo({ id, parentID: "ses_1" }).data;
+    return watched({}, (path, init) => {
+      if (path === "/api/session/ses_1/inbox") {
+        return json({
+          data: stopped.has("ses_bg") ? [queued, notice] : [queued],
+        });
+      }
+      if (path.includes("/inbox/") && init?.method === "DELETE") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (path === "/api/session") {
+        return json({ data: [kid("ses_fg"), kid("ses_bg")], cursor: {} });
+      }
+      if (path === "/api/session/active") {
+        return json(
+          activeSessions(
+            ...["ses_1", "ses_fg", "ses_bg"].filter((id) => !stopped.has(id)),
+          ),
+        );
+      }
+      const interrupted = /^\/api\/session\/([^/]+)\/interrupt$/.exec(
+        path,
+      )?.[1];
+      if (interrupted !== undefined) {
+        if (refuse && interrupted === "ses_bg") {
+          return Promise.resolve(new Response("down", { status: 503 }));
+        }
+        stopped.add(interrupted);
+        return json({ interrupted: true });
+      }
+      return undefined;
+    });
+  };
+
+  const stopAllWith = (stub: ReturnType<typeof stopAllStub>) => {
+    const seen: SubagentState[] = [];
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const reading = yield* follow(harness, seen);
+              yield* Effect.sleep("30 millis");
+              stub.background("call_bg", "ses_bg");
+              stub.foreground("call_fg", "ses_fg");
+              yield* until(
+                () =>
+                  seen.some((state) => state.background) &&
+                  seen.some(
+                    (state) => state.callId === "call_fg" && !state.background,
+                  ),
+              );
+              yield* Effect.sleep("20 millis");
+              const answer = yield* Effect.result(
+                harness.stopSubagents("ses_1"),
+              );
+              yield* Fiber.interrupt(reading);
+              return answer;
+            }),
+          ),
+          stub.layer,
+        ),
+      ),
+    );
+  };
+
+  const asked = (recorded: { urls: string[]; methods: string[] }) =>
+    recorded.urls
+      .map(
+        (url, index) =>
+          `${recorded.methods[index] ?? "?"} ${new URL(url).pathname}`,
+      )
+      .filter(
+        (call) => call.endsWith("/interrupt") || call.startsWith("DELETE"),
+      );
+
+  test("A7-S review 3: Stop all in the End's order: spares the foreground child for the parent's interrupt, stops the background one, lets its notice in and cancels only that notice; the operator's queued message stays", async () => {
+    const stub = stopAllStub();
+    const answer = await stopAllWith(stub);
+    expect(answer).toMatchObject({ _tag: "Success", success: ["call_bg"] });
+    // No foreground interrupt and no parent interrupt: the route's Stop sends that next.
+    expect(asked(stub.recorded)).toEqual([
+      "POST /api/session/ses_bg/interrupt",
+      "DELETE /api/session/ses_1/inbox/msg_n",
+    ]);
+  });
+
+  test("A7-S review 3: a background child that will not stop fails Stop all, after the others are seen to", async () => {
+    const stub = stopAllStub(true);
+    const answer = await stopAllWith(stub);
+    expect(answer._tag).toBe("Failure");
+    expect(asked(stub.recorded)).toEqual([
+      "POST /api/session/ses_bg/interrupt",
+    ]);
+  });
+
+  test("A7-S review 3: an end that finds no session (404) still lets go of the ended stream's sub-agents", async () => {
+    const { layer, recorded, background } = watched({}, (path) =>
+      path === "/api/session/ses_1/inbox"
+        ? Promise.resolve(new Response("{}", { status: 404 }))
+        : path === "/api/session"
+          ? Promise.resolve(new Response("down", { status: 503 }))
+          : path === "/api/session/active"
+            ? json(activeSessions("ses_bg"))
+            : undefined,
+    );
+    const seen: SubagentState[] = [];
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const reading = yield* follow(harness, seen);
+              yield* Effect.sleep("30 millis");
+              background("call_bg", "ses_bg");
+              yield* until(() => seen.some((state) => state.background));
+              yield* Fiber.interrupt(reading);
+              yield* harness.endSession({ id: "ses_1" });
+              // Only what bit still holds names the child: the list is down.
+              yield* harness.stopSubagents("ses_1");
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(recorded.urls.filter((url) => url.includes("/interrupt"))).toEqual(
+      [],
+    );
   });
 
   test("A7-S review 2: an end after the stream closed spares a foreground child, which the parent's interrupt stops, and waits only for the background one's notice", async () => {

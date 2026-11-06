@@ -1907,6 +1907,7 @@ const fleetHandlers = HttpApiBuilder.group(
             harnessSessionId: session.harnessSessionId,
             harnessInstanceId: session.harnessInstanceId,
             endedReason: session.endedReason,
+            endedAt: session.endedAt,
             confirmedAt: session.confirmedAt,
             agentId: session.agentId,
           },

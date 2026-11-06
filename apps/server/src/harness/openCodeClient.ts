@@ -3400,30 +3400,110 @@ export const openCodeHarness = (
       });
 
       /**
-       * Interrupts every running sub-agent's child session (E7's Stop all), before the
-       * parent's own Stop. The parent's interrupt reaches a foreground child too (the tool's
-       * `onInterrupt` interrupts it), but **not a background one**, which runs as an
-       * execution of its own; so each is asked here. A child that will not answer fails the
-       * whole: Stop all says so rather than claim everything stopped.
+       * Stops every running sub-agent's child session (E7's Stop all), in the End's order
+       * ({@link endSession}), before the route asks the parent's own Stop.
+       *
+       * 1. **A foreground child is spared**: the parent's interrupt, which the route's Stop
+       *    sends next, reaches it (the tool's `onInterrupt`), and its `subagent` call then
+       *    reads `aborted`, i.e. stopped.
+       * 2. **Every background child is interrupted**, since the parent's interrupt does not
+       *    reach one (it runs as an execution of its own). Children the server lists by
+       *    `parentID` that bit never saw are taken for background ones.
+       * 3. **Their notices are let in** ({@link settleChildNotices}, at most
+       *    {@link CHILD_NOTICE_SETTLE}),
+       * 4. **and cancelled from the parent's inbox** — only those notices, which this Stop
+       *    all caused ({@link cancelChildNotices}). The operator's own queued messages stay:
+       *    a Stop holds them for the next message (`AgentHarness.queuedOnInterrupt`), and
+       *    Stop all is a Stop. A notice from a child that ended on its own is not this Stop
+       *    all's either, and stays. (The End empties the whole inbox, since nothing may run
+       *    after it.)
+       * 5. The parent's interrupt is the route's Stop, next.
+       *
+       * Review 3 measured the order before this: each running child interrupted directly,
+       * a foreground one too, which failed the parent's call while the parent ran on; the
+       * parent opened a model step on that failure and the background child's notice, and
+       * the Stop then left it an empty aborted step, "Step interrupted".
+       *
+       * A child that will not answer fails the whole: Stop all says so rather than claim
+       * everything stopped. Answers the call ids of the children it stopped that bit knows.
+       *
+       * V2(chat): a parent that was idle — background children alone — is still woken by
+       * their notices, which reach it at once rather than wait in its inbox, for a turn the
+       * route's Stop then aborts (stored as an aborted step, as at an End).
        */
       const stopSubagents: AgentHarness["Service"]["stopSubagents"] = Effect.fn(
         "openCodeHarness.stopSubagents",
       )(function* (sessionId) {
-        const known =
-          streamedSubagents.get(sessionId) ?? replayedSubagents.get(sessionId);
-        const running = [...(known?.calls ?? new Map())].filter(
-          ([, call]) => call.status === "running" && call.child !== undefined,
+        const foreground = foregroundChildren(sessionId);
+        const since = Date.now();
+        const stopped = yield* stopRunningChildren(sessionId, foreground, true);
+        yield* settleChildNotices(
+          sessionId,
+          stopped.notifying,
+          since,
+          "stopAll",
         );
-        const stopped = yield* Effect.forEach(
-          running,
-          ([callId]) =>
-            Effect.map(stopSubagent(sessionId, callId), (answer) =>
-              answer === "stopped" ? [callId] : [],
-            ),
-          { concurrency: "unbounded" },
-        );
-        return stopped.flat();
+        yield* cancelChildNotices(sessionId as Session.ID, stopped.notifying);
+        const refused = stopped.refusals[0];
+        if (refused !== undefined) return yield* Effect.fail(refused);
+        const byChild = new Map<string, string>();
+        for (const subagents of [
+          streamedSubagents.get(sessionId),
+          replayedSubagents.get(sessionId),
+        ]) {
+          for (const [callId, call] of subagents?.calls ?? new Map()) {
+            if (call.child !== undefined && !byChild.has(call.child)) {
+              byChild.set(call.child, callId);
+            }
+          }
+        }
+        return stopped.interrupted.flatMap((child) => {
+          const callId = byChild.get(child);
+          return callId === undefined ? [] : [callId];
+        });
       });
+
+      /**
+       * Cancels the inbox notices of `children` waiting in `sessionID`'s inbox, and nothing
+       * else: Stop all's step 4 ({@link stopSubagents}). A list or a cancel that fails is
+       * logged — the route's Stop still interrupts the parent — and a notice already
+       * delivered is a no-op to cancel (`session.inbox.cancel`).
+       */
+      const cancelChildNotices = (
+        sessionID: Session.ID,
+        children: readonly string[],
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          if (children.length === 0) return;
+          const wanted = new Set(children);
+          const waiting = yield* bounded(
+            "session.inbox.list",
+            timeouts.control,
+            api.session.inbox.list({ sessionID }),
+          );
+          const notices = waiting.filter((item) => {
+            if (item.type !== "synthetic") return false;
+            const child = noticeChild(item.payload.metadata);
+            return child !== undefined && wanted.has(child);
+          });
+          yield* Effect.forEach(
+            notices,
+            (item) =>
+              bounded(
+                "session.inbox.cancel",
+                timeouts.control,
+                api.session.inbox.cancel({ sessionID, inboxID: item.id }),
+              ),
+            { discard: true },
+          );
+        }).pipe(
+          Effect.catch((failure) =>
+            Effect.logWarning(
+              "a stopped sub-agent's notice could not be taken out of its parent's inbox; the parent may answer it after the Stop all",
+              { sessionId: sessionID, detail: failure.message },
+            ),
+          ),
+        );
 
       /**
        * The forms this process answered or dismissed, by id, so the event that follows
@@ -3630,8 +3710,8 @@ export const openCodeHarness = (
        * parent's interrupt then stops. Measured live (A7-S fix round 1, 2.2.5, GLM 5.3
        * Flash): aborted 20 ms after it began, with no output, but stored as an aborted
        * step. The importer's replay reads that step, in the last turn of an import the
-       * operator ended, as the end's stop (`projectReplay`'s `endedByOperator`, A7-S review
-       * 2), not as the harness's error; the turn itself is still in OpenCode's store. V2
+       * operator ended, as the end's stop (`projectReplay`'s `endedByOperatorAt`, A7-S
+       * reviews 2 and 3), not as the harness's error; the turn itself is still in OpenCode's store. V2
        * could ask OpenCode for a way to cancel a background job without notifying.
        */
       const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
@@ -3639,6 +3719,18 @@ export const openCodeHarness = (
       )(function* (session) {
         const latest = latestRef.get(session.id);
         if (latest !== undefined && latest !== session) return;
+        /*
+         * The ended stream's sub-agents go however the end goes (A7-S review 3): a 404, a
+         * failed read or interrupt included. Nothing reads them after this ref's end — the
+         * session registry ends a session once — so a failure kept them for good.
+         */
+        yield* endOwned(session).pipe(
+          Effect.ensuring(Effect.sync(() => endedStreams.delete(session.id))),
+        );
+      });
+
+      /** {@link endSession} for the ref that is the session's latest, or one never handed out. */
+      const endOwned = Effect.fnUntraced(function* (session: SessionRef) {
         const sessionID = session.id as Session.ID;
         const first = yield* Effect.result(
           bounded(
@@ -3683,7 +3775,6 @@ export const openCodeHarness = (
         // Nothing of this session runs here now, so nothing of its sub-agents is live.
         streamedSubagents.delete(session.id);
         replayedSubagents.delete(session.id);
-        endedStreams.delete(session.id);
       });
 
       /**
@@ -3713,13 +3804,16 @@ export const openCodeHarness = (
         sessionId: string,
         children: readonly string[],
         since: number,
+        occasion: "end" | "stopAll" = "end",
       ): Effect.Effect<void> =>
         Effect.gen(function* () {
           if (children.length === 0) return;
           const missing = yield* awaitChildNotices(sessionId, children, since);
           if (missing.length > 0) {
             yield* Effect.logWarning(
-              "a background sub-agent stopped at the end of its session had not told its parent yet; the parent is interrupted anyway, and may wake once more for that notice",
+              occasion === "end"
+                ? "a background sub-agent stopped at the end of its session had not told its parent yet; the parent is interrupted anyway, and may wake once more for that notice"
+                : "a background sub-agent a Stop all stopped had not told its parent yet; the parent is stopped anyway, and may wake once more for that notice",
               { sessionId, children: missing },
             );
           }
@@ -3764,7 +3858,7 @@ export const openCodeHarness = (
        * `foreground` ones when `sparingForeground`, which the parent's interrupt stops — and
        * answers the ones it interrupted, and of those the ones whose stop sends the parent a
        * notice (all but the foreground ones). A child the server lists that bit never saw is
-       * taken for a background one. See {@link endSession}.
+       * taken for a background one. See {@link endSession} and {@link stopSubagents}.
        */
       const stopRunningChildren = (
         sessionId: string,
@@ -3773,6 +3867,10 @@ export const openCodeHarness = (
       ): Effect.Effect<{
         readonly interrupted: readonly string[];
         readonly notifying: readonly string[];
+        /** Each child interrupt that failed, logged: the End goes on, Stop all fails. */
+        readonly refusals: readonly (
+          HarnessTransportError | HarnessDecodeError
+        )[];
       }> =>
         Effect.gen(function* () {
           const known = [
@@ -3799,11 +3897,13 @@ export const openCodeHarness = (
             for (const child of listed.success.data) children.add(child.id);
           } else {
             yield* Effect.logWarning(
-              "an ending session's child sessions could not be listed; only the sub-agents bit saw are stopped",
+              "a session's child sessions could not be listed; only the sub-agents bit saw are stopped",
               { sessionId, detail: listed.failure.message },
             );
           }
-          if (children.size === 0) return { interrupted: [], notifying: [] };
+          if (children.size === 0) {
+            return { interrupted: [], notifying: [], refusals: [] };
+          }
           const active = yield* Effect.result(
             bounded("session.active", timeouts.control, api.session.active()),
           );
@@ -3822,23 +3922,27 @@ export const openCodeHarness = (
                 timeouts.control,
                 api.session.interrupt({ sessionID: child as Session.ID }),
               ).pipe(
-                Effect.map((result) => (result.interrupted ? [child] : [])),
+                Effect.map((result) => ({
+                  interrupted: result.interrupted ? [child] : [],
+                  refusals: [],
+                })),
                 Effect.catch((failure) =>
                   Effect.as(
                     Effect.logWarning(
-                      "a running sub-agent of an ending session would not stop; it may still be running",
+                      "a running sub-agent would not stop; it may still be running",
                       { sessionId, child, detail: failure.message },
                     ),
-                    [],
+                    { interrupted: [], refusals: [failure] },
                   ),
                 ),
               ),
             { concurrency: "unbounded" },
           );
-          const interrupted = answered.flat();
+          const interrupted = answered.flatMap((each) => each.interrupted);
           return {
             interrupted,
             notifying: interrupted.filter((child) => !foreground.has(child)),
+            refusals: answered.flatMap((each) => each.refusals),
           };
         });
 

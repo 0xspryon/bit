@@ -2462,39 +2462,92 @@ describe("projecting a replay", () => {
 
   test("A7-S review 2: a stop the harness recorded in the last turn of a session the operator ended is that end's: said neutrally, once; an earlier turn's, or any when the operator did not end it, is the harness's error", () => {
     const entries = [
-      entry({ text: "first" }),
-      entry({ type: "assistant", error: "Step interrupted", aborted: true }),
-      entry({ text: "second" }),
-      entry({ type: "assistant", text: "", parts: [] }),
-      entry({ type: "assistant", error: "Step interrupted", aborted: true }),
-      entry({ type: "idle", error: "Step interrupted", aborted: true }),
+      entry({ text: "first", at: 10 }),
+      entry({
+        type: "assistant",
+        error: "Step interrupted",
+        aborted: true,
+        at: 11,
+        endedAt: 12,
+      }),
+      entry({ text: "second", at: 20 }),
+      entry({ type: "assistant", text: "", parts: [], at: 21 }),
+      entry({
+        type: "assistant",
+        error: "Step interrupted",
+        aborted: true,
+        at: 22,
+        endedAt: 101,
+      }),
+      entry({
+        type: "idle",
+        error: "Step interrupted",
+        aborted: true,
+        at: 102,
+      }),
       // A real failure in the same turn is still the harness's.
-      entry({ type: "assistant", error: "429 from the provider" }),
+      entry({ type: "assistant", error: "429 from the provider", at: 103 }),
     ];
-    const lines = (endedByOperator: boolean) =>
+    const lines = (endedByOperatorAt: number | undefined) =>
       projectReplay({
         entries,
         subject: { _tag: "import", importId: "imp_1" },
         harnessSessionId: "ses_1",
         users: "operator",
         fallbackAt: 0,
-        endedByOperator,
+        endedByOperatorAt,
       }).items.map((item) =>
         [item.kind, item.headline, item.body, item.outcome].join(" | "),
       );
-    expect(lines(true)).toEqual([
+    expect(lines(100)).toEqual([
       "turn.operator | You | first | ",
       "turn.other | error | Step interrupted | failed",
       "turn.operator | You | second | ",
       `turn.other | interrupted | ${ENDED_STOP_NOTE} | `,
       "turn.other | error | 429 from the provider | failed",
     ]);
-    expect(lines(false)).toEqual([
+    expect(lines(undefined)).toEqual([
       "turn.operator | You | first | ",
       "turn.other | error | Step interrupted | failed",
       "turn.operator | You | second | ",
       "turn.other | error | Step interrupted | failed",
       "turn.other | error | 429 from the provider | failed",
+    ]);
+  });
+
+  test("A7-S review 3: a stop that ended before the operator's end — a Stop all's, a restart's — keeps its own reading in the last turn; only one cut at or after the end is the end's", () => {
+    const lines = projectReplay({
+      entries: [
+        entry({ text: "go", at: 10 }),
+        // Stop all, two seconds before the end: OpenCode's aborted step, stored at once.
+        entry({
+          type: "assistant",
+          error: "Step interrupted",
+          aborted: true,
+          at: 11,
+          endedAt: 98,
+        }),
+        // A step started before the end and cut by it: its end is what counts.
+        entry({
+          type: "assistant",
+          error: "Step interrupted",
+          aborted: true,
+          at: 99,
+          endedAt: 100,
+        }),
+      ],
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+      endedByOperatorAt: 100,
+    }).items.map((item) =>
+      [item.kind, item.headline, item.body, item.outcome].join(" | "),
+    );
+    expect(lines).toEqual([
+      "turn.operator | You | go | ",
+      "turn.other | error | Step interrupted | failed",
+      `turn.other | interrupted | ${ENDED_STOP_NOTE} | `,
     ]);
   });
 

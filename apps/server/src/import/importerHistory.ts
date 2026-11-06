@@ -109,6 +109,12 @@ export interface RecordedImportSession {
   readonly harnessSessionId: string;
   readonly harnessInstanceId: string | null;
   readonly endedReason: ImporterSessionEndReason | null;
+  /**
+   * When the import's authority ended, in epoch milliseconds, `null` while it has not
+   * (`0026`). What tells the stop the operator's end made from an earlier one (A7-S review
+   * 3; `projectReplay`'s `endedByOperatorAt`).
+   */
+  readonly endedAt: number | null;
   /** `null` while the harness never confirmed creating the session. See the header. */
   readonly confirmedAt: number | null;
   /** The agent the session runs as (`0002`). See {@link importSessionAgent}. */
@@ -649,7 +655,9 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
     harnessSessionId: sessionId,
     users: "operator",
     fallbackAt: at,
-    endedByOperator: ended,
+    ...(ended && input.recorded.endedAt !== null
+      ? { endedByOperatorAt: input.recorded.endedAt }
+      : {}),
   });
   if (items.length === 0) {
     return standing(
