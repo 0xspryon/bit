@@ -351,26 +351,38 @@ mount it. Nothing outside the importer mounts it yet, and the importer looks and
 before: its DOM suites pass unchanged, except that the composer-border test now compiles
 `ChatComposer.svelte`, where the box's CSS moved.
 
+**Review 1 fixes (2026-11-06).** The question dock now takes the composer's slot instead of
+sitting above it (E3). The sub-agents chip moved from a `Chat` header row to the app's
+title bar (E8). The shell gained `aside` for E8's panel and `controls` for E7's "Stop all".
+A closed composer is its reason alone. The hidden file input is no longer a Tab stop. U13
+review 6's leftovers were folded in: the reconnect notice is cleared when its import ends or
+a message opens or resumes it, and `lost` now comes after ~31.5 s (`RESUBSCRIBE_LOST_AFTER` 7).
+
 **What was extracted.**
 
-- `apps/web/src/lib/chatShell.ts` holds the adapter types (`ChatSession`, `ChatComposerSource`,
-  `ChatTurnState`, `ChatWords`, `ComposerNotice`, `ComposerSendNow`) and the turn shape
-  `ThreadTurn`. `ImporterTurn` is now an alias of `ThreadTurn`. The module also holds the
+- `apps/web/src/lib/chatShell.ts` holds the adapter types (`ChatSession`, `ChatComposerSource`
+  = `OpenChatComposer | ClosedChatComposer`, `ChatQuestion`, `ChatTurnState`, `ChatWords`,
+  `ComposerNotice`, `ComposerSendNow`) and the turn shape `ThreadTurn`. `ImporterTurn` is now an alias of `ThreadTurn`. The module also holds the
   rules the shell needs: `turnFooterText`, `replyText`, `clockLabel`, `composerCanSend` and
   `stopOffered`.
 - `components/ChatShell.svelte` wraps `Chat` with `layout="thread"`. It draws the operator's
   bubble, the streaming cursor, the turn footer, Stop with an optional elapsed clock, the
-  composer column, the drop of files on the panel, and the two F2 dialogs (a refused file,
-  a refused Stop). It also sets the attachment loader.
-- `components/ChatComposer.svelte` is the box: notices, tray, textarea, `+`, Send now,
-  arrow and count. It has three states:
+  composer column with the sentences above the box, the drop of files on the panel, and the
+  two F2 dialogs (a refused file, a refused Stop). It also sets the attachment loader.
+- `components/ChatComposer.svelte` is the box: tray, textarea, `+`, Send now, arrow and
+  count. It has three states:
   - **open**;
   - **blocked**: the input is disabled and the placeholder says why (the importer's
     stranded, ended and refused sessions);
   - **closed**: a reason sentence takes the input's place, and there is no `+` and no
-    send.
-- `Chat.svelte` has two new optional snippets: `header` (a region at the top) and
-  `subagent` (one sub-agent row, wrapped in `li.subagent-card`, which replaces U14's entry).
+    send. A closed source is `{ closed: "…" }` and nothing else; the importer's composer
+    is typed `OpenChatComposer`, so the compiler checks it supplies every field.
+- `Chat.svelte` has one new optional snippet, `subagent` (one sub-agent row, wrapped in
+  `li.subagent-card`, which replaces U14's entry).
+- `titleBarChips.svelte.ts` and `TitleBarChipSlot.svelte`: the page (`+page.svelte`)
+  provides one holder by context, `TitleBar` draws whatever is placed in it between the
+  context meter and the session chip, and a chat places a chip for as long as it is
+  mounted.
 - `ImporterChat.svelte` is now the importer's adapter. Its own parts are the starters
   (`below`), and the agent chip, model picker and caption (`strip`). The importer also keeps
   the switch notices and every sentence about why a session cannot be continued. Parked
@@ -384,10 +396,28 @@ extension of it, as getters over the chat's own state. Then render
 - `separator`, `tail` and `footer` override a turn's bubble, cursor and footer, for example
   for a planner round's status heading.
 - `strip` fills the composer strip and `below` goes under the composer.
-- `dock` is **A7-Q's question dock**. It is drawn above the composer, including a closed
-  one, and stays usable there.
-- `header` is **A7-S's sub-agents chip**, and `subagent` is **A7-S's card**, called per
-  folded row.
+- `dock` is **A7-Q's question dock**, drawn **in the composer's slot** (E3) while the
+  session's `question` is set: the box, open or closed with its reason, is not drawn; the
+  dock is, in the same column and width. Stop, the elapsed clock and the sentences above
+  the box stay where they were. Esc in the dock calls `question.dismiss()` unless the dock's
+  own control kept the key (`preventDefault`); once the adapter clears `question`
+  (dismissed, or answered on the server) the box is back and, if focus went with the dock,
+  is focused. A dismissed question still waits on the server (E3's "reply in chat
+  instead"); the snippet gets the `ChatQuestion` so the dock can offer that too.
+- `controls` sits beside Stop: **E7's "Stop all"**. It is drawn whether or not Stop is.
+- `chip` is **E8's sub-agents chip**. The shell places it in the app's title bar beside the
+  session chip, not in the chat.
+- `aside` is **E8's 400px panel**, beside the chat column (`.chat-shell` is a row:
+  `.column`, then `aside.aside`), which narrows the column rather than covering it.
+- `subagent` is **A7-S's card**, called per folded row.
+
+**The panel at tablet width (decision, 2026-11-06).** E8 has no note for narrow widths.
+Measured live with a 400px region in the shell: at 1024 px with the rail showing the chat
+column is 392 px (box 328 px). It still works, but the model chip is ellipsed and the
+strip's caption drops out. With the rail hidden it is 624 px (box 560 px), and at 1440 px
+it is 808 px. So **A7-S hides the rail while the panel is open whenever the column would
+otherwise be under 560 px** (1024 px and similar), and gives it back on close. The panel
+still reflows the chat, as E8 says, and is never an overlay.
 
 All of the A7 slots are empty today. Leaving a field out means the chat cannot do that
 thing:
@@ -395,8 +425,11 @@ thing:
 - no `stop` means no Stop;
 - no `composer.sendNow` means no Send now;
 - no `composer.files` means no `+`, no paste and no drop;
-- no `composer` means a read-only thread (unless there is a `dock` or a `below`);
-- `turn.since` set means an elapsed clock beside Stop.
+- no `composer` means a read-only thread (unless a `question` is docked or there is a
+  `below`);
+- no `question` means the box is drawn;
+- `turn.since` set means an elapsed clock beside Stop, and `words.elapsedLead` puts the
+  chat's words before it (the planner's "Planning for", a worker's "Running for").
 
 **The adapter each role needs.**
 
@@ -406,13 +439,16 @@ thing:
   kept. The adapter turns the goal conversation's replay and live items into `ThreadTurn`
   groups, the way `buildImporterChat` does for the importer. Its composer is the goal's
   draft and files, with `send` passing `urgency`. `stop` calls `stopGoalTurn`.
-- **Planner.** `groups` has one `ThreadTurn` per round, with `message: null` or the round's
+- **Planner.** It becomes a page-layout chat (`layout="thread"` through the shell), not
+  `PlannerChat`'s panel, with the shell's clock beside Stop in place of its own running
+  strip. `groups` has one `ThreadTurn` per round, with `message: null` or the round's
   objective, plus a `separator` override for the round's status. The composer is
-  `closed: "Steered from the goal chat"`. `stop` calls `stopRound`, and `turn.since` is the
-  round's `startedAt`.
-- **Worker.** One turn whose `message` is the intent's question, from the attempt
-  transcript. The composer is `closed: "The prompt is the intent's question"`. `stop` calls
-  `stopRun`, and `turn.since` is the attempt's start.
+  `{ closed: "Steered from the goal chat" }`. `stop` calls `stopRound`, `turn.since` is the
+  round's `startedAt`, and `words.elapsedLead` is "Planning for".
+- **Worker.** Also a page-layout chat with the shell's clock, in place of `ComposeBox`'s
+  strip. One turn whose `message` is the intent's question, from the attempt transcript.
+  The composer is `{ closed: "The prompt is the intent's question" }`. `stop` calls
+  `stopRun`, `turn.since` is the attempt's start, and `words.elapsedLead` is "Running for".
 
 **What is missing per role on the server and in the web state.** The live frames are not
 in this list. `LiveItem`, `LiveUsage`, `LiveTurnEnded` and `LiveConnection` all carry
@@ -454,6 +490,17 @@ F1, F2, F3, F4, F5, F6, F7, F8, F10, F9, U1, U10, U14, U12, U11, U2, U7, U3, U4,
 U8, U8b, U13, A7-Q, A7-S, F12.
 
 ## Known issues found along the way (not in any slice)
+
+- **By design for V1 (U13 review 6).** A pasted line that names one of this session's own
+  uploads in T3's attachment-line format is drawn as words live, but a replay after a
+  reload reads it as a chip for that file, and the paragraph break around it collapses.
+  Only this session's stored uploads are ever chips, so nothing outside the session can be
+  named this way. The V2 gate refusal is where forged lines are refused.
+- **V2 (U13 review 6).** No stall timer on OpenCode's event stream: OpenCode sends a
+  heartbeat every 15 s, but a connection that stays open and goes quiet is neither an end
+  nor a failure, so it never shows `reconnecting` and the chat shows no notice while
+  narration has stopped. Recorded as a `V2(chat):` note at `resubscribing`
+  (`harness/openCodeEvents.ts`).
 
 - The **built** server (`bun dist/main.js`) cannot open Claude Code sessions: it refuses
   `import_ungated` because it resolves the policy hook at `apps/plugins/claudeCodeGate.ts`,
