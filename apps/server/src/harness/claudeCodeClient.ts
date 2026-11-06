@@ -3512,6 +3512,9 @@ export const claudeCodeHarness = (
                   ...(record.multiTurn && record.operatorQuestions
                     ? {
                         canUseTool: refuseEveryPrompt,
+                        // See `QUESTION_SESSION_DISALLOWED_TOOLS`: registering
+                        // `canUseTool` also offers plan mode, which cannot work here.
+                        disallowedTools: [...QUESTION_SESSION_DISALLOWED_TOOLS],
                         hooks: { PreToolUse: [answerHook(record)] },
                       }
                     : {}),
@@ -4787,6 +4790,29 @@ interface HeldQuestion {
 const QUESTION_HOOK_TIMEOUT_SECONDS = 86_400;
 
 /**
+ * The tools a question session is not offered, though registering {@link refuseEveryPrompt}
+ * makes the CLI offer them: plan mode's way in and out.
+ *
+ * Measured on CLI 2.1.310 (A7-Q review 1, the init tool lists diffed): registering
+ * `canUseTool` adds `AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` to a session's
+ * tools, and nothing else. Plan mode cannot work under bit's `dontAsk` + gate regime: the
+ * gate allows `EnterPlanMode`, the session's mode moves from `dontAsk` to `plan`, and from
+ * then on every gate-allowed Write and MCP call is put to `canUseTool` — which refuses it,
+ * as it must, since bit asks no one to approve a call — and `ExitPlanMode` is refused the
+ * same way, so the session stays stuck there. Disallowing both (measured) removes them,
+ * keeps `AskUserQuestion`, keeps the mode `dontAsk`, and `canUseTool` is then never called.
+ *
+ * This is no departure from running the CLI as the operator would: a session without
+ * `operatorQuestions` registers no `canUseTool`, is offered neither tool already, and is
+ * left exactly as it was. A question session is offered what that session is, plus
+ * `AskUserQuestion`.
+ */
+const QUESTION_SESSION_DISALLOWED_TOOLS = [
+  "EnterPlanMode",
+  "ExitPlanMode",
+] as const;
+
+/**
  * The permission prompt a conversation registers, and why it answers no to everything.
  *
  * **Registered only so the CLI offers `AskUserQuestion` at all.** Measured on CLI 2.1.310
@@ -4800,6 +4826,11 @@ const QUESTION_HOOK_TIMEOUT_SECONDS = 86_400;
  * called, though the policy gate had answered `allow`). So it loosens nothing: the gate
  * stays the only thing that pre-approves a call, as `permissionMode: "dontAsk"` demands, and
  * a call the gate did not allow is refused here too rather than becoming a prompt.
+ *
+ * Nothing may rely on it beyond making `AskUserQuestion` offered. The one way measured to
+ * reach it is plan mode (the session leaves `dontAsk`), which
+ * {@link QUESTION_SESSION_DISALLOWED_TOOLS} keeps out; were it reached some other way, it
+ * refuses, so the failure is a refused call rather than a loosened one.
  */
 const refuseEveryPrompt: CanUseTool = (toolName) =>
   Promise.resolve({
@@ -4835,7 +4866,9 @@ const refuseEveryPrompt: CanUseTool = (toolName) =>
  * So the policy gate is unchanged, the permission mode is unchanged, and the gate is still
  * asked about and can still refuse every call this answers. What is added is an in-process
  * `PreToolUse` callback whose matcher is `AskUserQuestion` alone, which parks the call
- * until the operator answers or dismisses it, and the no-op {@link refuseEveryPrompt}.
+ * until the operator answers or dismisses it, the no-op {@link refuseEveryPrompt}, and
+ * plan mode kept out ({@link QUESTION_SESSION_DISALLOWED_TOOLS}), which registering it
+ * would otherwise offer.
  *
  * V2(chat): the gate is asked at the same moment as this hook, and its answer is not known
  * here, so a question the gate refuses is still shown and can be answered, and only then does
@@ -4846,7 +4879,13 @@ const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
   timeout: QUESTION_HOOK_TIMEOUT_SECONDS,
   hooks: [
     (hookInput, toolUseId, { signal }) => {
-      if (hookInput.hook_event_name !== "PreToolUse")
+      // The matcher already holds this hook to `AskUserQuestion` (measured: it did not fire
+      // for an MCP tool of that name); checked again so that a matcher the CLI ever reads
+      // differently answers nothing — no decision — for any other tool.
+      if (
+        hookInput.hook_event_name !== "PreToolUse" ||
+        hookInput.tool_name !== CLAUDE_CODE_QUESTION_TOOL
+      )
         return Promise.resolve({});
       const input = hookInput.tool_input;
       const id = toolUseId ?? hookInput.tool_use_id;

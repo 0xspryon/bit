@@ -8463,6 +8463,8 @@ describe("the question dock's Claude Code half: AskUserQuestion (A7-Q)", () => {
             (matcher) => matcher.matcher,
           ),
           timeout: options?.hooks?.PreToolUse?.[0]?.timeout,
+          disallowed: options?.disallowedTools,
+          keys: Object.keys(options ?? {}),
           decision,
         };
       }),
@@ -8472,6 +8474,9 @@ describe("the question dock's Claude Code half: AskUserQuestion (A7-Q)", () => {
     expect(offered.matchers).toEqual(["AskUserQuestion"]);
     expect(offered.timeout).toBe(86_400);
     expect(offered.decision).toMatchObject({ behavior: "deny" });
+    // Registering `canUseTool` also offers plan mode, which would leave `dontAsk` and put
+    // every gate-allowed Write and MCP call to the refusing prompt (A7-Q review 1).
+    expect(offered.disallowed).toEqual(["EnterPlanMode", "ExitPlanMode"]);
 
     const notOffered = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {
@@ -8479,11 +8484,53 @@ describe("the question dock's Claude Code half: AskUserQuestion (A7-Q)", () => {
         return {
           canUseTool: driver.seen.options?.canUseTool,
           hooks: driver.seen.options?.hooks,
+          disallowed: driver.seen.options?.disallowedTools,
+          mode: driver.seen.options?.permissionMode,
+          keys: Object.keys(driver.seen.options ?? {}),
         };
       }),
     );
     expect(notOffered.canUseTool).toBeUndefined();
     expect(notOffered.hooks).toBeUndefined();
+    expect(notOffered.disallowed).toBeUndefined();
+    expect(notOffered.mode).toBe("dontAsk");
+    // The question setup is these three options and nothing else: no other option rides on
+    // the refusing prompt, and a session without it is left as the operator would run it.
+    expect(
+      offered.keys.filter((key) => !notOffered.keys.includes(key)).sort(),
+    ).toEqual(["canUseTool", "disallowedTools", "hooks"]);
+    expect(
+      notOffered.keys.filter((key) => !offered.keys.includes(key)),
+    ).toEqual([]);
+  });
+
+  test("the answer hook decides nothing for a tool other than AskUserQuestion, should the CLI ever call it for one", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const hook = driver.seen.options?.hooks?.PreToolUse?.[0]?.hooks[0];
+        if (hook === undefined) throw new Error("no AskUserQuestion hook");
+        // An MCP tool of the same shape and a near name: the input is a real question.
+        const output = yield* Effect.promise(() =>
+          hook(
+            {
+              hook_event_name: "PreToolUse",
+              tool_name: "mcp__probe__AskUserQuestion",
+              tool_input: INPUT,
+              tool_use_id: "toolu_mcp",
+              session_id: ASKS,
+              transcript_path: "/tmp/t.jsonl",
+              cwd: "/tmp/import",
+            } as never,
+            "toolu_mcp",
+            { signal: new AbortController().signal },
+          ),
+        );
+        return { output, pending: yield* harness.pendingQuestions(ASKS) };
+      }),
+    );
+    expect(outcome.output).toEqual({});
+    expect(outcome.pending).toEqual([]);
   });
 
   test("a question waits in the session until answered: listed, narrated, and the tool allowed with the answers by question text, a choose-any comma-joined", async () => {
