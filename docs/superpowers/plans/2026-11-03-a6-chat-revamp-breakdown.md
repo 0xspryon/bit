@@ -423,7 +423,7 @@ warning dot (E6's "each surface keeps its own local signal") is not drawn.
   after that, reload the page to check.
 - **A failed re-list after `restored` no longer empties Needs you.** Needs you no longer
   clears on `restored`. The OpenCode driver re-lists, and narrates `questionSettled`
-  (`withdrawn`) only for a question a *successful* list no longer holds. A failed list says
+  (`withdrawn`) only for a question a _successful_ list no longer holds. A failed list says
   nothing.
 - **Input methods.** `composing(event)` (`isComposing`, or `keyCode` 229) guards every Enter
   and Esc on a text field in the chat: the dock, the shell's Esc, the composer's
