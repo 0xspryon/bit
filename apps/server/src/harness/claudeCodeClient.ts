@@ -5091,6 +5091,14 @@ export const claudeCodeHarness = (
        * turn, whose result names none — the listed sub-agent whose prompt it was given. A
        * sub-agent the session's live record already follows is left to it. A transcript
        * that cannot be read leaves its card as the parent's transcript drew it.
+       *
+       * V2(chat): each replay reads every replayed sub-agent's whole transcript
+       * (`getSubagentMessages` parses the file entire), and a replay is read at every turn's
+       * end. Measured in A7-S review 1 on a 35 MB sub-agent transcript: 40–70 ms and ~100 MB
+       * of RSS per read. V1 accepts it: a sub-agent's transcript is rarely that large, and
+       * the cost is one read per card per replay. V2 could keep what was read of a sub-agent
+       * that has ended (its lines, count, last text and times are fixed from then on) by
+       * agent id, so a later replay asks nothing, or read only the transcript's tail.
        */
       const readSubagents = (
         sessionId: string,
