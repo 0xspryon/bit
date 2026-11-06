@@ -169,16 +169,20 @@
   }
 
   function closePanel(): void {
+    // Asked before the panel goes: focus in it would otherwise fall to the page's body.
+    const active = document.activeElement;
+    const inPanel =
+      active !== null &&
+      (document.getElementById("subagent-panel")?.contains(active) ?? false);
     panelOpen = false;
     if (railTakenByPanel) {
       railTakenByPanel = false;
       // Given back only if the operator did not show it again meanwhile.
       if (app.drawerHidden) app.drawerHidden = false;
     }
-    // Back to the chip that opened it, when focus was in the panel.
-    const active = document.activeElement;
-    if (active === null || active === document.body || !active.isConnected) {
-      chipButton?.focus();
+    // Back to the chip that opened it, when focus was in the panel or nowhere.
+    if (inPanel || active === null || active === document.body) {
+      void tick().then(() => chipButton?.focus());
     }
   }
 

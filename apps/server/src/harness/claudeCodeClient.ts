@@ -1828,9 +1828,9 @@ const subagentFrame = (
       moved = call.lines.some((each) => each.id === id) || moved;
     }
   }
-  return moved && call.status === "running"
-    ? [subagentState(callId, call)]
-    : [];
+  // Said after its end too: a stopped sub-agent's call in flight is answered by the CLI's
+  // rejection a moment after its notification, which is what the replay reads as well.
+  return moved ? [subagentState(callId, call)] : [];
 };
 
 /**

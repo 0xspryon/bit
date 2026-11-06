@@ -480,6 +480,8 @@ describe("the sub-agents chip and panel (A7-S, E8)", () => {
     await settle();
     expect(panel()).toBeNull();
     expect(chip()?.getAttribute("aria-pressed")).toBe("false");
+    // Focus was in the panel: it goes back to the chip that opened it.
+    expect(document.activeElement?.className).toContain("subagents-chip");
     click(chip()!);
     await settle();
     click(panel()!.querySelector<HTMLButtonElement>(".close")!);
