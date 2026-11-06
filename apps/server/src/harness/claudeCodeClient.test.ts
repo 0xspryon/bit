@@ -7464,6 +7464,68 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     ).toEqual(new Set(["claude-haiku-4-5-20251001"]));
   });
 
+  test("A7-S review 1: live, a finished foreground card quotes the hand-back, as the replay does, not the sub-agent's last text block", async () => {
+    // The sub-agent's own last block says something before the report it hands back.
+    const recorded = (await frames()).map((frame) => {
+      const nested = frame as {
+        parent_tool_use_id?: unknown;
+        message?: { content?: unknown };
+      };
+      if (
+        nested.parent_tool_use_id !== FOREGROUND ||
+        !Array.isArray(nested.message?.content)
+      ) {
+        return frame;
+      }
+      return {
+        ...frame,
+        message: {
+          ...nested.message,
+          content: (nested.message.content as { type?: unknown }[]).map(
+            (part) =>
+              part.type === "text"
+                ? { ...part, text: "Done, here is the word." }
+                : part,
+          ),
+        },
+      } as unknown as SDKMessage;
+    });
+    expect(JSON.stringify(recorded)).toContain("Done, here is the word.");
+    let seen = 0;
+    const live = await narratedUntil(recorded, (entry) => {
+      if (entry.type === "result") seen += 1;
+      return seen === 2;
+    });
+    expect(
+      newest(live.map((entry) => entry.detail)).get(FOREGROUND)?.result,
+    ).toBe("PONG");
+  });
+
+  test("A7-S review 1: replay of a session not held: a background sub-agent never notified was stopped with its CLI, not running", async () => {
+    // The import was ended while the sub-agent ran: the CLI and its group were stopped, so
+    // no notification was ever written.
+    const stored = (await transcript()).filter(
+      (entry) => !JSON.stringify(entry).includes("<task-notification>"),
+    );
+    const entries = await withHarness({ transcript: stored }, (harness) =>
+      harness.messages(SESSION),
+    );
+    const parts = entries.flatMap((entry) => entry.parts);
+    expect(states(parts)).toEqual([
+      `${FOREGROUND} running general-purpose · Say PONG`,
+      `${FOREGROUND} finished general-purpose · Say PONG`,
+      // Its launch as the transcript has it, then its newest state, as now known.
+      `${BACKGROUND} running general-purpose · Say PING later`,
+      `${BACKGROUND} stopped general-purpose · Say PING later`,
+    ]);
+    expect(newest(parts).get(BACKGROUND)).toMatchObject({
+      status: "stopped",
+      stop: "none",
+      activity: null,
+      result: null,
+    });
+  });
+
   test("live: a background sub-agent stays running past its turn's end, until its task's notification", async () => {
     // The measured order for a sub-agent still working when its turn ends (2.1.310, the
     // background-agent probe): its frames and its task's end arrive after the `result`.

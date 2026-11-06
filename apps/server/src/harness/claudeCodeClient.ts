@@ -1673,8 +1673,11 @@ const subagentResult = (
       ? "stopped"
       : "failed";
   if (status === "finished") {
+    // The hand-back first, live as on a replay (which has only it): it is what the
+    // sub-agent returned, where its last text block may be a sentence before the report.
+    const report = handBackReport(text);
     call.result = capped(
-      call.lastText ?? handBackReport(text),
+      report !== "" ? report : (call.lastText ?? ""),
       SUBAGENT_RESULT_MAX,
     );
     const uses = toolUsesIn(text);
@@ -4992,11 +4995,29 @@ export const claudeCodeHarness = (
          */
         return newestSubagents(flat, (callId) => {
           const call = record?.subagents.get(callId) ?? subagents.get(callId);
-          return call === undefined
-            ? undefined
-            : subagentState(callId, call, live);
+          if (call === undefined) return undefined;
+          return subagentState(
+            callId,
+            live || call.status !== "running" ? call : endedWithCli(call),
+            live,
+          );
         });
       });
+
+      /**
+       * A sub-agent still running when its transcript ends, in a session this process no
+       * longer holds, as **stopped** (A7-S review 1): a Claude Code sub-agent runs inside the
+       * CLI, and a session is let go of only with its CLI and process group stopped
+       * (`endSession`) or with this server gone, which takes the CLI down too (see
+       * {@link spawnOwnedCli}). A background one stopped that way is never notified, so its
+       * transcript alone would leave its card running for ever. A copy: the live record's
+       * call is left as it was.
+       */
+      const endedWithCli = (call: SubagentCall): SubagentCall => {
+        const ended: SubagentCall = { ...call, lines: [...call.lines] };
+        endSubagent(ended, "stopped", null);
+        return ended;
+      };
 
       /**
        * Reads each replayed sub-agent's own transcript into its call (A7-S): by the task id
