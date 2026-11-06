@@ -884,17 +884,19 @@ interface SessionRecord {
    */
   readonly notified: Set<string>;
   /**
-   * The stopped sub-agents ({@link stoppedHere}) a Stop all armed a quell for: the CLI's
-   * own turn about them is stopped as it opens, once, and only if it is about nothing else
-   * ({@link notified}). An entry goes when its turn opens, and all go at
-   * {@link quellUntil} or when the operator's next message is accepted.
+   * The tasks a Stop all armed a quell for: the stopped sub-agents ({@link stoppedHere}) and
+   * every background task running as it armed, which its Stop then stops (A7-S review 3).
+   * The CLI's own turn about them is stopped as it opens, once, and only if it is about
+   * nothing else ({@link notified}). An entry goes when its turn opens or when its task
+   * ends other than `stopped`, and all go at {@link quellUntil} or when the operator's next
+   * message is accepted.
    */
   readonly quellFor: Set<string>;
   /**
    * Until when, in `Date.now()` milliseconds, {@link quellFor} holds; 0 when not armed.
-   * Armed by Stop all (`stopSubagents`) while {@link stoppedHere} holds a sub-agent (A7-S
-   * review 1): its notification turn was still to come after the Stop all, ~2.5 s later,
-   * and the agent answered about it. A bound, not the rule: before review 2 it was the
+   * Armed by Stop all (`stopSubagents`) while {@link stoppedHere} holds a sub-agent or a
+   * background task runs (A7-S reviews 1 and 3): a stopped sub-agent's notification turn
+   * was still to come after the Stop all, ~2.5 s later, and the agent answered about it. A bound, not the rule: before review 2 it was the
    * whole rule, and a timer the operator asked for after the Stop all had its own
    * notification turn stopped 4.4 s later.
    */
@@ -3362,6 +3364,9 @@ const trackTask = (record: SessionRecord, message: SDKMessage): void => {
     const tracked = record.tasks.get(message.task_id);
     if (lateRun(tracked, message.run_id)) return;
     if (tracked?.background === true) record.notified.add(message.task_id);
+    // A task that ended of its own, not stopped, is news the Stop all did not make: a turn
+    // about it is never quelled (A7-S review 3; `SessionRecord.quellFor`).
+    if (message.status !== "stopped") record.quellFor.delete(message.task_id);
     record.tasks.delete(message.task_id);
   }
 };
@@ -3789,7 +3794,7 @@ export const claudeCodeHarness = (
         record.interruptMoved = false;
         void Effect.runPromise(
           Effect.logInfo(
-            "a turn Claude Code opened on its own after a Stop all, to tell the agent of a sub-agent a card's Stop had stopped, is stopped as it opens",
+            "a turn Claude Code opened on its own after a Stop all, to tell the agent of background work that was stopped, is stopped as it opens",
             { sessionId: record.sessionId, tasks: about },
           ),
         ).catch(() => undefined);
@@ -5488,20 +5493,31 @@ export const claudeCodeHarness = (
        * come** (A7-S review 1, measured: ~2.5 s after the Stop all, and haiku answered it).
        * So Stop all arms {@link SessionRecord.quellFor} with those sub-agents, and the pump
        * stops the turn about them as it opens ({@link turnOpened}).
+       *
+       * **And with every background task running as it arms** (A7-S review 3, measured
+       * twice): the turn's Stop stops them — a background sub-agent by `interrupt()`, a
+       * background Bash by `stopTask` — and when one's `task_notification` lands before the
+       * card-stopped sub-agent's turn opens, that turn is about both. Armed with the stopped
+       * sub-agent alone, it was not all armed, and haiku answered it. A task that starts
+       * after the Stop all is not armed, and one that then ends other than `stopped` leaves
+       * the quell ({@link trackTask}): neither is the Stop all's doing.
        */
       const stopSubagents: AgentHarness["Service"]["stopSubagents"] = (
         sessionId,
       ) =>
         Effect.sync(() => {
           const record = sessions.get(sessionId);
-          if (
-            record !== undefined &&
-            !record.closed &&
-            record.stoppedHere.size > 0
-          ) {
+          if (record === undefined || record.closed) return [];
+          // The stopped sub-agents, and every background task still running: the turn's
+          // Stop, which comes next, stops those, so their notifications are this Stop
+          // all's doing too (A7-S review 3).
+          const armed = new Set(record.stoppedHere);
+          for (const [taskId, task] of record.tasks) {
+            if (task.background) armed.add(taskId);
+          }
+          if (armed.size > 0) {
             record.quellFor.clear();
-            for (const taskId of record.stoppedHere)
-              record.quellFor.add(taskId);
+            for (const taskId of armed) record.quellFor.add(taskId);
             record.quellUntil = Date.now() + notificationQuellMillis;
           }
           return [];
