@@ -204,8 +204,8 @@ export class GoalBriefingCeiling extends Context.Service<
  *   can be opened on it. The detail names both numbers; a planner is never given a
  *   shortened briefing.
  * - `harness_unavailable` — there is no agent harness, or it would not take a session, or
- *   the round's directory could not be made or gated. A round is refused rather than run
- *   ungated.
+ *   the round's directory could not be made or would sit inside the workspace. A round
+ *   is refused rather than run where it should not.
  * - `conflict` — an `operation_id` already used with different arguments, or a goal that
  *   something else ended first. Nothing was written either way.
  * - `unauthorized` — this credential is not a goal agent's, or names another goal.
@@ -729,7 +729,6 @@ const asPlanRefusal = (error: {
     case "harness_not_ready":
     case "harness_unreachable":
     case "planning_directory_unusable":
-    case "planning_ungated":
       return refused("harness_unavailable", detail);
     case "goal_not_found":
     case "target_unavailable":

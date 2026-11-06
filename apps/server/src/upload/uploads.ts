@@ -517,9 +517,9 @@ export interface StoreUploadsProbe {
  * Writes one message's files into `<directory>/uploads/`, all or none, and answers what the
  * harness is to be given.
  *
- * `directory` is the session's own working directory, as the spine gated it
- * (`harness/liveAgentSessions.ts`): the files go where the agent already works and the gate
- * already audits, which is what makes this grant nothing new.
+ * `directory` is the session's own working directory, as the spine made it
+ * (`harness/liveAgentSessions.ts`): the files go where the agent already works, which is
+ * what makes this grant nothing new.
  *
  * - **The folder is opened once, and every entry is made and removed through that open
  *   folder.** It is opened `O_DIRECTORY|O_NOFOLLOW`, so a link planted at `uploads` is

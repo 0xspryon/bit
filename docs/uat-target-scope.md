@@ -1,5 +1,10 @@
 # UAT — target scope and the Assets screen
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 > **Superseded in part.** Anything to do with the scope importer — opening a conversation,
 > sending turns, narration, records, replay, resume, the Agent sessions list, or recovery after a
 > restart — is in `docs/uat-importer-conversation.md`. This document still covers the scope model

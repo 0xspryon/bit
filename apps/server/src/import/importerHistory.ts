@@ -18,8 +18,8 @@
  *
  * `absent` is reachable here for a reason that is the importer's own rather than a goal's.
  * An import's index row is written *before* its session exists (`0025`), so a row whose
- * `session_created_at` is null names a session the harness may never have minted: the gate
- * would not install, the harness refused, the process died in between. Nobody has said
+ * `session_created_at` is null names a session the harness may never have minted: the
+ * directory was unusable, the harness refused, the process died in between. Nobody has said
  * anything in that import, and reporting it with the harness's "I no longer hold that
  * session" sentence would tell an operator their message had been lost. The goal path makes
  * the same distinction for the same reason, one row earlier.
@@ -162,13 +162,14 @@ export const agentUnavailableDetail = (
  *
  * `resume` carries everything the reopen needs and nothing it would have to re-derive: the
  * session to continue and the import whose directory the harness resolves it in — because
- * that directory is where the policy gate has to be, and it is not the new import's.
+ * that directory is where the session's MCP registration and files have to be, and it is
+ * not the new import's.
  */
 export type ImporterReopen =
   | {
       readonly _tag: "resume";
       readonly sessionId: string;
-      /** The import whose directory the session runs in. The gate goes there. */
+      /** The import whose directory the session runs in. Its MCP registration goes there. */
       readonly directoryImportId: string;
       readonly detail: string;
     }
@@ -181,8 +182,8 @@ export type ImporterReopen =
  * never fails, every uncertainty is a `fresh` session with the reason in its sentence, and
  * the directory the harness names has to be **one of this target's own import
  * directories** — rebuilt from the id in its last segment through
- * `FleetPaths.importDirectory` and compared — because the policy gate lives in the
- * directory the session runs in.
+ * `FleetPaths.importDirectory` and compared — because the directory a session runs in is
+ * its authority boundary (see {@link sessionReopen}'s header).
  *
  * What is the importer's own here is the word in the refusal and the name of the id in the
  * answer: `directoryImportId`, the import whose directory the harness resolves the session
@@ -198,7 +199,7 @@ export const importerReopen = Effect.fnUntraced(function* (input: {
   const reopen = yield* sessionReopen({
     harness: input.harness,
     sessionId: input.sessionId,
-    gatedRoleId: roleDirectoryMatcher({
+    ownRoleId: roleDirectoryMatcher({
       isRoleId: isRoleDirectoryId,
       rebuild: (importId) => input.importDirectory(input.targetId, importId),
     }),
@@ -387,7 +388,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
   /** The session **this process** is holding for this import, if any. */
   readonly liveSessionId: string | undefined;
   /**
-   * The directory that held session runs in, as the spine gated it — which for a successor
+   * The directory that held session runs in, as the spine made it — which for a successor
    * is the original import's, not this one's. Where its files are stored (A6 F9).
    */
   readonly liveDirectory?: string | undefined;

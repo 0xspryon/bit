@@ -1,5 +1,10 @@
 # The chat surface, and the work queued behind it
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 **Status:** backlog plus research findings. Items S1–S5 approved by the operator on
 2026-11-03; S6–S8 are recorded, not yet designed.
 **Date:** 2026-11-03

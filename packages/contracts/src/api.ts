@@ -13,14 +13,14 @@
  * from: the client cannot call a guarded endpoint without supplying a bearer, and the
  * server cannot serve one without implementing the guard.
  *
- * **It does not describe the three routes that were already there.** `/api/v1/health`,
- * `/api/v1/mcp` and `/api/v1/policy/decide` keep their own admission postures and their
- * own hand-written router registrations, for the reasons recorded on
- * `apps/server/src/http/controlPlane.ts`. They are served on the same listener as this
- * API and are deliberately not re-posted through it: `/api/v1/mcp` fails closed on an
- * MCP credential, and `/api/v1/policy/decide` is unauthenticated at the operator's
- * direction. Folding either into a group that carries {@link SessionGuard} would change
- * what they admit.
+ * **It does not describe the two routes that were already there.** `/api/v1/health` and
+ * `/api/v1/mcp` keep their own admission postures and their own hand-written router
+ * registrations, for the reasons recorded on `apps/server/src/http/controlPlane.ts`. They
+ * are served on the same listener as this API and are deliberately not re-posted through
+ * it: `/api/v1/health` admits anyone, and `/api/v1/mcp` fails closed on an MCP
+ * credential. Folding either into a group that carries {@link SessionGuard} would change
+ * what it admits. (A third, the unauthenticated `/api/v1/policy/decide`, went with the
+ * policy gate on 2026-11-06: the A6 plan's "Policy gate removed" entry.)
  *
  * **Browser-safe.** `effect/http-api` and `effect/http` contain no `node:` or `bun:`
  * imports at any depth (verified against `effect@4.0.5`'s sources), so declaring the API

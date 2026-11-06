@@ -29,7 +29,7 @@ const recordingRules = (toolName: string): readonly string[] => [
   `  total for the whole task.`,
   `- \`setup\` describes the arrangement all your cases ran against, including whether`,
   `  you reset the fixture first.`,
-  `- Some tool calls may be refused by a policy gate before they run. A refusal is`,
+  `- Some tool calls may be refused before they run. A refusal is`,
   `  information: report it, do not work around it. If the refusal stops you deciding`,
   `  the claim, record what you did reach and use "inconclusive".`,
   `- Call \`${toolName}\` to record. If it refuses with reason "stale", stop: your`,

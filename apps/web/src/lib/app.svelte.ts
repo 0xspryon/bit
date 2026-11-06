@@ -3946,7 +3946,7 @@ export class App {
   /**
    * Opens a planner round on the open goal.
    *
-   * It sends no body: the round's directory, its audit path, its harness and its prompt
+   * It sends no body: the round's directory, its harness and its prompt
    * are all the server's. It returns as soon as the round is prompted, so the button is
    * released long before the round finishes — what happens after that shows up in
    * {@link planRounds} and, from slice 8, in the round's own view.

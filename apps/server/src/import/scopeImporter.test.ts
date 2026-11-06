@@ -3191,7 +3191,7 @@ describe("a reopen", () => {
  * *new harness session*, so one conversation became two rows in the picker and the composer
  * moved to the second — the honest degradation the spec said would last "until S6 lands".
  * It lands here: when the harness still holds the session and resolves it in a directory this
- * server gates, the successor import continues that same session.
+ * server made, the successor import continues that same session.
  *
  * What does **not** go away is the second import id. An import id names one authority period
  * (`0027`), the credential behind the old one is gone with the process that held it, and
@@ -3232,7 +3232,7 @@ describe("a reopen that resumes", () => {
     expect(reopened.success.note).toContain("the same one");
 
     // Resumed, not created, and in the directory the harness named — which is where the
-    // gate is installed, because the gate lives in the directory a session runs in.
+    // session's MCP registration and files go, because they live where a session runs.
     const second = built.script.created.at(-1);
     expect(built.script.created).toHaveLength(2);
     expect(second?.resume).toBe("ses_import");
@@ -3474,9 +3474,9 @@ describe("a reopen that resumes", () => {
     if (started._tag !== "started") throw new Error("the import did not start");
     /*
      * The harness says it still holds the session — and would resume it — but it runs it in
-     * the operator's own home directory. Resuming there is an agent whose tool calls nothing
-     * is consulting, because the pre-execution policy gate lives in the directory a session
-     * runs in. So a fresh session, in a directory this server gates.
+     * the operator's own home directory. Resuming there is an agent among MCP registrations
+     * nobody checked, because the directory a session runs in is its authority boundary. So
+     * a fresh session, in a directory this server made.
      */
     built.script.holds.set("ses_import", workspace);
     await runtime.dispose();
@@ -4602,7 +4602,7 @@ describe("a message's files (A6 F9)", () => {
     await runtime.dispose();
   });
 
-  test("an opening message's files are stored once the directory is gated, and go with the opening prompt", async () => {
+  test("an opening message's files are stored once the directory is made, and go with the opening prompt", async () => {
     const built = world([PAGE_GOOD]);
     const runtime = ManagedRuntime.make(built.layer);
     const opened = await runtime.runPromise(

@@ -4,8 +4,9 @@
  * ## Why this is a service and not a second copy of four lines
  *
  * {@link PlanSupervisor.start} takes a `PlanInput`: a target, a goal, the **engagement
- * folder** the round's directory must not sit inside, the **audit path** its policy gate
- * appends to, a session title and the briefing ceiling. Those last four are facts about
+ * folder** the round's directory must not sit inside, a session title and the briefing
+ * ceiling. (It also took the **audit path** the policy gate appended to, until the gate
+ * was removed on 2026-11-06: the plan's "Policy gate removed" entry.) Those are facts about
  * this installation's filesystem layout and configuration, and they are assembled from the
  * fleet registry — which is why `contracts/plan.ts` is explicit that `PlanInput` is not a
  * wire shape and the `POST .../plan` route takes no payload at all.
@@ -13,9 +14,9 @@
  * There are now **two** callers that have a goal and need a round: that route, and the goal
  * agent's `wake_planner` tool. The tool has strictly less context than the route — it holds
  * a goal credential, so it knows a target id and a goal id and has never heard of a
- * workspace path — and a second assembly of the four would be a second answer to "where
- * does planning happen, and where does its gate write". A drift between them would not fail
- * a test: it would put a round's audit trail somewhere nobody looks.
+ * workspace path — and a second assembly of them would be a second answer to "where does
+ * planning happen, and what may it not sit inside". A drift between them would not fail a
+ * test: it would put a round somewhere its containment check was never asked about.
  *
  * So the assembly lives here, once, and both callers pass what they have.
  *
@@ -59,10 +60,10 @@ export class RoundOpener extends Context.Service<
     /**
      * Opens one round on one goal, answering as soon as it is durable and prompted.
      *
-     * Every refusal is the supervisor's own, including the two that are really about this
+     * Every refusal is the supervisor's own, including the one that is really about this
      * installation: `planning_directory_unusable` when the round's directory could not be
-     * made, and `planning_ungated` when the policy gate would not install into it. A round
-     * is refused rather than run ungated.
+     * made or would sit inside the workspace. (Its sibling `planning_ungated`, for a policy
+     * gate that would not install, went with the gate on 2026-11-06.)
      */
     readonly open: (
       request: RoundRequest,

@@ -34,7 +34,7 @@ export const API_PREFIX = `/api/${API_VERSION}` as const;
  *
  * @example
  * apiPath("health") // "/api/v1/health"
- * apiPath("/policy/decide") // "/api/v1/policy/decide"
+ * apiPath("/mcp") // "/api/v1/mcp"
  */
 export const apiPath = (path: string): `${typeof API_PREFIX}/${string}` =>
   `${API_PREFIX}/${path.replace(/^\/+/, "")}`;

@@ -21,8 +21,9 @@
  * back (`getSessionMessages`, `listSubagents`, `getSubagentMessages`) and prints the
  * project folder to trash.
  *
- * The hook is a stand-in for `plugins/claudeCodeGate.ts` that answers `allow`, as in
- * `askUserQuestionProbe.ts`.
+ * The hook is a stand-in for the removed policy gate's hook (`plugins/claudeCodeGate.ts`,
+ * last in `635c1fc`) that answers `allow`, as in `askUserQuestionProbe.ts`; bit had the
+ * gate when this was measured.
  *
  * **Nothing may import this module.** `main` runs at module scope.
  */

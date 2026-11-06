@@ -2737,14 +2737,13 @@ const fleetHandlers = HttpApiBuilder.group(
        *
        * Everything after that is {@link PlanSupervisor}: by the time it returns, the goal
        * briefing has been rendered and measured against the ceiling, the `planner_rounds`
-       * row exists, the goal claim is held, the round's own directory is gated, a
+       * row exists, the goal claim is held, the round's own directory is made, a
        * round-scoped credential is minted and the **planner** MCP endpoint is registered
        * under it, and the prompt has been accepted. This handler has no part in how the
        * round ends.
        *
        * **Nothing in the request chooses where the round runs.** The planning directory
-       * comes from the registry, keyed by the round id the supervisor mints; the audit path
-       * is the target's `evidence/` directory, which is deliberately outside it; and the
+       * comes from the registry, keyed by the round id the supervisor mints; and the
        * workspace is passed only so the containment check can refuse a planning directory
        * inside the engagement folder. `row.workspacePath ?? undefined` is explicit because
        * that check does not run for a caller who omits the field — `undefined` here says

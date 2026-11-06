@@ -15,8 +15,8 @@
  *
  * **Every member is overridable and the defaults are the dullest possible answers**: a
  * session is created under whatever id it is handed, a prompt succeeds, a wait returns, the
- * session reports no outcome, the narration stream is empty, and the gate is installed
- * without touching a filesystem. A test overrides exactly the behaviour it is about, so a
+ * session reports no outcome, and the narration stream is empty, without touching a
+ * filesystem. A test overrides exactly the behaviour it is about, so a
  * reader can see what the test depends on by reading the override list.
  *
  * The one default worth noticing is {@link STUB_INSTANCE}: a stub reports a driver of its

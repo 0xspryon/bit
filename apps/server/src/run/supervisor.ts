@@ -530,9 +530,10 @@ export class RunSupervisor extends Context.Service<
      * happened by the time anything is dispatched, and a predecessor still `running` is a
      * refusal here rather than a row this call moves.
      *
-     * The workspace and the audit path are the caller's, as they are for {@link start} and
-     * for the same reason: they are facts about the target that live in the registry, and
-     * this service does not hold it.
+     * The workspace is the caller's, as it is for {@link start} and for the same reason: it
+     * is a fact about the target that lives in the registry, and this service does not
+     * hold it. (So was the policy gate's audit path, until the gate was removed on
+     * 2026-11-06: the plan's "Policy gate removed" entry.)
      */
     readonly continueAttempt: (
       input: ContinueAttemptInput,

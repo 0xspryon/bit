@@ -1,5 +1,10 @@
 # Goal and planner flow — spec and delivery sequence
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 Written 2026-10-29. Covers the path from an open target to a goal, to a planner that
 dispatches intents, and the two chat surfaces around it.
 

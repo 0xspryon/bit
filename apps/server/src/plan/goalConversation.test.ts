@@ -388,7 +388,6 @@ const world = (options?: {
                 plannerMcp: "http://127.0.0.1:9/api/v1/planner/mcp",
                 goalMcp: "http://127.0.0.1:9/api/v1/goal/mcp",
                 importerMcp: "http://127.0.0.1:9/api/v1/importer/mcp",
-                policy: "http://127.0.0.1:9/api/v1/policy/decide",
               }),
             }),
           ),
@@ -822,8 +821,8 @@ describe("a restart with a goal conversation live", () => {
   /**
    * The other half of the directory check, and the reason it is not a formality.
    *
-   * The policy gate lives in the directory a session runs in, so a resume into a directory
-   * this server did not gate is an agent whose tool calls nothing is consulting. A harness
+   * The directory a session runs in is its authority boundary, so a resume into a directory
+   * this server did not make is an agent among MCP registrations nobody checked. A harness
    * that resolves our session somewhere else — another goal's directory, the operator's home
    * folder, a path we cannot rebuild — gets a fresh session instead.
    */

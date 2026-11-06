@@ -1,5 +1,10 @@
 # UAT — goal and planner flow
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 A step-by-step script for the work in `2a4b96b..HEAD`: target → goal → planner → intents →
 attempts, the two chat surfaces, the context meter, and uploads.
 
@@ -549,8 +554,9 @@ find /tmp/uat/hunt/targets/*/ -maxdepth 2 -type d
 workspace outside the tree entirely.
 `[ ] pass  [ ] fail` ______________________________________________
 
-**K.6** Check the policy gate is installed in **all three** role directories, including the
-two where nothing is expected to act.
+**K.6** _Retired 2026-11-06 with the policy gate (see the note at the top)._ ~~Check the
+policy gate is installed in **all three** role directories, including the two where nothing
+is expected to act.~~
 `[ ] pass  [ ] fail` ______________________________________________
 
 > Why these matter: under OpenCode the **directory is the authority boundary**. A second

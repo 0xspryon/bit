@@ -384,8 +384,9 @@ export interface HarnessCandidate {
  *
  * **A harness that will not start is not fatal, per instance now rather than per process.**
  * `main.ts` already made that decision for its one harness: `opencode` may be missing, the
- * Claude Agent SDK may carry a build too old to fail its policy hook closed, and a server
- * that refused to boot over either would be a server that cannot show what earlier runs
+ * Claude Agent SDK's CLI may not start (it once could also be a build too old to fail the
+ * policy gate's hook closed, before the gate was removed), and a server that refused to
+ * boot over either would be a server that cannot show what earlier runs
  * recorded. What is new is that one failing candidate no longer takes the *other* down
  * with it — which is the only way a two-instance installation is usable on a machine that
  * has one of the two installed.

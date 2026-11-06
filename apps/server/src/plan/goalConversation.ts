@@ -625,7 +625,7 @@ const make = Effect.fnUntraced(function* () {
     const reopen = yield* sessionReopen({
       harness: resolved.success.harness,
       sessionId: input.session.harnessSessionId,
-      gatedRoleId: roleDirectoryMatcher({
+      ownRoleId: roleDirectoryMatcher({
         isRoleId: isRoleDirectoryId,
         rebuild: (goalId) => fleet.paths.goalDirectory(input.targetId, goalId),
       }),

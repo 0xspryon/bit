@@ -1,5 +1,10 @@
 # The agent conversation — API design
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 > Eight slices that turn the mock-driven importer chat into a real one — written for the
 > importer, built so the goal agent and the worker attempt inherit it rather than repeat it.
 > See "The generic spine" for what is shared and where the sharing honestly stops. Written

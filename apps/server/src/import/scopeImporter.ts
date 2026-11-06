@@ -1189,7 +1189,7 @@ export class ScopeImporter extends Context.Service<
               // Pinned to the entry, so every later message into this session is framed by
               // the agent that opened it (`deliverTurn`).
               meta: { agent: input.agent },
-              // The first message's files, stored by the spine in the gated directory.
+              // The first message's files, stored by the spine in the session's directory.
               ...(input.request.uploads === undefined
                 ? {}
                 : { uploads: input.request.uploads }),

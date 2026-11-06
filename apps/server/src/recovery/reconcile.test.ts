@@ -1360,7 +1360,7 @@ describe("the live harness adapter's own mapping", () => {
    * no terminal event at all.
    *
    * Read as `running` it left the attempt row `running`, the write fence unmoved and the
-   * credential ungated, with nothing that would ever look again.
+   * credential live, with nothing that would ever look again.
    */
   test("a session that exists with no outcome and nothing running it is abandoned, not running", async () => {
     const report = await observe(

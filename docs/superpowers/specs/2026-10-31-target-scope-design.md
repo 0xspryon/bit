@@ -1,5 +1,10 @@
 # Target scope — design
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 Written 2026-10-31. Architecture source is `DECISIONS.md`; where this document and
 that one disagree about the eventual perimeter, that one wins — but see **Non-goals**,
 because this work deliberately stops short of what `DECISIONS.md` §5 describes.

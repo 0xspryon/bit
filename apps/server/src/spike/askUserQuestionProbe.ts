@@ -16,8 +16,10 @@
  * - `interrupt`: as the first leg, but `interrupt()` while `canUseTool` waits.
  * - `deny`: as the first leg, but `canUseTool` answers `deny` (the dock's dismiss).
  *
- * The hook is a stand-in for `plugins/claudeCodeGate.ts`: it prints the same
- * `hookSpecificOutput` the gate prints for an `allow`, and logs the tool name it saw.
+ * The hook is a stand-in for the policy gate's `PreToolUse` hook (`plugins/claudeCodeGate.ts`,
+ * removed 2026-11-06; read it back with `git show 635c1fc:apps/server/plugins/claudeCodeGate.ts`):
+ * it prints the `hookSpecificOutput` that gate printed for an `allow`, and logs the tool
+ * name it saw. The measurements were taken while bit had the gate.
  *
  * **Nothing may import this module.** `main` runs at module scope.
  */

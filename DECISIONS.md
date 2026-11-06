@@ -3,6 +3,13 @@
 Working record of what we are building, what we port from which source, and what we
 deliberately leave behind. Written 2026-10-15.
 
+> **2026-11-06: the pre-execution policy gate was removed at the operator's request, to be
+> redone later.** What this document says about the gate (the `PreToolUse` hook, OpenCode's
+> `execute.before` plugin, the policy route and its audit) describes a design bit no longer
+> runs. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 **Reference codebases on disk:**
 
 | Name        | Path                                               | License                      | Role                                               |
@@ -653,6 +660,9 @@ Matching semantics: `exact_domain` is `strings.EqualFold`; `fuzzy_domain` is
 rule** (`cyberaar.io` would permit `evil-cyberaar.io.attacker.com`).
 
 ### Our design
+
+> **2026-11-06:** the gate this section describes was removed at the operator's request, to be
+> redone later — see the top of this document, and commit `635c1fc` for the last version.
 
 **Design constraint: this tool runs autonomously.** A human cannot be in every loop.
 Damage limitation must therefore come from _code-enforced boundaries_, not from approval
@@ -2404,6 +2414,9 @@ have manufactured a pass.
 
 ### Checkpoint 5 — the pre-execution hook, and its real coverage
 
+> **2026-11-06:** the gate this section describes was removed at the operator's request, to be
+> redone later — see the top of this document, and commit `635c1fc` for the last version.
+
 `apps/server/plugins/policyHook.ts` is a real server-side OpenCode plugin; the rule lives
 in `apps/server/src/policy/service.ts`, reached over HTTP. The hook holds no local copy of
 the rules, which is what makes failing closed meaningful. Posture is **permissive with
@@ -3432,6 +3445,9 @@ reasons: the simulated target must not be served from the control plane's origin
 fixture fault must not take down the endpoint the worker records through.
 
 ### `FIX` — the worker runs under the policy hook, not only a probe
+
+> **2026-11-06:** the gate this section describes was removed at the operator's request, to be
+> redone later — see the top of this document, and commit `635c1fc` for the last version.
 
 The pre-execution gate was proven in §19 Checkpoint 5 by a dedicated probe and then not
 used: `workerDemo` ran with no hook loaded, so the policy endpoint sat there answering

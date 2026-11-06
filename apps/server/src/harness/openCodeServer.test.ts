@@ -534,8 +534,8 @@ describe("serverEnvironment", () => {
   test("no inherited OPENCODE_ variable reaches the child, by prefix", () => {
     // Not a prefix passthrough on purpose. Some of these names are secrets, and
     // `OPENCODE_CONFIG_PROJECT_DISABLE` is worse than a secret: it would stop the server
-    // reading the project configuration that loads our pre-execution policy gate, so an
-    // inherited one turns a boundary off with no sign in the run.
+    // reading project configuration, changed from outside with no sign in the run. (It
+    // once guarded the policy gate's plugin, removed 2026-11-06.)
     const environment = serverEnvironment(
       {
         OPENCODE_API_KEY: "oc-operator",

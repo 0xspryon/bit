@@ -50,11 +50,10 @@ Every endpoint this application _serves_ is one route on one listener
 `apiPath` in `@bit/contracts` so the web app and the server cannot disagree about a
 path. Each route keeps its own admission:
 
-| Route                        | Admission                                                 |
-| ---------------------------- | --------------------------------------------------------- |
-| `GET /api/v1/health`         | none; answers `{ "status": "ok" }` and nothing else       |
-| `POST /api/v1/mcp`           | **bearer credential required**, `401` before any dispatch |
-| `POST /api/v1/policy/decide` | deliberately unauthenticated, at the operator's direction |
+| Route                | Admission                                                 |
+| -------------------- | --------------------------------------------------------- |
+| `GET /api/v1/health` | none; answers `{ "status": "ok" }` and nothing else       |
+| `POST /api/v1/mcp`   | **bearer credential required**, `401` before any dispatch |
 
 The simulated target under test keeps its **own** listener
 (`apps/server/src/fixture/server.ts`). It is not part of this API and must not be

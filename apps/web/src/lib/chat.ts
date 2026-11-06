@@ -29,7 +29,7 @@
  *
  * The merge rule is the spec's: **a write arrives twice and must be shown once.** The
  * planner calls `add_intent`, which reaches this feed immediately as a `tool.call` on the
- * activity channel — unconfirmed, because the gate or the store may still refuse it — and
+ * activity channel — unconfirmed, because the store may still refuse it — and
  * then again as the `intent.added` record it produced. Rendering both would show one intent
  * as two; rendering only the call would report a write that may have been refused. So the
  * call is rendered as **pending** and collapses into the record when the record arrives,
@@ -367,8 +367,8 @@ export type WriteState = "recorded" | "refused" | "pending" | "unresolved";
  * ## Why this sentence is composed in the browser when `headline` and `body` are not
  *
  * `live.ts` is explicit that the server writes those two, "because the server is where the
- * sentence can be accurate: it has the policy gate's reason, the resolver's words for a
- * harness, and the store's payload. A browser that rephrased them would be inventing
+ * sentence can be accurate: it has the resolver's words for a harness, the harness's own,
+ * and the store's payload. A browser that rephrased them would be inventing
  * wording for states it cannot see." None of that applies here. A tool call's **arguments**
  * are on the item verbatim, already capped by the server, and this reads one field out of
  * them. There is no state it cannot see, and nothing is rephrased.

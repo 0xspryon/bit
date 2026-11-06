@@ -16,11 +16,13 @@
  *
  * Two consequences, both accepted:
  *
- * - The fetch goes through the **policy hook** rather than a tool we own, so it is audited
- *   on the same path as every other tool call. That is better than our own tool would have
- *   given us. It does mean that when enforcement eventually lands, the importer reading
- *   `hackerone.com` is a host outside every scope, and the gate will have to permit the
- *   importer's own reads explicitly rather than by accident.
+ * - The fetch is the harness's own tool rather than one we own, so it runs under the same
+ *   permissions as every other tool call: Claude Code's `WebFetch`, pre-approved for the
+ *   importer alone (`fetchesPages`), and OpenCode's, which nothing refuses. There is no
+ *   policy gate to audit or refuse it since 2026-11-06 (the plan's "Policy gate removed"
+ *   entry). When a gate is redone, the importer reading `hackerone.com` is a host outside
+ *   every scope, and it will have to permit the importer's own reads explicitly rather
+ *   than by accident.
  * - Nothing we own observes the fetch, so per-link progress is derived from the
  *   `source_url` on the calls below rather than from watching a page load. Which is why
  *   two of the three tools take one.

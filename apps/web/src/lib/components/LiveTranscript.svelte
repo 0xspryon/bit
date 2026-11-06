@@ -15,9 +15,10 @@
    * - **record** — a committed event from the target's own event log, arriving in the order
    *   the store assigned it inside the writing transaction. It has a position, it can be
    *   resumed from, and `app.liveCursor` is that position.
-   * - **activity** — what the harness is narrating and what the policy gate refused, in
-   *   this process, now. It was never written to the event log, so it has no position, no
-   *   replay and no durability: both buses behind it are sliding buffers, chosen so a slow
+   * - **activity** — what the harness is narrating, in this process, now (and what the
+   *   policy gate refused, until it was removed on 2026-11-06). It was never written to the
+   *   event log, so it has no position, no replay and no durability: the bus behind it is a
+   *   sliding buffer, chosen so a slow
    *   browser tab cannot slow down a running agent.
    *
    * Each row says which by its left edge — a solid rule for a record, a dashed rule and

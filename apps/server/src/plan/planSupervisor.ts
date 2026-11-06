@@ -450,7 +450,7 @@ export class PlanSupervisor extends Context.Service<
      * Opens a planner round and returns as soon as the prompt is accepted.
      *
      * Does **not** wait for the round. By the time this returns the `planner_rounds` row
-     * exists, the goal claim is held, the planning directory is gated, the harness session
+     * exists, the goal claim is held, the planning directory is made, the harness session
      * exists under the goal's lineage, a round-scoped credential is minted and registered,
      * and the prompt has been accepted. Everything after that is the fiber's.
      */

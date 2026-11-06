@@ -32,7 +32,7 @@
  * same-origin: through the Vite dev server's `/api` proxy in development, and from the
  * server itself in a packaged deployment. The control plane serves no CORS headers on
  * purpose — the only way to add them is `HttpRouter.cors`, which is global and would
- * change what `/api/v1/mcp` and `/api/v1/policy/decide` answer to a cross-origin caller.
+ * change what `/api/v1/mcp` and `/api/v1/health` answer to a cross-origin caller.
  */
 import {
   BitApi,
@@ -243,8 +243,8 @@ export const REFUSAL_TAGS = new Set([
   "IntentRefused",
   // Opening a planner round. **Every reason on `PlanRefused` is a sentence the goal
   // screen puts next to the "Plan next" button** — a round already working this goal, a
-  // goal that has ended, a harness that is not configured, a directory the policy gate
-  // would not install into. Classifying any of them as transport trouble would replace
+  // goal that has ended, a harness that is not configured, a planning directory that could
+  // not be made. Classifying any of them as transport trouble would replace
   // "a round is already planning this goal; wait for it or stop it" with "No server
   // answered at this address", which is both wrong and unactionable. A briefing over the
   // ceiling comes back as `GoalBriefingRefused`, already listed above, because it is the
@@ -260,7 +260,7 @@ export const REFUSAL_TAGS = new Set([
   "RoundNotFound",
   // Saying something to a goal's agent. **Every reason is a sentence the composer prints
   // beside itself**: no harness configured, a harness that would not take a session, a goal
-  // that has ended, a directory the policy gate would not install into. Classifying any of
+  // that has ended, a goal directory that could not be made. Classifying any of
   // them as transport trouble would replace "this goal has ended, so its agent's authority
   // has ended with it" with "No server answered at this address", which is wrong and
   // unactionable. Reading the conversation declares no error at all: a conversation nobody
@@ -775,7 +775,7 @@ export const server = {
    * Opens a planner round on one goal, and answers without waiting for it.
    *
    * **There is no payload at all**, which is the shape of this call rather than an
-   * omission: the round's directory, its audit path and the harness it runs on are the
+   * omission: the round's directory and the harness it runs on are the
    * server's, and the prompt is the goal's objective plus the goal briefing assembled
    * server-side. A browser that could name any of them would be choosing where an agent
    * runs.

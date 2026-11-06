@@ -1,5 +1,10 @@
 # UAT — the scope importer as a conversation
 
+> **2026-11-06:** the pre-execution policy gate this document mentions was removed at the
+> operator's request, to be redone later. See the "Policy gate removed" entry in
+> `docs/superpowers/plans/2026-11-03-a6-chat-revamp-breakdown.md`; the last commit with the
+> gate is `635c1fc`.
+
 Covers what shipped on 2 Nov 2026: slices S1–S6, S7a and S8 of
 `docs/superpowers/specs/2026-11-02-importer-conversation-design.md`. Written to be worked
 through in order; later parts depend on sessions created by earlier ones.

@@ -38,8 +38,9 @@
  * - **Claude Code.** The SDK seam (`ClaudeCodeSdk`) is wrapped: each frame the real
  *   `query()` yields is copied, with its arrival time, so `message.model` on every
  *   `assistant` frame is visible. The wrapper also drops the setting sources and allows
- *   `Read` — the policy gate that pre-approves tools in production is not installed here,
- *   and under `dontAsk` with no gate every tool call would be denied. A denied call is
+ *   `Read` — the policy gate that pre-approved tools in production when this was written
+ *   (removed 2026-11-06) was not installed here, and under `dontAsk` with no settings
+ *   sources a tool call that is not read-only is denied. A denied call is
  *   still a model call, but a read that succeeds is the turn production runs.
  *
  * Each leg runs one long turn (six files read one call at a time, so six or more model
@@ -375,7 +376,7 @@ interface Frame {
  *
  * The production options pass through untouched apart from `settingSources` (none, so the
  * operator's own hooks and permissions do not enter the measurement) and `allowedTools`
- * (`Read`, standing in for the gate's pre-approval, and exactly `printenv CLAUDE_EFFORT`
+ * (`Read`, standing in for the old gate's pre-approval, and exactly `printenv CLAUDE_EFFORT`
  * through `Bash`, which is how a turn reads back the effort level it ran at). See the file
  * header.
  */

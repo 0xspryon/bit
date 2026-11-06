@@ -7,13 +7,13 @@
  * either of them (`recovery/continuation.ts`). It was the importer's alone until S7 needed
  * the same decision one surface along, and the extraction is the point: a second resume
  * would be a second place deciding whether an agent may run in a directory this server did
- * not gate, and the second one is the one nobody reviews.
+ * not make, and the second one is the one nobody reviews.
  *
  * ## It never fails, and every uncertainty resolves to `fresh`
  *
  * A fresh session always works; a resume that was promised and then refused is a message
  * the operator loses. So a harness that cannot be asked, a transcript that was swept, a
- * session killed before its first prompt, and a directory this server does not gate are
+ * session killed before its first prompt, and a directory this server did not make are
  * all `fresh`, each with the reason in its own sentence.
  *
  * ## The directory check, which is about authority rather than about resuming
@@ -31,14 +31,13 @@
  * The path the harness reports is therefore not merely checked for existence: it has to be
  * recognised by the caller as one of *its own* role directories, rebuilt through
  * `FleetPaths` and compared. Nothing is parsed out of the path and trusted — that is
- * {@link SessionReopenInput.gatedRoleId}'s whole contract, and a caller that cannot
+ * {@link SessionReopenInput.ownRoleId}'s whole contract, and a caller that cannot
  * recognise the path says so by answering `undefined`.
  *
  * A harness that reports no directory at all is `fresh` for the same reason: there is
  * nothing to match, and "we could not tell where it runs" is not permission to resume into
  * it. The directory does not have to *exist* — the caller's own `ensure…Directory` recreates
- * a swept one and reinstalls the gate, which is also the answer to OpenCode's
- * `LocationNotFoundError`.
+ * a swept one, which is also the answer to OpenCode's `LocationNotFoundError`.
  */
 import { Effect } from "effect";
 
@@ -49,8 +48,9 @@ import type { AgentHarness } from "./agentHarness";
  *
  * `roleId` is the id of the role directory the **harness** resolves the session in, which
  * is not necessarily the id the caller is working under: an importer's successor has a new
- * import id while the session still runs in the original import's directory. The gate goes
- * where the harness runs the session, so that is the id the caller must gate.
+ * import id while the session still runs in the original import's directory. The session's
+ * MCP registration and files go where the harness runs it, so that is the id the caller
+ * must work in.
  */
 export type SessionReopen =
   | {
@@ -67,12 +67,12 @@ export interface SessionReopenInput {
   readonly sessionId: string;
   /**
    * The role id this directory belongs to, or `undefined` for a path this caller does not
-   * recognise as one of its own gated directories.
+   * recognise as one of its own role directories.
    *
    * The caller rebuilds the path from the id it reads out and compares; it never trusts a
    * segment it merely parsed. See this module's header.
    */
-  readonly gatedRoleId: (directory: string) => string | undefined;
+  readonly ownRoleId: (directory: string) => string | undefined;
   /**
    * What this surface's directories are called in the refusal sentence — "import
    * directories", "goal directories". Operator-facing prose, so it is the surface's word
@@ -103,14 +103,14 @@ export const sessionReopen = Effect.fnUntraced(function* (
   if (directory === undefined) {
     return {
       _tag: "fresh",
-      detail: `the harness still holds session ${input.sessionId} but did not say which directory it resolves it in, and a session is only resumed into a directory this server has gated`,
+      detail: `the harness still holds session ${input.sessionId} but did not say which directory it resolves it in, and a session is only resumed into a directory this server made`,
     } as const satisfies SessionReopen;
   }
-  const roleId = input.gatedRoleId(directory);
+  const roleId = input.ownRoleId(directory);
   return roleId === undefined
     ? ({
         _tag: "fresh",
-        detail: `the harness still holds session ${input.sessionId}, but it resolves it in '${directory}', which is not one of this target's own ${input.directoryWords} — so it is not a directory this server gates, and the session is not resumed into it`,
+        detail: `the harness still holds session ${input.sessionId}, but it resolves it in '${directory}', which is not one of this target's own ${input.directoryWords} — so it is not a directory this server made, and the session is not resumed into it`,
       } as const satisfies SessionReopen)
     : ({
         _tag: "resume",
@@ -121,7 +121,7 @@ export const sessionReopen = Effect.fnUntraced(function* (
 });
 
 /**
- * {@link SessionReopenInput.gatedRoleId} for a surface whose directories are
+ * {@link SessionReopenInput.ownRoleId} for a surface whose directories are
  * `<…>/<role>/<roleId>`, which is every one of them (`persistence/fleet.ts`).
  *
  * The id is taken from the last segment and then **thrown away as a string**: the path is

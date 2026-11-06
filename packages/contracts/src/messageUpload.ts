@@ -15,7 +15,7 @@
  *
  * Into an `uploads/` folder **inside the session's own working directory** — the import's
  * directory for the importer, `goal/<goalId>/` for a goal agent — which the server
- * chooses, never the browser. The policy gate already covers that directory, so the agent
+ * chooses, never the browser. The agent already works in that directory, so its
  * reading a file there is nothing it could not already do: no new filesystem authority is
  * granted to anyone by this feature.
  *

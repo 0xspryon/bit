@@ -1441,7 +1441,7 @@ describe("reading an opencode event", () => {
       tool: "bash",
       output: "command not found: curl",
       // The harness's word about its own call. It says nothing about whether the action
-      // was *allowed*, which is the gate's answer and arrives on its own item.
+      // was *allowed* (the policy gate's answer, on its own item, until the gate went).
       failed: true,
     });
   });

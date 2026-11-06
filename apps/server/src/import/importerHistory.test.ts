@@ -17,7 +17,7 @@
  * a message. A composer offered for a session the driver cannot continue is a message written
  * and lost, so every one of these tests asks the harness rather than assuming — including the
  * two that refuse a resume the harness *would* have accepted, because the directory it
- * resolves the session in is not one this server gates.
+ * resolves the session in is not one this server made.
  */
 import { ImporterConversationView } from "@bit/contracts";
 import { describe, expect, test } from "bun:test";
@@ -560,8 +560,9 @@ describe("a row naming an agent this server does not define", () => {
  *
  * Tested through {@link importerReopen} directly as well as through the view, because the
  * directory check is the part that is about *authority* rather than about resuming: the
- * policy gate lives in the directory a session runs in, so a resume into a directory this
- * server did not gate is an agent whose tool calls nothing is consulting.
+ * directory a session runs in is its authority boundary (OpenCode keeps its MCP set per
+ * directory, and the role-directory check is of this path), so a resume into a directory
+ * this server did not make is an agent among registrations nobody checked.
  */
 describe("whether a session this process does not hold can be carried on", () => {
   const ask = (continuation: SessionContinuation | (() => never)) =>
@@ -603,7 +604,7 @@ describe("whether a session this process does not hold can be carried on", () =>
     });
   });
 
-  test("a directory that is not one of this target's is a fresh session, not an ungated resume", async () => {
+  test("a directory that is not one of this target's is a fresh session, not a resume into a directory this server did not make", async () => {
     const reopen = await ask({
       _tag: "resumable",
       directory: "/home/operator/somewhere-else",
@@ -808,7 +809,7 @@ describe("the uploads folder the replay is given", () => {
     return asked;
   };
 
-  test("a held session's: the directory the registry gated, which for a successor is not this import's", async () => {
+  test("a held session's: the directory the registry made, which for a successor is not this import's", async () => {
     expect(
       await folderFor({
         live: { directory: importDirectory(TARGET, "imp_0") },

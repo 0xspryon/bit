@@ -1317,8 +1317,8 @@ describe("outcomes", () => {
   test("a subagent's call narrates as its entry, its words as nothing, and does not feed the meter", async () => {
     /*
      * `forwardSubagentText: true` is pinned so that a subagent's text and thinking reach
-     * the stream, and the policy gate's default answer is `allow`, so a `Task` call is
-     * reachable on any run. A subagent has **its own context**: its prompt size is not this
+     * the stream, and nothing refuses a `Task` call (no policy gate since 2026-11-06), so
+     * one is reachable on any run. A subagent has **its own context**: its prompt size is not this
      * session's, and a meter that took its newest frame would change subject without saying
      * so — which is the exact defect that keeps this meter off the target-wide transcript.
      *

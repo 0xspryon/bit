@@ -200,7 +200,8 @@ export const HarnessModelView = Schema.Struct({
    * automatic compaction starts `auto: true` (line 200) and fires when the estimated
    * context reaches `(limit.input || limit.context) − max(15 % of it, 16 000)` (line 849,
    * `RESERVE_SHARE`/`RESERVE_MIN`). bit writes no `compaction` key into any OpenCode config
-   * — the gate install writes only its plugin registration — so the default is what applies.
+   * — it writes no OpenCode config at all since the policy gate went (2026-11-06) — so the
+   * default is what applies.
    *
    * **So it is an estimate of somebody else's threshold, and three things can move it
    * without moving this number:** an `opencode.json` at or above the session's directory

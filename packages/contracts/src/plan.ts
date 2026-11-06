@@ -10,7 +10,7 @@
  * and a wire type that have to be kept in step by hand.
  *
  * **What is still the server's and is deliberately not here.** `PlanInput` is not a wire
- * shape: a round's directory, its audit path and the engagement folder it must not be
+ * shape: a round's directory and the engagement folder it must not be
  * inside are facts about this installation's filesystem layout, and a browser that could
  * name any of them would be choosing where an agent runs. The route takes a target and a
  * goal from the path and nothing else at all — there is no payload — and the server

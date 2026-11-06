@@ -78,7 +78,7 @@ export class RoleDirectoryRefused extends Schema.TaggedError<RoleDirectoryRefuse
  *   caller that passes a path from anywhere else must not rely on this function.
  * - It is a check at one moment. A symlink swapped in after the check, or a component
  *   created as a symlink later, is not seen. That is a race against somebody with write
- *   access to the fleet root, who could already edit the gate directly, so it is accepted
+ *   access to the fleet root, who could already edit its files directly, so it is accepted
  *   rather than defended.
  */
 export const resolveThroughSymlinks = (path: string): string => {

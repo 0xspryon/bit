@@ -270,7 +270,8 @@ describe("activityOrder", () => {
   });
 
   test("a refused action does not parse, because it is counted by another service", () => {
-    // `activity:decision:<n>` is the policy service's answer order, not the narration bus's.
+    // `activity:decision:<n>` was the policy service's answer order (gone with the gate,
+    // 2026-11-06), not the narration bus's; an id shaped like it must still not parse.
     // Treating the two counters as one would compare numbers from different sequences.
     expect(
       activityOrder(activity({ id: "activity:decision:3" })),

@@ -23,7 +23,7 @@
    * harness and model the operator picks. The *live*
    * transcript is the dock at the foot of every section: {@link LiveTranscript} shows the
    * target's own event log, read in store-assigned order behind a cursor, next to the
-   * harness's narration and the policy gate's denials as live activity — and says which is
+   * harness's narration as live activity — and says which is
    * which. It is about the target rather than any one page, so it is under all of them.
    * {@link TranscriptPanel} remains the different thing beside it: what a *settled*
    * attempt left behind, read from the harness (the server keeps no copy), labelled as the
