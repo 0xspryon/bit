@@ -1386,6 +1386,34 @@ export class FakeServer implements ServerClient {
       detail: "Stopped the turn running in this session.",
     });
 
+  /** A sub-agent's Stop the server took (A7-S). */
+  onStopImporterSubagent: (
+    ...args: Parameters<ServerClient["stopImporterSubagent"]>
+  ) => Answer<"stopImporterSubagent"> = (
+    _baseUrl,
+    _targetId,
+    importId,
+    callId,
+  ) =>
+    ok({
+      conversationId: importId,
+      callId,
+      detail:
+        "The sub-agent was stopped. The harness tells the importer, which may answer about it.",
+    });
+
+  /** Stop all, answered as a Stop (A7-S). */
+  onStopImporterAll: (
+    ...args: Parameters<ServerClient["stopImporterAll"]>
+  ) => Answer<"stopImporterAll"> = (_baseUrl, _targetId, importId) =>
+    ok({
+      conversationId: importId,
+      outcome: "interrupted",
+      working: false,
+      background: false,
+      detail: "Stopped the sub-agents and the turn running in this session.",
+    });
+
   /** An answer the harness took (A7-Q). */
   onAnswerImporterQuestion: (
     ...args: Parameters<ServerClient["answerImporterQuestion"]>
@@ -1622,6 +1650,16 @@ export class FakeServer implements ServerClient {
     this.record("stopImporterTurn", args, () =>
       this.onStopImporterTurn(...args),
     );
+
+  stopImporterSubagent = (
+    ...args: Parameters<ServerClient["stopImporterSubagent"]>
+  ) =>
+    this.record("stopImporterSubagent", args, () =>
+      this.onStopImporterSubagent(...args),
+    );
+
+  stopImporterAll = (...args: Parameters<ServerClient["stopImporterAll"]>) =>
+    this.record("stopImporterAll", args, () => this.onStopImporterAll(...args));
 
   switchImporterModel = (
     ...args: Parameters<ServerClient["switchImporterModel"]>

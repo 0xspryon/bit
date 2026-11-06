@@ -25,16 +25,17 @@
    *   (`ChatQuestion.dismiss`); once the adapter takes `question` away — dismissed, or
    *   answered — the box is drawn again and, if focus went with the dock, gets it back.
    *   Focus that was in the box's column when the dock arrived goes into the dock.
-   * - `controls` — beside Stop: **E7's "Stop all"** for a session's sub-agents. Drawn
-   *   whether or not Stop is; the chat decides when its control applies. Empty until A7-S.
+   * - `controls` — beside Stop, for a control of the chat's own. Drawn whether or not Stop
+   *   is. **E7's "Stop all" is not drawn here** but in Stop's place, by the adapter's
+   *   `stopAll` (A7-S): one pill, with the clock and the stopping state Stop has.
    * - `chip` — **E8's sub-agents chip**, which is not drawn in the chat at all: it is
    *   placed in the app's title bar beside the session chip (`titleBarChips.svelte.ts`) for
-   *   as long as this shell is mounted. Empty until A7-S.
+   *   as long as this shell is mounted (A7-S: `SubagentChip`).
    * - `aside` — **E8's 400px panel** of sub-agents, beside the chat column and narrowing it
    *   rather than covering it. The thread's 800px column gives way first (`Chat`'s
-   *   `--column`). Empty until A7-S.
-   * - `subagent` — **A7-S's card** (E7) in place of a sub-agent's U14 entry, per row.
-   *   Absent until A7-S, so the entry is drawn as before.
+   *   `--column`). A7-S: `SubagentPanel`.
+   * - `subagent` — **A7-S's card** (E7) in place of a sub-agent's U14 entry, per row
+   *   (`SubagentCard`). Absent, the U14 entry is drawn.
    * - `separator`, `tail`, `footer` — a turn's bubble, cursor and footer, the shell's own
    *   unless a chat needs a heading of its own (a planner round's status, say).
    *
@@ -58,6 +59,7 @@
     openComposer,
     replyText,
     stopOffered,
+    stopsAll,
     turnFooterText,
     type ChatQuestion,
     type ChatSession,
@@ -398,25 +400,35 @@
           background work the agent started, which the pill then names, since nothing else on
           screen says it is running. Above the composer whatever its state, a closed one too.
         -->
+          <!--
+          E7's Stop all (A7-S) takes the pill while sub-agents run: the same place, clock and
+          stopping state, and the session's sub-agents stopped before its turn.
+        -->
           <button
             bind:this={stopButton}
             class="stop"
             type="button"
             aria-disabled={turn.stopping}
-            title={working
-              ? session.words.stopTurn
-              : session.words.stopBackground}
+            title={stopsAll(session)
+              ? session.stopAll?.title
+              : working
+                ? session.words.stopTurn
+                : session.words.stopBackground}
             onclick={() => {
-              if (!turn.stopping) session.stop?.();
+              if (turn.stopping) return;
+              if (stopsAll(session)) session.stopAll?.stop();
+              else session.stop?.();
             }}
           >
             <span class="stop-mark" aria-hidden="true"></span>
             <span
               >{turn.stopping
                 ? "Stopping…"
-                : working
-                  ? "Stop"
-                  : "Stop background work"}</span
+                : stopsAll(session)
+                  ? "Stop all"
+                  : working
+                    ? "Stop"
+                    : "Stop background work"}</span
             >
           </button>
           {#if elapsed !== ""}

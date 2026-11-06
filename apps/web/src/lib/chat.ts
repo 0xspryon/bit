@@ -917,7 +917,38 @@ export interface ToolRunSummary {
   readonly failed: number;
   /** A write still in flight: the line says "writing…", as D3 draws it. */
   readonly pending: boolean;
+  /**
+   * When every call in the run is the harness's question tool (A7-Q's E3): how many
+   * questions they asked, and whether one has no answer yet — the agent waits on the
+   * operator. `undefined` for any other run.
+   */
+  readonly asked?:
+    { readonly questions: number; readonly waiting: boolean } | undefined;
 }
+
+/**
+ * The tools a harness asks the operator with (A7-Q): Claude Code's `AskUserQuestion`,
+ * OpenCode's `question`. A tool of an MCP server is namespaced, so neither name can be one
+ * of ours.
+ */
+const QUESTION_TOOLS: ReadonlySet<string> = new Set([
+  "AskUserQuestion",
+  "question",
+]);
+
+/** How many questions one question-tool call asked: its input's `questions`, else one. */
+const questionsIn = (row: ChatRow): number => {
+  const input = (row.proposedBy ?? row.item).input;
+  if (input === null) return 1;
+  try {
+    const parsed = JSON.parse(input) as { questions?: unknown };
+    return Array.isArray(parsed.questions) && parsed.questions.length > 0
+      ? parsed.questions.length
+      : 1;
+  } catch {
+    return 1;
+  }
+};
 
 /**
  * One line of a thread (A6 U4): a row drawn as itself, or consecutive tool calls folded into
@@ -970,6 +1001,12 @@ export const toolRunSummary = (rows: readonly ChatRow[]): ToolRunSummary => {
       failed += 1;
     }
   }
+  const questionRun =
+    rows.length > 0 &&
+    rows.every(
+      (row) =>
+        row.item.kind === "tool.call" && QUESTION_TOOLS.has(toolRowName(row)),
+    );
   return {
     count: rows.length,
     names,
@@ -977,8 +1014,21 @@ export const toolRunSummary = (rows: readonly ChatRow[]): ToolRunSummary => {
     unresolved,
     failed,
     pending: rows.some((row) => row.write === "pending"),
+    ...(questionRun
+      ? {
+          asked: {
+            questions: rows.reduce((sum, row) => sum + questionsIn(row), 0),
+            // A call with no answer yet: the harness is still waiting on the operator.
+            waiting: rows.some((row) => row.result === null),
+          },
+        }
+      : {}),
   };
 };
+
+/** E3's line for a run of question calls: "Asked 2 questions". */
+export const toolRunAsked = (questions: number): string =>
+  `Asked ${String(questions)} ${questions === 1 ? "question" : "questions"}`;
 
 /** "Ran 1 command", "Ran 3 commands": the folded line's count, as D3 words it. */
 export const toolRunCount = (count: number): string =>

@@ -243,6 +243,11 @@ export interface SwitchFailure {
 }
 
 /** What the server answered a Stop with, as the page needs it. */
+/** A sub-agent's Stop, answered (A7-S): the server's sentence either way. */
+export type ImporterSubagentStopAnswer =
+  | { readonly _tag: "stopped"; readonly detail: string }
+  | { readonly _tag: "refused"; readonly detail: string };
+
 export type ImporterStopAnswer =
   | { readonly _tag: "stopped"; readonly stopped: ConversationStopped }
   | { readonly _tag: "refused"; readonly detail: string };
@@ -301,6 +306,16 @@ export interface ImporterServer {
    * harness is interrupted and the session stays open for the next message.
    */
   readonly stop: (importId: string) => Promise<ImporterStopAnswer>;
+  /**
+   * E7's Stop all (A7-S): every sub-agent the server can stop on its own, then the turn and
+   * background work, answered as {@link stop} is.
+   */
+  readonly stopAll: (importId: string) => Promise<ImporterStopAnswer>;
+  /** Stops one sub-agent of one import's session (A7-S), by its calling tool call's id. */
+  readonly stopSubagent: (
+    importId: string,
+    callId: string,
+  ) => Promise<ImporterSubagentStopAnswer>;
   /**
    * Answers, or dismisses, the question one import's agent is waiting on (A7-Q), by the
    * harness's id for it. `settled` when the server passed it on; `refused` with the
@@ -2197,7 +2212,7 @@ export class ImporterSessions {
    * prototype shows the stopped state: whatever it had not finished stays visibly
    * unfinished.
    */
-  async stop(): Promise<void> {
+  async stop(all = false): Promise<void> {
     const session = this.current;
     if (session === undefined) return;
     const server = this.#server;
@@ -2213,12 +2228,18 @@ export class ImporterSessions {
     }
     if (this.stopping) return;
     this.stopping = true;
-    const answer = await server.stop(importId);
+    // Stop all (A7-S, E7): the session's sub-agents first, then the turn, in one request.
+    const answer = await (all
+      ? server.stopAll(importId)
+      : server.stop(importId));
     this.stopping = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
     if (this.#server !== server) return;
     if (answer._tag === "refused") {
-      this.stopFailure = { title: "Turn not stopped", sentence: answer.detail };
+      this.stopFailure = {
+        title: all ? "Not everything was stopped" : "Turn not stopped",
+        sentence: answer.detail,
+      };
       return;
     }
     const stopped = answer.stopped;
@@ -2268,6 +2289,38 @@ export class ImporterSessions {
     // What the stopped turn left in the window (A6 U9 review): the turn watch does not see
     // this turn end, since the session already reads as idle when it next answers.
     void this.readContext(importId, false, "stop");
+  }
+
+  /**
+   * The sub-agents whose Stop is with the server (A7-S), by call id: their card's Stop reads
+   * "Stopping…" and is not pressed again until the answer.
+   */
+  subagentStopping = $state<readonly string[]>([]);
+
+  /**
+   * Stops one sub-agent of the session on screen (A7-S, E7). The card follows the server's
+   * narration rather than the button: it ends when the harness says the sub-agent stopped.
+   * A refusal — it runs inside the turn, it has ended, the harness did not answer — goes to
+   * the error dialog with the server's sentence, as a turn's Stop does.
+   */
+  async stopSubagent(callId: string): Promise<void> {
+    const session = this.current;
+    const server = this.#server;
+    const importId = session?.importId;
+    if (server === undefined || importId === undefined) return;
+    if (this.subagentStopping.includes(callId)) return;
+    this.subagentStopping = [...this.subagentStopping, callId];
+    const answer = await server.stopSubagent(importId, callId);
+    this.subagentStopping = this.subagentStopping.filter((id) => id !== callId);
+    if (this.#server !== server) return;
+    if (answer._tag === "refused") {
+      this.stopFailure = {
+        title: "Sub-agent not stopped",
+        sentence: answer.detail,
+      };
+      return;
+    }
+    this.notice = answer.detail;
   }
 
   /** The switch of one session that is with the server, if there is one. */

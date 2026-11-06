@@ -3023,6 +3023,58 @@ export class App {
             "No server answered at this address, so the turn may still be running.",
         };
       },
+      /** E7's Stop all (A7-S): the sub-agents, then the turn, answered as a Stop is. */
+      stopAll: async (importId) => {
+        const call = await this.client.stopImporterAll(
+          this.serverUrl,
+          targetId,
+          importId,
+        );
+        this.#agentSessionsMoved(targetId);
+        if (call._tag === "Ok") return { _tag: "stopped", stopped: call.value };
+        if (call._tag === "Refused") {
+          if (call.error._tag === "Unauthenticated") this.signOut("expired");
+          return {
+            _tag: "refused",
+            detail: this.#refusalText(
+              call.error,
+              "The turn and its sub-agents were not stopped.",
+            ),
+          };
+        }
+        return {
+          _tag: "refused",
+          detail:
+            "No server answered at this address, so the turn and its sub-agents may still be running.",
+        };
+      },
+      /** One sub-agent's Stop (A7-S), by its calling tool call's id. */
+      stopSubagent: async (importId, callId) => {
+        const call = await this.client.stopImporterSubagent(
+          this.serverUrl,
+          targetId,
+          importId,
+          callId,
+        );
+        if (call._tag === "Ok") {
+          return { _tag: "stopped", detail: call.value.detail };
+        }
+        if (call._tag === "Refused") {
+          if (call.error._tag === "Unauthenticated") this.signOut("expired");
+          return {
+            _tag: "refused",
+            detail: this.#refusalText(
+              call.error,
+              "The sub-agent was not stopped.",
+            ),
+          };
+        }
+        return {
+          _tag: "refused",
+          detail:
+            "No server answered at this address, so the sub-agent may still be running.",
+        };
+      },
       /**
        * One session's conversation, with the floor the live tail is joined at (S6).
        *

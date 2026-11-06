@@ -425,7 +425,14 @@
         }}
       >
         {#snippet trigger()}
-          {#if importer.current?.working}
+          {#if importer.question !== undefined}
+            <!--
+              E6's local signal (A6 D9): the session on screen waits on the operator's answer.
+              In the warning colour, and said in words to a reader that cannot see it.
+            -->
+            <span class="question-dot" aria-hidden="true"></span>
+            <span class="visually-hidden">Waiting on you:</span>
+          {:else if importer.current?.working}
             <span class="working-dot" aria-hidden="true"></span>
           {:else if importer.current?.tally.messages === 0}
             <IconPlus width="11" height="11" />
@@ -671,6 +678,14 @@
     border-radius: 50%;
     background: var(--text-base);
     box-shadow: 0 0 0 3px var(--overlay-pressed);
+  }
+  /* The session waits on the operator's answer (A7-Q's E6 signal, drawn in A7-S). */
+  .question-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--state-fg-warning);
   }
   .group-label {
     margin: 0;

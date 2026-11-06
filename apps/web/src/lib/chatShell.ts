@@ -287,6 +287,23 @@ export interface ChatSession<Subject extends ThreadTurn = ThreadTurn> {
   readonly turn: ChatTurnState;
   /** Interrupts the running turn or background work. Absent: no Stop. */
   readonly stop?: (() => void) | undefined;
+  /**
+   * **E7's Stop all** (A7-S), drawn **in Stop's place** while `running` sub-agents run: the
+   * pill reads "Stop all" and asks this instead of {@link stop} — the session's sub-agents,
+   * then its turn and background work — with the same elapsed clock and the same stopping
+   * state. Offered even with no turn running, since a sub-agent can outlive the turn that
+   * started it (an OpenCode background child is no harness "background work"). Absent, or
+   * `running: 0`: Stop is as it was. Needs {@link stop}: a chat that cannot stop cannot stop
+   * all.
+   */
+  readonly stopAll?:
+    | {
+        readonly running: number;
+        readonly stop: () => void;
+        /** The pill's title: what Stop all stops, in the chat's words. */
+        readonly title: string;
+      }
+    | undefined;
   /** A Stop the server refused, for the F2 dialog. */
   readonly stopFailure?: ErrorNotice | undefined;
   readonly dismissStopFailure?: (() => void) | undefined;
@@ -372,7 +389,11 @@ export const composerCanSend = (composer: ChatComposerSource): boolean =>
  */
 export const stopOffered = (session: ChatSession<ThreadTurn>): boolean =>
   session.stop !== undefined &&
-  (session.turn.working || session.turn.background);
+  (session.turn.working || session.turn.background || stopsAll(session));
+
+/** Whether the Stop pill is E7's Stop all now: sub-agents run (A7-S). */
+export const stopsAll = (session: ChatSession<ThreadTurn>): boolean =>
+  session.stop !== undefined && (session.stopAll?.running ?? 0) > 0;
 
 /** The session's box when the operator can write in it, or `undefined`. */
 export const openComposer = (

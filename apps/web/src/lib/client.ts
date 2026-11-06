@@ -304,6 +304,10 @@ export const REFUSAL_TAGS = new Set([
   "ConversationStopRefused",
   // A7-Q: a question no longer waiting, answers that do not fit, a harness that did not answer.
   "QuestionRefused",
+  // A7-S: a sub-agent's Stop the server could not carry out — it runs inside the turn, it
+  // has ended, the session is not held here, the harness did not answer. A sentence for the
+  // F2 dialog; as transport trouble it would say "No server answered" about a refusal.
+  "SubagentStopRefused",
 ]);
 
 /**
@@ -1108,6 +1112,35 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.stopImporterTurn({ params: { targetId, importId } }),
+      ),
+    ),
+
+  /**
+   * Stops one sub-agent of one import's session (A7-S, E7), by its calling tool call's id.
+   * One the server cannot stop on its own is `SubagentStopRefused`, with a sentence.
+   */
+  stopImporterSubagent: (
+    baseUrl: string,
+    targetId: string,
+    importId: string,
+    callId: string,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopImporterSubagent({
+          params: { targetId, importId, callId },
+        }),
+      ),
+    ),
+
+  /**
+   * E7's Stop all for one import's session (A7-S): every sub-agent the server can stop on
+   * its own, then the turn and background work, answered as {@link stopImporterTurn} is.
+   */
+  stopImporterAll: (baseUrl: string, targetId: string, importId: string) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.stopImporterAll({ params: { targetId, importId } }),
       ),
     ),
 

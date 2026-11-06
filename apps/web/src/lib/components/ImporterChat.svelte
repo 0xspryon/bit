@@ -95,9 +95,18 @@
     type ImporterTurn,
   } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
+  import {
+    railGivesWay,
+    subagentCardId,
+    subagentGroups,
+    subagentsIn,
+  } from "../subagents";
   import AgentChip from "./AgentChip.svelte";
   import ChatShell from "./ChatShell.svelte";
   import ImporterModelPicker from "./ImporterModelPicker.svelte";
+  import SubagentCard from "./SubagentCard.svelte";
+  import SubagentChip from "./SubagentChip.svelte";
+  import SubagentPanel from "./SubagentPanel.svelte";
 
   let { app }: { app: App } = $props();
 
@@ -116,6 +125,75 @@
   );
   let groups = $derived(importer.groups);
   let target = $derived(app.selected?.name ?? app.viewTargetId);
+
+  /*
+   * ── Sub-agents (A7-S, E7/E8) ─────────────────────────────────────────────────────────
+   * Every sub-agent of the session, its newest view each, from the rows the shell draws:
+   * the chip counts them, the panel groups them, Stop all takes Stop's place while any runs.
+   *
+   * V2(chat): only the importer chat draws cards and the panel. The goal, planner and worker
+   * chats get them by passing the same three snippets and `stopAll` to `ChatShell` once
+   * they are rebuilt on it; their servers already narrate the same `SubagentView`, but have
+   * no per-sub-agent Stop route yet (`stopImporterSubagent` is the importer's).
+   */
+  let subagents = $derived(subagentsIn(groups));
+  let subagentsBy = $derived(subagentGroups(subagents));
+  /** The clock a running card's time is measured to: ticked each second while any runs. */
+  let now = $state(Date.now());
+  $effect(() => {
+    if (subagentsBy.running.length === 0) return;
+    now = Date.now();
+    const ticking = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(ticking);
+  });
+  let panelOpen = $state(false);
+  let chipButton = $state<HTMLButtonElement | undefined>(undefined);
+  /**
+   * The rail was put away by the panel, not by the operator: given back when the panel
+   * closes (the chat-shell prep's decision: at 1024px and similar the chat column would
+   * otherwise be under 560px beside a 400px panel).
+   */
+  let railTakenByPanel = false;
+
+  function openPanel(): void {
+    const shellWidth =
+      document.querySelector<HTMLElement>(".chat-shell.importer")
+        ?.clientWidth ?? window.innerWidth;
+    if (!app.drawerHidden && railGivesWay(shellWidth)) {
+      app.drawerHidden = true;
+      railTakenByPanel = true;
+    }
+    panelOpen = true;
+  }
+
+  function closePanel(): void {
+    panelOpen = false;
+    if (railTakenByPanel) {
+      railTakenByPanel = false;
+      // Given back only if the operator did not show it again meanwhile.
+      if (app.drawerHidden) app.drawerHidden = false;
+    }
+    // Back to the chip that opened it, when focus was in the panel.
+    const active = document.activeElement;
+    if (active === null || active === document.body || !active.isConnected) {
+      chipButton?.focus();
+    }
+  }
+
+  // A panel open as the chat goes (another page, another session's chat) gives the rail back.
+  $effect(() => () => {
+    if (railTakenByPanel && app.drawerHidden) app.drawerHidden = false;
+  });
+
+  /** E8: selecting a row scrolls the transcript to its card, and focus goes with it. */
+  function showCard(callId: string): void {
+    const card = document.getElementById(subagentCardId(callId));
+    if (card === null) return;
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    card.focus({ preventScroll: true });
+  }
   /** Set when the session's harness is one this server does not run: see `strandedNote`. */
   let stranded = $derived(session?.strandedOn);
   /** The replay's refusal, when it answered `refused`: which one, and the server's sentence. */
@@ -368,6 +446,18 @@
       return { working, background, stopping: importer.stopping };
     },
     stop: () => void importer.stop(),
+    /*
+     * E7's Stop all, in Stop's place while sub-agents run (A7-S): the shell's own pill, so
+     * the clock and the stopping state are Stop's. Chosen over leaving `stop` out and
+     * drawing a second pill in `controls`, which would lose both (plan, A7-S).
+     */
+    get stopAll() {
+      return {
+        running: subagentsBy.running.length,
+        stop: () => void importer.stop(true),
+        title: "Stop the importer's sub-agents, then its turn",
+      };
+    },
     get stopFailure() {
       return importer.stopFailure;
     },
@@ -434,7 +524,53 @@
   }
 </script>
 
-<ChatShell bind:this={shell} session={chat} id="importer" rootClass="importer">
+{#snippet subagentPanel()}
+  <SubagentPanel
+    groups={subagentsBy}
+    {now}
+    agent="the importer"
+    stopping={importer.subagentStopping}
+    onstop={(callId) => void importer.stopSubagent(callId)}
+    onselect={showCard}
+    onclose={closePanel}
+  />
+{/snippet}
+
+<!-- E8's panel is the shell's `aside` while it is open, and nothing otherwise. -->
+<ChatShell
+  bind:this={shell}
+  session={chat}
+  id="importer"
+  rootClass="importer"
+  aside={panelOpen ? subagentPanel : undefined}
+>
+  {#snippet subagent(row)}
+    {#if row.item.subagent !== undefined}
+      <SubagentCard
+        view={row.item.subagent}
+        {now}
+        agent="the importer"
+        stopping={importer.subagentStopping.includes(row.item.subagent.callId)}
+        onstop={(callId) => void importer.stopSubagent(callId)}
+      />
+    {:else}
+      <!-- A server from before A7-S sends no view: its type and task, as U14 drew them. -->
+      <p class="old-subagent">
+        Sub-agent {row.item.headline}: {row.item.body} ({row.item.outcome ??
+          "running"})
+      </p>
+    {/if}
+  {/snippet}
+
+  {#snippet chip()}
+    <SubagentChip
+      groups={subagentsBy}
+      open={panelOpen}
+      bind:button={chipButton}
+      ontoggle={() => (panelOpen ? closePanel() : openPanel())}
+    />
+  {/snippet}
+
   {#snippet footnote()}
     A call marked <strong>recorded</strong> is a committed event and stays on the
     Assets page. A dashed call, the importer's words and your messages are narration:
@@ -519,6 +655,11 @@
     faint; muted here, as the turn footer is, because faint is below AA at 11px and this is
     a sentence the operator reads. It gives way before the chips do.
   */
+  .old-subagent {
+    margin: 0;
+    color: var(--text-muted);
+    font: 400 12px/18px var(--font-sans);
+  }
   .hint {
     /*
      * Gives way first, and wholly, before any chip does: the chips and the send buttons are

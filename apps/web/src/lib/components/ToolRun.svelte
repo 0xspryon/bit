@@ -17,7 +17,7 @@
    * accessibility tree, so a screen reader is not read every argument on arrival.
    */
   import type { ChatRow, ToolRunSummary } from "../chat";
-  import { toolRunAttention, toolRunCount } from "../chat";
+  import { toolRunAsked, toolRunAttention, toolRunCount } from "../chat";
   import ChatItem from "./ChatItem.svelte";
   import MarkedText from "./MarkedText.svelte";
   import StreamCursor from "./StreamCursor.svelte";
@@ -32,12 +32,25 @@
   <details>
     <summary>
       <span class="mark mono" aria-hidden="true">&gt;_</span>
-      <span class="count">{toolRunCount(summary.count)}</span>
-      <span class="sep" aria-hidden="true">·</span>
-      <!-- Tool names are the harness's words for its tools: marked as code, as a signature is. -->
-      <span class="names mono"
-        ><MarkedText text={summary.names.join(", ")} code /></span
-      >
+      {#if summary.asked !== undefined}
+        <!--
+          E3: a run of the harness's question calls reads as what it was, "Asked 2
+          questions", and "waiting on you" while one has no answer yet (A7-Q's leftover,
+          done in A7-S).
+        -->
+        <span class="count">{toolRunAsked(summary.asked.questions)}</span>
+        {#if summary.asked.waiting}
+          <span class="sep" aria-hidden="true">·</span>
+          <span class="waiting">waiting on you</span>
+        {/if}
+      {:else}
+        <span class="count">{toolRunCount(summary.count)}</span>
+        <span class="sep" aria-hidden="true">·</span>
+        <!-- Tool names are the harness's words for its tools: marked as code, as a signature is. -->
+        <span class="names mono"
+          ><MarkedText text={summary.names.join(", ")} code /></span
+        >
+      {/if}
       {#if attention.length > 0}
         <span
           class="attention"
@@ -115,7 +128,8 @@
     white-space: nowrap;
     text-overflow: ellipsis;
   }
-  .attention {
+  .attention,
+  .waiting {
     flex: none;
     color: var(--state-fg-warning);
   }
