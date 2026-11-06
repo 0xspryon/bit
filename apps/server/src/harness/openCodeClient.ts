@@ -3520,6 +3520,13 @@ export const openCodeHarness = (
        * parent interrupted, which cancels the notices or stops the turn they woke. A child
        * list or a child's interrupt that fails is logged and the end goes on: the parent
        * still has to be stopped.
+       *
+       * V2(chat): the notice cannot be held back, so it wakes the parent for a turn the
+       * parent's interrupt then stops. Measured live (A7-S fix round 1, 2.2.5, GLM 5.3
+       * Flash): aborted 20 ms after it began, with no output, but stored, so the ended
+       * chat's replay closes on "The harness stopped this turn with an error: Step
+       * interrupted". V2 could read an aborted turn after the operator's end as part of the
+       * end, or ask OpenCode for a way to cancel a background job without notifying.
        */
       const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
         "openCodeHarness.endSession",
