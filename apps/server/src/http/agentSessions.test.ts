@@ -128,6 +128,41 @@ describe("an importer session", () => {
     assets: 3,
   } as const;
 
+  test("waits on the operator while held, with its newest run's question, and never once let go (A7-Q)", () => {
+    const asked: string[] = [];
+    const rows = unionAgentSessions(
+      sources({
+        importers: [
+          { ...importer, held: true, latestImportId: "imp_live" },
+          { ...importer, held: false, latestImportId: "imp_gone" },
+        ],
+        waiting: (subject) => {
+          asked.push(subject._tag === "import" ? subject.importId : subject._tag);
+          return "2 questions — Hosts";
+        },
+      }),
+    ).rows;
+    expect(rows.map((row) => row.waiting)).toEqual([
+      "2 questions — Hosts",
+      null,
+    ]);
+    expect(asked).toEqual(["imp_live"]);
+    const page = pageAgentSessions(
+      { rows, workersOmitted: 0 },
+      {
+        tab: "active",
+        needsYou: false,
+        agent: undefined,
+        q: "",
+        page: 1,
+        pageSize: 25,
+        timeZone: "UTC",
+      },
+    );
+    expect(page.counts.needsYou).toBe(1);
+    expect(page.sessions[0]?.group).toBe("needs_you");
+  });
+
   test("a held session is live even beside an earlier ending", () => {
     const [row] = unionAgentSessions(
       sources({
@@ -524,7 +559,7 @@ describe("a page of the list", () => {
         goalLive: () => ({ sessionId: "ses_goal_1", model: "x/y" }),
       }),
     );
-    // A7-Q will supply this; the plumbing is what is under test.
+    // The page's plumbing is what is under test; A7-Q's source has its own test above.
     const waiting = rows.map((row) =>
       row.kind === "goal" ? { ...row, waiting: "question 1 of 3" } : row,
     );

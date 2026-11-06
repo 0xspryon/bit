@@ -92,6 +92,9 @@ import type {
   ContextBreakdown,
   ContextReading,
   ModelOptionSelection,
+  QuestionAnswers,
+  QuestionField,
+  QuestionSettlement,
 } from "@bit/contracts";
 import {
   Context,
@@ -102,7 +105,11 @@ import {
 } from "effect";
 
 import type { MessageAttachment, ReplayedAttachment } from "./attachments";
-import type { HarnessDecodeError, HarnessTransportError } from "./errors";
+import type {
+  HarnessDecodeError,
+  HarnessTransportError,
+  QuestionNotPending,
+} from "./errors";
 import type { HarnessInstance, ModelProvenance } from "./identity";
 import type { GateInstaller } from "../policy/install";
 
@@ -756,10 +763,51 @@ export type NarrationDetail =
        * transport's own words for the break, `""` on `restored`.
        */
       readonly _tag: "connection";
-      readonly state: "reconnecting" | "restored" | "lost";
+      /**
+       * `closed` is never a driver's: the surface publishing a session's narration says it
+       * stopped holding the session (A7-Q), as the narration's last entry.
+       */
+      readonly state: "reconnecting" | "restored" | "lost" | "closed";
       readonly reason: string;
     }
+  | {
+      /**
+       * The agent asked the operator something and is waiting on the answer (A7-Q): Claude
+       * Code's `AskUserQuestion`, caught before it runs; an OpenCode form of kind `question`.
+       * One entry per request, when it is made. {@link AgentHarness.pendingQuestions} is
+       * what a reader that joined later asks instead.
+       */
+      readonly _tag: "question";
+      readonly question: HarnessQuestion;
+    }
+  | {
+      /**
+       * A question stopped waiting (A7-Q): answered or dismissed through this harness
+       * ({@link AgentHarness.answerQuestion}, {@link AgentHarness.dismissQuestion}), or
+       * `withdrawn` without either — a Stop, the session ending, the harness forgetting it.
+       */
+      readonly _tag: "questionSettled";
+      readonly questionId: string;
+      readonly settled: QuestionSettlement;
+    }
   | { readonly _tag: "opaque" };
+
+/**
+ * One request for the operator's answers, as a driver holds it (A7-Q).
+ *
+ * The harness-neutral half of the contract's `PendingQuestion`: what was asked, under the
+ * harness's own id. Whose session it is and whether it can still be answered are the
+ * caller's to add, because only the caller knows which import or goal holds the session.
+ */
+export interface HarnessQuestion {
+  /** Claude Code's tool-use id; OpenCode's form id. */
+  readonly questionId: string;
+  readonly fields: readonly [QuestionField, ...QuestionField[]];
+  /** When it was asked, on this server's clock, when known. */
+  readonly askedAt: number | undefined;
+  /** The tool call that asked it, when the harness said: what a replay finds it by. */
+  readonly callId: string | undefined;
+}
 
 /**
  * Where a sub-agent stands, as {@link SubagentState} says it.
@@ -1127,6 +1175,17 @@ export class AgentHarness extends Context.Service<
        * conversation unanswerable from its second message on.
        */
       readonly multiTurn?: boolean | undefined;
+      /**
+       * Whether the agent may stop and ask the operator through the harness's own question
+       * tool (A7-Q), because a chat on screen draws the question and answers it.
+       *
+       * **Claude Code**: only a session that says yes is offered `AskUserQuestion` at all
+       * (`claudeCodeClient.ts`, `answerHook`); one that does not would park its agent on a
+       * question nothing shows for up to a day. **OpenCode** offers its `question` tool to
+       * every session whatever this says, as it did before A7-Q; a question the operator
+       * cannot see is the V2 note on the goal chat (`plan/goalConversation.ts`).
+       */
+      readonly operatorQuestions?: boolean | undefined;
       /**
        * Continue this existing session of this harness instead of creating one.
        *
@@ -1545,6 +1604,42 @@ export class AgentHarness extends Context.Service<
     readonly holding: (
       sessionId: string,
     ) => Effect.Effect<boolean, HarnessFailure>;
+    /**
+     * The questions this session's agent is waiting on the operator for, oldest first (A7-Q).
+     *
+     * What a page that loaded after the `question` narration reads instead: the request is
+     * re-read from where the harness keeps it. **Claude Code** answers from this process's
+     * own map of `AskUserQuestion` calls it is holding (`[]` for a session it does not hold:
+     * a request lives only as long as the CLI that made it); **OpenCode** asks the server
+     * (`session.form.list`), which keeps forms in memory, so a restarted OpenCode server
+     * answers `[]` for a question it was holding.
+     */
+    readonly pendingQuestions: (
+      sessionId: string,
+    ) => Effect.Effect<readonly HarnessQuestion[], HarnessFailure>;
+    /**
+     * Answers one pending question, so the agent carries on with the answers (A7-Q).
+     *
+     * `answers` are keyed by `QuestionField.key` and checked by the caller first
+     * (`questionAnswersProblem`). Fails with {@link QuestionNotPending} when the harness is no
+     * longer waiting on it. **Claude Code**: the held `AskUserQuestion` is allowed with the
+     * answers as its input (multi-select answers comma-joined, as the CLI's own dialog does);
+     * **OpenCode**: `session.form.reply`.
+     */
+    readonly answerQuestion: (
+      sessionId: string,
+      questionId: string,
+      answers: QuestionAnswers,
+    ) => Effect.Effect<void, HarnessFailure | QuestionNotPending>;
+    /**
+     * Dismisses one pending question: the harness's request is cancelled and the agent is
+     * told the operator declined to answer (`QUESTION_DISMISSED_MESSAGE`, `harness/questions.ts`), and goes on
+     * from there. Fails with {@link QuestionNotPending} as {@link answerQuestion} does.
+     */
+    readonly dismissQuestion: (
+      sessionId: string,
+      questionId: string,
+    ) => Effect.Effect<void, HarnessFailure | QuestionNotPending>;
     /**
      * Ends one session, so that **nothing of it runs after this returns**: the turn in
      * flight is stopped, and a message queued behind it is dropped rather than run.

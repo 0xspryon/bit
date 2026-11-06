@@ -40,6 +40,7 @@ import { Schema } from "effect";
 import { SteerUrgency } from "./conversationTurn";
 import { LiveItem } from "./live";
 import { MessageAttachmentView } from "./messageUpload";
+import { PendingQuestion } from "./question";
 
 /**
  * The three tools the importer has, and the only three values this can ever hold.
@@ -990,6 +991,16 @@ const ImporterConversationViewFields = {
    * conversation.
    */
   queued: Schema.Array(ImporterQueuedMessage),
+  /**
+   * The question the session's agent is waiting on, or null (A7-Q).
+   *
+   * Re-read on every replay: from the harness when this process holds the session — Claude
+   * Code's pending `AskUserQuestion`, OpenCode's pending forms — and `live` then; otherwise
+   * from the transcript, when its last question call was never answered and no message of the
+   * operator's came after it, as `message` where a message would carry the session on and
+   * `not_resumable` where none would. The newest one, when a harness holds several.
+   */
+  question: Schema.NullOr(PendingQuestion),
   /** Messages this answer stopped short of. */
   truncated: Schema.Boolean,
   /** How many harness entries produced no item. See `RoundNarration.omittedBlank`. */

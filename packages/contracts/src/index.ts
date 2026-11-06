@@ -23,6 +23,7 @@ export * from "./goalAgent";
 export * from "./messageUpload";
 export * from "./event";
 export * from "./live";
+export * from "./question";
 export * from "./narrationCaps";
 export * from "./mcpToolName";
 export * from "./unknownField";

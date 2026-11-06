@@ -6003,6 +6003,12 @@ export class App {
       }
       return;
     }
+    if (frame._tag === "question") {
+      // An agent asked the operator something, or stopped waiting (A7-Q): Needs you and the
+      // rail's count move now, not at the next quiet moment.
+      this.#agentSessionsMoved(targetId);
+      return;
+    }
     if (frame._tag === "usage") {
       /*
        * One model call's measurement, kept against its own session and nothing else.

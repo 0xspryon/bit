@@ -38,10 +38,12 @@ import {
   openCodeContext,
   openCodeHarness,
   openCodeNarration,
+  openCodeQuestionOf,
   openCodeSubagents,
   outcomeIsLastTurns,
 } from "./openCodeClient";
 import { withAttachmentLines } from "./attachments";
+import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 
 import { HarnessResolver } from "./resolver";
 import { HarnessSessionStatus } from "../recovery/harnessStatus";
@@ -4029,5 +4031,248 @@ describe("how full a session's window is (A6 U9)", () => {
       "desc",
       "desc",
     ]);
+  });
+});
+
+/* ── Questions: OpenCode's forms (A7-Q) ──────────────────────────────────────── */
+
+describe("the question dock's OpenCode half: forms (A7-Q)", () => {
+  /** A form the 2.2.5 `question` tool opens: one field per question, `q0…qN`. */
+  const questionForm = (id = "frm_1", session = "ses_1") => ({
+    id,
+    sessionID: session,
+    title: "Questions",
+    metadata: { kind: "question", tool: { messageID: "msg_1", id: "call_1" } },
+    fields: [
+      {
+        key: "q0",
+        type: "string",
+        title: "Colour",
+        description: "Which colour do you prefer?",
+        options: [
+          { value: "Red", label: "Red", description: "warm" },
+          { value: "Blue", label: "Blue" },
+        ],
+        custom: true,
+      },
+      {
+        key: "q1",
+        type: "multiselect",
+        title: "Sizes",
+        description: "Which sizes do you want?",
+        options: [
+          { value: "S", label: "S" },
+          { value: "L", label: "L" },
+        ],
+        custom: true,
+      },
+      { key: "q2", type: "string", description: "Anything else?", required: true },
+    ],
+  });
+  /** An MCP elicitation's form: not a question this build draws. */
+  const otherForm = {
+    id: "frm_other",
+    sessionID: "ses_1",
+    title: "Sign in",
+    fields: [{ key: "ok", type: "boolean" }],
+  };
+
+  test("a question form is the question it asks: kinds, options, keys and the required flag", () => {
+    const question = openCodeQuestionOf(questionForm());
+    expect(question?.questionId).toBe("frm_1");
+    expect(question?.callId).toBe("call_1");
+    expect(
+      question?.fields.map(
+        (field) =>
+          `${field.key} ${field.kind} ${field.header ?? "-"} | ${field.question} | ${field.options.map((option) => option.label).join(",")} | ${String(field.custom)} ${String(field.required)}`,
+      ),
+    ).toEqual([
+      "q0 one Colour | Which colour do you prefer? | Red,Blue | true false",
+      "q1 any Sizes | Which sizes do you want? | S,L | true false",
+      "q2 text - | Anything else? |  | true true",
+    ]);
+    expect(question?.fields[0].options[0]?.description).toBe("warm");
+    expect(openCodeQuestionOf(otherForm)).toBeUndefined();
+    expect(
+      openCodeQuestionOf({ ...questionForm(), metadata: { kind: "auth" } }),
+    ).toBeUndefined();
+  });
+
+  test("the three form events narrate a question asked, and how it stopped waiting", () => {
+    const names = new Map<string, string>();
+    const asked = openCodeNarration(
+      { type: "form.created", created: 5, data: { form: questionForm() } },
+      names,
+    );
+    expect(asked.detail._tag).toBe("question");
+    const other = openCodeNarration(
+      { type: "form.created", data: { form: otherForm } },
+      names,
+    );
+    expect(other.detail._tag).toBe("opaque");
+    const settled = (type: string, here: ReadonlyMap<string, never> | Map<string, "dismissed">) =>
+      openCodeNarration(
+        { type, data: { id: "frm_1", sessionID: "ses_1", answer: {} } },
+        names,
+        undefined,
+        new Map(),
+        undefined,
+        here,
+      ).detail;
+    expect(settled("form.replied", new Map())).toEqual({
+      _tag: "questionSettled",
+      questionId: "frm_1",
+      settled: "answered",
+    });
+    // A cancel says nothing of who cancelled: this process's own dismissal, or a withdrawal.
+    expect(
+      settled("form.cancelled", new Map([["frm_1", "dismissed" as const]])),
+    ).toMatchObject({ settled: "dismissed" });
+    expect(settled("form.cancelled", new Map())).toMatchObject({
+      settled: "withdrawn",
+    });
+  });
+
+  const asking = <A>(
+    stub: Parameters<typeof clientWith>[0],
+    use: (harness: AgentHarness["Service"]) => Effect.Effect<A, unknown>,
+  ) => {
+    const { layer, recorded } = clientWith(stub);
+    return Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.result(Effect.flatMap(AgentHarness, use)),
+          layer,
+        ),
+      ),
+    ).then((answer) => ({ answer, recorded }));
+  };
+  const listing = (url: string, init: RequestInit | undefined) =>
+    url.endsWith("/api/session/ses_1/form") && (init?.method ?? "GET") === "GET";
+
+  test("pending questions are the session's question forms, read from the server; a session it does not have waits on nothing", async () => {
+    const { answer } = await asking(
+      (url, init) =>
+        listing(url, init)
+          ? json({ data: [questionForm(), otherForm] })
+          : json({}, 500),
+      (harness) => harness.pendingQuestions("ses_1"),
+    );
+    expect(answer._tag).toBe("Success");
+    if (answer._tag !== "Success") return;
+    expect(answer.success.map((question) => question.questionId)).toEqual([
+      "frm_1",
+    ]);
+    const gone = await asking(
+      () =>
+        json({ _tag: "SessionNotFoundError", message: "no such session" }, 404),
+      (harness) => harness.pendingQuestions("ses_1"),
+    );
+    expect(gone.answer).toMatchObject({ _tag: "Success", success: [] });
+  });
+
+  test("an answer is the form's reply: a choose-one as its string, a choose-any as its list, a skipped one left out", async () => {
+    const { answer, recorded } = await asking(
+      (url, init) =>
+        listing(url, init)
+          ? json({ data: [questionForm()] })
+          : url.endsWith("/form/frm_1/reply")
+            ? Promise.resolve(new Response(null, { status: 204 }))
+            : json({}, 500),
+      (harness) =>
+        harness.answerQuestion("ses_1", "frm_1", {
+          q0: ["Blue"],
+          q1: ["S", "L"],
+          q2: ["nothing"],
+        }),
+    );
+    expect(answer._tag).toBe("Success");
+    expect(recorded.bodies.map((body) => JSON.parse(body) as unknown)).toEqual([
+      { answer: { q0: "Blue", q1: ["S", "L"], q2: "nothing" } },
+    ]);
+    const skipped = await asking(
+      (url, init) =>
+        listing(url, init)
+          ? json({ data: [questionForm()] })
+          : Promise.resolve(new Response(null, { status: 204 })),
+      (harness) =>
+        harness.answerQuestion("ses_1", "frm_1", { q0: [], q2: ["x"] }),
+    );
+    expect(JSON.parse(skipped.recorded.bodies[0] ?? "{}")).toEqual({
+      answer: { q2: "x" },
+    });
+  });
+
+  test("a dismissal cancels the form with the sentence the agent is told", async () => {
+    const { answer, recorded } = await asking(
+      (url, init) =>
+        init?.method === "DELETE"
+          ? Promise.resolve(new Response(null, { status: 204 }))
+          : json({}, 500),
+      (harness) => harness.dismissQuestion("ses_1", "frm_1"),
+    );
+    expect(answer._tag).toBe("Success");
+    const asked = new URL(recorded.urls[0] ?? "http://x/");
+    expect(`${recorded.methods[0] ?? ""} ${asked.pathname}`).toBe(
+      "DELETE /api/session/ses_1/form/frm_1",
+    );
+    expect(asked.searchParams.get("message")).toBe(QUESTION_DISMISSED_MESSAGE);
+  });
+
+  test("a form the server no longer waits on is refused as settled — FormAlreadySettledError, FormNotFoundError — and refused answers as invalid", async () => {
+    const replyWith = (body: unknown, status: number) =>
+      asking(
+        (url, init) =>
+          listing(url, init)
+            ? json({ data: [questionForm()] })
+            : json(body, status),
+        (harness) => harness.answerQuestion("ses_1", "frm_1", { q2: ["x"] }),
+      );
+    const settled = await replyWith(
+      { _tag: "FormAlreadySettledError", id: "frm_1", message: "settled" },
+      409,
+    );
+    expect(settled.answer).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending", reason: "settled" },
+    });
+    const invalid = await replyWith(
+      { _tag: "FormInvalidAnswerError", id: "frm_1", message: "bad" },
+      400,
+    );
+    expect(invalid.answer).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending", reason: "invalid" },
+    });
+    const forgotten = await asking(
+      () =>
+        json({ _tag: "FormNotFoundError", id: "frm_1", message: "gone" }, 404),
+      (harness) => harness.dismissQuestion("ses_1", "frm_1"),
+    );
+    expect(forgotten.answer).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending", reason: "settled" },
+    });
+    // Not listed any more (an OpenCode restart forgot it): refused before any reply is sent.
+    const restarted = await asking(
+      (url, init) => (listing(url, init) ? json({ data: [] }) : json({}, 500)),
+      (harness) => harness.answerQuestion("ses_1", "frm_1", { q2: ["x"] }),
+    );
+    expect(restarted.answer).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending", reason: "settled" },
+    });
+    expect(restarted.recorded.urls).toHaveLength(1);
+  });
+
+  test("a server that cannot be reached is a harness failure, not a settled question", async () => {
+    const { answer } = await asking(
+      () => json({ message: "boom" }, 500),
+      (harness) => harness.dismissQuestion("ses_1", "frm_1"),
+    );
+    expect(answer).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "HarnessTransportError" },
+    });
   });
 });

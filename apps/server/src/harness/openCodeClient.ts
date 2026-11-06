@@ -63,8 +63,13 @@ import {
   type HarnessModelView,
   type ModelOptionDescriptor,
   type ModelOptionSelection,
+  type QuestionAnswers,
+  type QuestionField,
+  type QuestionKind,
+  type QuestionSettlement,
 } from "@bit/contracts";
 import { OpenCode } from "@opencode/client/effect";
+import type { Form } from "@opencode/schema/form";
 import { Mcp } from "@opencode/schema/mcp";
 import {
   ID as ModelID,
@@ -104,6 +109,7 @@ import {
   type BlockChannel,
   type HarnessContextUsage,
   type HarnessNarration,
+  type HarnessQuestion,
   type MessageEntry,
   type MessagePart,
   type NarrationDetail,
@@ -120,7 +126,12 @@ import {
   type AttachmentReader,
 } from "./attachments";
 import { isDerivedMessageId, openCodeMessageId } from "./messageId";
-import { HarnessDecodeError, HarnessTransportError } from "./errors";
+import {
+  HarnessDecodeError,
+  HarnessTransportError,
+  QuestionNotPending,
+} from "./errors";
+import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 import {
   defaultInstanceIdForDriver,
   OPENCODE_DRIVER,
@@ -128,6 +139,7 @@ import {
   type ModelProvenance,
 } from "./identity";
 import {
+  openCodeVersionSkew,
   resubscribing,
   subscribeOpenCodeEvents,
   type Resubscribed,
@@ -449,11 +461,17 @@ const EXECUTION_OUTCOMES: Readonly<Record<string, TerminalOutcome>> = {
  */
 const sessionOf = (event: unknown): string | undefined => {
   const record = (event ?? {}) as {
-    data?: { sessionID?: unknown } | undefined;
+    data?:
+      | { sessionID?: unknown; form?: { sessionID?: unknown } | undefined }
+      | undefined;
     durable?: { aggregateID?: unknown } | undefined;
   };
   const fromData = record.data?.sessionID;
   if (typeof fromData === "string") return fromData;
+  // `form.created` names its session inside the form it carries (A7-Q); the other two form
+  // events name it beside the form's id, as a session event does.
+  const fromForm = record.data?.form?.sessionID;
+  if (typeof fromForm === "string") return fromForm;
   const fromDurable = record.durable?.aggregateID;
   return typeof fromDurable === "string" ? fromDurable : undefined;
 };
@@ -644,6 +662,12 @@ export const openCodeNarration = (
    * background one's notice narrate as its state. See {@link OpenCodeSubagents}.
    */
   subagents: OpenCodeSubagents = openCodeSubagents(),
+  /**
+   * How this process settled the forms it answered or dismissed (A7-Q), by form id, so a
+   * `form.cancelled` reads as the operator's dismissal and any other as a withdrawal. A
+   * cancel event says nothing of who cancelled.
+   */
+  settledHere: ReadonlyMap<string, QuestionSettlement> = new Map(),
 ): HarnessNarration => {
   const record = (entry ?? {}) as {
     type?: unknown;
@@ -831,6 +855,29 @@ export const openCodeNarration = (
           ? { _tag: "error", message: truncateNarration(error.message) }
           : { _tag: "opaque" };
       }
+      case "form.created": {
+        // The agent asked the operator something (A7-Q). A form of any other kind is not a
+        // question this build draws; see `openCodeQuestionOf`.
+        const question = openCodeQuestionOf(data["form"]);
+        return question === undefined
+          ? { _tag: "opaque" }
+          : { _tag: "question", question };
+      }
+      case "form.replied":
+      case "form.cancelled": {
+        const id = data["id"];
+        if (typeof id !== "string") return { _tag: "opaque" };
+        return {
+          _tag: "questionSettled",
+          questionId: id,
+          settled:
+            type === "form.replied"
+              ? "answered"
+              : settledHere.get(id) === "dismissed"
+                ? "dismissed"
+                : "withdrawn",
+        };
+      }
       case "session.synthetic":
         // A background sub-agent's end; any other notice stays `opaque`, as it was.
         return (
@@ -851,6 +898,121 @@ export const openCodeNarration = (
     detail,
   };
 };
+
+/**
+ * A form as the question it asks, or `undefined` for a form that is not one (A7-Q).
+ *
+ * OpenCode 2.2.5's `question` tool asks through a form whose `metadata.kind` is
+ * `"question"`, one field per question keyed `q0…qN`: a `string` field with the options
+ * (choose one), or a `multiselect` (choose any), each with `custom: true`
+ * (`core/src/tool/plugin/question.ts`, `toField`). Its field `title` is the question's
+ * `header` and its `description` the question.
+ *
+ * V2(chat): only question forms are drawn. OpenCode also asks through forms for an MCP
+ * server's elicitation and a provider's sign-in (`number`, `boolean`, `external` fields), and
+ * such a form waits with nothing on bit's screen. Proper V2 maps every field type onto the
+ * dock — a number as words checked against its bounds, a boolean as a choose-one, an
+ * external link opened — or tells the operator the agent is waiting on something bit cannot
+ * show.
+ */
+export const openCodeQuestionOf = (
+  form: unknown,
+): HarnessQuestion | undefined => {
+  const info = (form ?? {}) as {
+    id?: unknown;
+    metadata?: { kind?: unknown; tool?: { id?: unknown } } | undefined;
+    fields?: unknown;
+  };
+  if (typeof info.id !== "string" || info.metadata?.kind !== "question") {
+    return undefined;
+  }
+  if (!Array.isArray(info.fields)) return undefined;
+  const fields = info.fields.flatMap((value: unknown): QuestionField[] => {
+    const field = (value ?? {}) as {
+      key?: unknown;
+      type?: unknown;
+      title?: unknown;
+      description?: unknown;
+      required?: unknown;
+      options?: unknown;
+      custom?: unknown;
+    };
+    if (typeof field.key !== "string") return [];
+    if (field.type !== "string" && field.type !== "multiselect") return [];
+    const options = Array.isArray(field.options)
+      ? field.options.flatMap((option: unknown) => {
+          const entry = (option ?? {}) as {
+            value?: unknown;
+            label?: unknown;
+            description?: unknown;
+          };
+          // The value is what goes back; the tool sets it to the label.
+          return typeof entry.value === "string" && entry.value.trim() !== ""
+            ? [
+                {
+                  label: entry.value,
+                  description:
+                    typeof entry.description === "string" &&
+                    entry.description.trim() !== ""
+                      ? entry.description
+                      : null,
+                },
+              ]
+            : [];
+        })
+      : [];
+    const kind: QuestionKind =
+      field.type === "multiselect"
+        ? "any"
+        : options.length === 0
+          ? "text"
+          : "one";
+    const title =
+      typeof field.title === "string" && field.title.trim() !== ""
+        ? field.title.trim()
+        : null;
+    const question =
+      typeof field.description === "string" && field.description.trim() !== ""
+        ? field.description.trim()
+        : (title ?? field.key);
+    return [
+      {
+        key: field.key,
+        header: title,
+        question,
+        kind,
+        options,
+        custom: kind === "text" || field.custom === true,
+        required: field.required === true,
+      },
+    ];
+  });
+  const [first, ...rest] = fields;
+  if (first === undefined) return undefined;
+  const call = info.metadata.tool?.id;
+  return {
+    questionId: info.id,
+    fields: [first, ...rest],
+    askedAt: undefined,
+    callId: typeof call === "string" ? call : undefined,
+  };
+};
+
+/**
+ * The operator's answers as an OpenCode form's answer: a choose-any field's as a list, any
+ * other's as its one string (`Form.Value`), a skipped one left out.
+ */
+export const openCodeFormAnswer = (
+  question: HarnessQuestion,
+  answers: QuestionAnswers,
+): Form.Answer =>
+  Object.fromEntries(
+    question.fields.flatMap((field): [string, string | string[]][] => {
+      const given = answers[field.key] ?? [];
+      if (given.length === 0) return [];
+      return [[field.key, field.kind === "any" ? [...given] : (given[0] ?? "")]];
+    }),
+  );
 
 /**
  * A change in the event stream's connection as a narration entry (U13 review 5): no
@@ -1453,6 +1615,9 @@ export const openCodeHarness = (
     AgentHarness,
     Effect.gen(function* () {
       const { server } = yield* OpenCodeServer;
+      // A server a version apart may refuse the event stream's types (U13 review 6).
+      const skew = openCodeVersionSkew(server.version);
+      if (skew !== undefined) yield* Effect.logWarning(skew);
 
       /**
        * The transport every generated call runs on.
@@ -2489,6 +2654,142 @@ export const openCodeHarness = (
         });
 
       /**
+       * The forms this process answered or dismissed, by id, so the event that follows
+       * narrates who settled it (`openCodeNarration`'s `settledHere`). Bounded by the
+       * questions the operator settles in this process's life.
+       *
+       * V2(chat): never trimmed. One entry per settled question is a few bytes; a process
+       * that lived for years would still hold them all.
+       */
+      const settledHere = new Map<string, QuestionSettlement>();
+
+      /**
+       * A form call refused because the form is no longer waiting, as the seam's refusal:
+       * `FormAlreadySettledError` and `FormNotFoundError` are settled — answered, cancelled,
+       * or gone with an OpenCode restart, since forms live in its memory — and
+       * `FormInvalidAnswerError` is the server refusing the answers themselves.
+       */
+      const formRefusal =
+        (questionId: string) =>
+        (
+          failure: HarnessTransportError | HarnessDecodeError,
+        ): Effect.Effect<
+          never,
+          HarnessTransportError | HarnessDecodeError | QuestionNotPending
+        > => {
+          const tag =
+            failure._tag === "HarnessTransportError" ? failure.tag : undefined;
+          if (
+            tag === "FormAlreadySettledError" ||
+            tag === "FormNotFoundError" ||
+            tag === "SessionNotFoundError"
+          ) {
+            return Effect.fail(
+              new QuestionNotPending({
+                questionId,
+                reason: "settled",
+                detail: `OpenCode is not waiting on form ${questionId} any more: it was answered or cancelled, or OpenCode restarted and forgot it (${tag}).`,
+              }),
+            );
+          }
+          if (tag === "FormInvalidAnswerError") {
+            return Effect.fail(
+              new QuestionNotPending({
+                questionId,
+                reason: "invalid",
+                detail: `OpenCode refused the answers to form ${questionId}: ${failure.message}`,
+              }),
+            );
+          }
+          return Effect.fail(failure);
+        };
+
+      const pendingQuestions: AgentHarness["Service"]["pendingQuestions"] =
+        Effect.fn("openCodeHarness.pendingQuestions")(function* (sessionId) {
+          const forms = yield* bounded(
+            "session.form.list",
+            timeouts.control,
+            api.session.form.list({ sessionID: sessionId }),
+          ).pipe(
+            // A session the server does not have waits on nothing.
+            Effect.catchIf(
+              (failure) =>
+                failure._tag === "HarnessTransportError" &&
+                (failure.tag === "SessionNotFoundError" ||
+                  failure.status === 404),
+              () => Effect.succeed([] as readonly unknown[]),
+            ),
+          );
+          return forms.flatMap((form) => {
+            const question = openCodeQuestionOf(form);
+            return question === undefined ? [] : [question];
+          });
+        });
+
+      /** One pending question form of this session, read back, or the seam's refusal. */
+      const pendingForm = (sessionId: string, questionId: string) =>
+        Effect.flatMap(pendingQuestions(sessionId), (questions) => {
+          const question = questions.find(
+            (candidate) => candidate.questionId === questionId,
+          );
+          return question === undefined
+            ? Effect.fail(
+                new QuestionNotPending({
+                  questionId,
+                  reason: "settled",
+                  detail: `OpenCode is not waiting on question ${questionId} in session ${sessionId}: it was answered or cancelled, or OpenCode restarted and forgot it.`,
+                }),
+              )
+            : Effect.succeed(question);
+        });
+
+      const answerQuestion: AgentHarness["Service"]["answerQuestion"] =
+        Effect.fn("openCodeHarness.answerQuestion")(
+          function* (sessionId, questionId, answers) {
+            const question = yield* pendingForm(sessionId, questionId);
+            settledHere.set(questionId, "answered");
+            yield* bounded(
+              "session.form.reply",
+              timeouts.control,
+              api.session.form.reply({
+                sessionID: sessionId,
+                formID: questionId as Form.ID,
+                answer: openCodeFormAnswer(question, answers),
+              }),
+            ).pipe(Effect.catch(formRefusal(questionId)));
+          },
+        );
+
+      /**
+       * Cancels the form **with a message**, which is what makes it a dismissal the agent is
+       * told about: OpenCode 2.2.5's question tool fails with the message as model-facing
+       * feedback and the model carries on, where a cancel without one ends the step
+       * (`core/src/tool/plugin/question.ts`).
+       */
+      const dismissQuestion: AgentHarness["Service"]["dismissQuestion"] =
+        Effect.fn("openCodeHarness.dismissQuestion")(
+          function* (sessionId, questionId) {
+            settledHere.set(questionId, "dismissed");
+            yield* bounded(
+              "session.form.cancel",
+              timeouts.control,
+              api.session.form.cancel({
+                sessionID: sessionId,
+                formID: questionId as Form.ID,
+                message: QUESTION_DISMISSED_MESSAGE,
+              }),
+            ).pipe(
+              Effect.catch(formRefusal(questionId)),
+              Effect.tapError(() =>
+                Effect.sync(() => {
+                  settledHere.delete(questionId);
+                }),
+              ),
+            );
+          },
+        );
+
+      /**
        * Whether an operator message is waiting in the session's inbox, which is where
        * OpenCode keeps one held across an interrupt (`AgentHarness.holding`).
        *
@@ -2618,6 +2919,24 @@ export const openCodeHarness = (
         const models = new Map<string, string>();
         /** The sub-agents this stream saw started. See {@link openCodeNarration}. */
         const subagents = openCodeSubagents();
+        /**
+         * The questions the session waits on, as `question` entries, read each time a
+         * connection opens (A7-Q): on the first, for a form made before this stream was
+         * asked for; after a break, for one made while it was down. A form settled in the gap
+         * is not narrated settled: the chat reads the replay on `restored`, which re-reads
+         * what is pending.
+         */
+        const pendingNow = Effect.map(
+          Effect.orElseSucceed(pendingQuestions(sessionId), () => []),
+          (questions): HarnessNarration[] =>
+            questions.map((question) => ({
+              type: "form.created",
+              sequence: undefined,
+              at: Date.now(),
+              outcome: undefined,
+              detail: { _tag: "question", question },
+            })),
+        );
         return resubscribing(() =>
           subscribeOpenCodeEvents(http, server.baseUrl),
         ).pipe(
@@ -2654,11 +2973,27 @@ export const openCodeHarness = (
                         contextLimits.get(sessionId),
                         models,
                         subagents,
+                        settledHere,
                       ),
                     )
                   : Result.fail(item),
             ),
           ),
+          // A connection's first event (`server.connected`) is not a session's, so it was
+          // filtered out above; a `restored` or the stream's first entry stands for it.
+          Stream.flatMap(
+            (entry) =>
+              entry.detail._tag === "connection" &&
+              entry.detail.state === "restored"
+                ? Stream.concat(
+                    Stream.make(entry),
+                    Stream.fromIterableEffect(pendingNow),
+                  )
+                : Stream.make(entry),
+            { concurrency: 1 },
+          ),
+          (narrated) =>
+            Stream.concat(Stream.fromIterableEffect(pendingNow), narrated),
         );
       };
 
@@ -2681,6 +3016,9 @@ export const openCodeHarness = (
         interruptSession,
         queuedOnInterrupt: "held",
         holding,
+        pendingQuestions,
+        answerQuestion,
+        dismissQuestion,
         endSession,
         sessionEvents,
       });

@@ -23,12 +23,13 @@
  * own, `stub`, rather than claiming to be OpenCode. A test that wants an attempt row to
  * name a real instance says so.
  */
-import type { ModelOptionSelection } from "@bit/contracts";
+import type { ModelOptionSelection, QuestionAnswers } from "@bit/contracts";
 import { Effect, Stream } from "effect";
 
 import {
   AgentHarness,
   type HarnessNarration,
+  type HarnessQuestion,
   type MessageEntry,
   type PromptDelivery,
   type SessionContinuation,
@@ -36,6 +37,7 @@ import {
   type SessionTitle,
 } from "./agentHarness";
 import type { MessageAttachment } from "./attachments";
+import { QuestionNotPending } from "./errors";
 import {
   DriverKind,
   defaultInstanceIdForDriver,
@@ -170,6 +172,80 @@ export const recordPrompts = (): {
   };
 };
 
+const notPending = (questionId: string): QuestionNotPending =>
+  new QuestionNotPending({
+    questionId,
+    reason: "settled",
+    detail: `the scripted harness is not waiting on question ${questionId}`,
+  });
+
+/** What {@link scriptedQuestions} saw the operator do, in order. */
+export type ScriptedQuestionCall =
+  | {
+      readonly _tag: "answered";
+      readonly sessionId: string;
+      readonly questionId: string;
+      readonly answers: QuestionAnswers;
+    }
+  | {
+      readonly _tag: "dismissed";
+      readonly sessionId: string;
+      readonly questionId: string;
+    };
+
+/**
+ * Questions a test puts in front of the operator (A7-Q): `ask` makes one pending for a
+ * session, and the three members answer from what is pending, so an answer or a dismissal
+ * settles it and a second one is refused as settled — as both real harnesses do.
+ */
+export const scriptedQuestions = (): {
+  readonly ask: (sessionId: string, question: HarnessQuestion) => void;
+  readonly calls: readonly ScriptedQuestionCall[];
+  readonly members: Pick<
+    StubHarness,
+    "pendingQuestions" | "answerQuestion" | "dismissQuestion"
+  >;
+} => {
+  const pending = new Map<string, HarnessQuestion[]>();
+  const calls: ScriptedQuestionCall[] = [];
+  const take = (
+    sessionId: string,
+    questionId: string,
+  ): Effect.Effect<void, QuestionNotPending> => {
+    const held = pending.get(sessionId) ?? [];
+    if (!held.some((question) => question.questionId === questionId)) {
+      return Effect.fail(notPending(questionId));
+    }
+    pending.set(
+      sessionId,
+      held.filter((question) => question.questionId !== questionId),
+    );
+    return Effect.void;
+  };
+  return {
+    ask: (sessionId, question) => {
+      pending.set(sessionId, [...(pending.get(sessionId) ?? []), question]);
+    },
+    calls,
+    members: {
+      pendingQuestions: (sessionId) =>
+        Effect.sync(() => [...(pending.get(sessionId) ?? [])]),
+      answerQuestion: (sessionId, questionId, answers) =>
+        Effect.tap(take(sessionId, questionId), () =>
+          Effect.sync(() => {
+            calls.push({ _tag: "answered", sessionId, questionId, answers });
+          }),
+        ),
+      dismissQuestion: (sessionId, questionId) =>
+        Effect.tap(take(sessionId, questionId), () =>
+          Effect.sync(() => {
+            calls.push({ _tag: "dismissed", sessionId, questionId });
+          }),
+        ),
+    },
+  };
+};
+
 /**
  * A scripted harness, with the members a test cares about replaced.
  *
@@ -261,6 +337,13 @@ export const stubHarness = (
     // Nothing held, which is what a `runs` harness always answers. A test about a held
     // message says so.
     holding: () => Effect.succeed(false),
+    // Asked nothing: no question waits, so an answer or a dismissal finds nothing. A test
+    // about the dock passes `scriptedQuestions`.
+    pendingQuestions: () => Effect.succeed([]),
+    answerQuestion: (_sessionId, questionId) =>
+      Effect.fail(notPending(questionId)),
+    dismissQuestion: (_sessionId, questionId) =>
+      Effect.fail(notPending(questionId)),
     // Nothing measured, no window: what a harness that has made no call answers.
     contextUsage: () =>
       Effect.succeed({

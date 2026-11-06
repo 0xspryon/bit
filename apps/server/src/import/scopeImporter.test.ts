@@ -73,6 +73,7 @@ import { ScopeImporter, type ScopeImportRequest } from "./scopeImporter";
 import type {
   AgentHarness,
   HarnessNarration,
+  HarnessQuestion,
   McpRegistration,
   MessageEntry,
   PromptDelivery,
@@ -83,6 +84,7 @@ import { HarnessResolver } from "../harness/resolver";
 import {
   STUB_INSTANCE,
   recordModelSwitches,
+  scriptedQuestions,
   stubHarness,
   type RecordedModelSwitch,
 } from "../harness/stubHarness";
@@ -344,6 +346,8 @@ interface Script {
   contextLatency: number;
   /** The model a `contextUsage` answer names for its window, if any (Claude Code's). */
   contextModel: string | undefined;
+  /** Questions the scripted agent is waiting on the operator for (A7-Q). */
+  readonly questions: ReturnType<typeof scriptedQuestions>;
   holdContinuation:
     | {
         readonly entered: Deferred.Deferred<void>;
@@ -389,6 +393,7 @@ const newScript = (readable: readonly string[]): Script => {
     contextReads: [],
     contextLatency: 0,
     contextModel: undefined,
+    questions: scriptedQuestions(),
   };
 };
 
@@ -410,6 +415,8 @@ const scriptedHarness = (script: Script) => {
       return minted === 1 ? "ses_import" : `ses_import_${String(minted)}`;
     },
     installGate: () => Effect.void,
+    // What the agent is waiting on the operator for (A7-Q): `script.questions.ask`.
+    ...script.questions.members,
     /*
      * What the harness still holds, which is the question S6 asks and `sessionStatus` is the
      * wrong one for. `script.holds` is what a test says about it; anything not in there reads
@@ -4543,6 +4550,197 @@ describe("a message's files (A6 F9)", () => {
     expect(plain._tag === "Success" && plain.success.attachments).toBe(
       undefined,
     );
+    await runtime.dispose();
+  });
+});
+
+/* ── A7-Q: the question dock, through the importer ────────────────────────────── */
+
+describe("a question the importer's agent waits on (A7-Q)", () => {
+  const QUESTION: HarnessQuestion = {
+    questionId: "toolu_q1",
+    fields: [
+      {
+        key: "Which hosts?",
+        header: "Hosts",
+        question: "Which hosts?",
+        kind: "one",
+        options: [
+          { label: "api", description: null },
+          { label: "www", description: null },
+        ],
+        custom: true,
+        required: false,
+      },
+    ],
+    askedAt: 1_700_000_000_000,
+    callId: "toolu_q1",
+  };
+
+  const questionCall = (
+    runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+    importId: string,
+    questionId: string,
+    answers?: Record<string, readonly string[]>,
+  ) =>
+    runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          answers === undefined
+            ? importer.dismissQuestion({ targetId: TARGET, importId, questionId })
+            : importer.answerQuestion({
+                targetId: TARGET,
+                importId,
+                questionId,
+                answers,
+              }),
+        ),
+      ),
+    );
+
+  test("an answer reaches the session holding it, once: a second is refused as settled", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    const answered = await questionCall(runtime, importId, "toolu_q1", {
+      "Which hosts?": ["api"],
+    });
+    expect(answered).toMatchObject({
+      _tag: "Success",
+      success: { questionId: "toolu_q1", settled: "answered" },
+    });
+    expect(built.script.questions.calls).toEqual([
+      {
+        _tag: "answered",
+        sessionId: "ses_import",
+        questionId: "toolu_q1",
+        answers: { "Which hosts?": ["api"] },
+      },
+    ]);
+    const again = await questionCall(runtime, importId, "toolu_q1", {
+      "Which hosts?": ["www"],
+    });
+    expect(again).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "settled" },
+    });
+    await runtime.dispose();
+  });
+
+  test("answers that do not fit the question are refused before the harness hears them", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    const two = await questionCall(runtime, importId, "toolu_q1", {
+      "Which hosts?": ["api", "www"],
+    });
+    expect(two).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "invalid" },
+    });
+    const stranger = await questionCall(runtime, importId, "toolu_q1", {
+      "Not asked": ["x"],
+    });
+    expect(stranger).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "invalid" },
+    });
+    expect(built.script.questions.calls).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a question another session waits on is not this import's to answer or dismiss", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_somebody_else", QUESTION);
+    const answered = await questionCall(runtime, importId, "toolu_q1", {
+      "Which hosts?": ["api"],
+    });
+    expect(answered).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "settled" },
+    });
+    const dismissed = await questionCall(runtime, importId, "toolu_q1");
+    expect(dismissed).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "settled" },
+    });
+    expect(built.script.questions.calls).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a dismissal cancels the harness's request; an unknown import is a 404's error", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    const dismissed = await questionCall(runtime, importId, "toolu_q1");
+    expect(dismissed).toMatchObject({
+      _tag: "Success",
+      success: { settled: "dismissed" },
+    });
+    expect(built.script.questions.calls.map((call) => call._tag)).toEqual([
+      "dismissed",
+    ]);
+    const unknown = await questionCall(runtime, "imp_nope", "toolu_q1");
+    expect(unknown).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "ScopeImportNotFound" },
+    });
+    await runtime.dispose();
+  });
+
+  test("a replay offers what the harness is waiting on as live, and nothing once it is answered", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    const waiting = await replayOf(runtime, importId);
+    expect(waiting.question).toMatchObject({
+      questionId: "toolu_q1",
+      answerability: "live",
+      importId,
+      harnessSessionId: "ses_import",
+    });
+    await questionCall(runtime, importId, "toolu_q1", {
+      "Which hosts?": ["api"],
+    });
+    const answered = await replayOf(runtime, importId);
+    expect(answered.question).toBeNull();
+    await runtime.dispose();
+  });
+
+  test("a question narrated is waiting on the bus until settled, and the narrator's close says `closed` and clears it", async () => {
+    const collected = collectNarration(4);
+    const { built, runtime, importId } = await (async () => {
+      const opened = await importWith([PAGE_GOOD], {
+        links: [PAGE_GOOD],
+        beforeStart: collected.beforeStart,
+      });
+      if (opened.started._tag !== "started") throw new Error("no import");
+      return { ...opened, importId: opened.started.importId };
+    })();
+    const waitingOf = () =>
+      runtime.runPromise(
+        Effect.flatMap(RunNarrations, (bus) =>
+          bus.waiting({ _tag: "import", importId }),
+        ),
+      );
+    built.script.emit?.({
+      type: "question",
+      sequence: undefined,
+      at: 1_700_000_000_100,
+      outcome: undefined,
+      detail: { _tag: "question", question: QUESTION },
+    });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await waitingOf()) !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect((await waitingOf())?.questionId).toBe("toolu_q1");
+    await runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) => importer.stop(importId)),
+    );
+    expect(await waitingOf()).toBeUndefined();
+    const said = (await collected.taken()).map((item) =>
+      item.entry.detail._tag === "connection"
+        ? `connection ${item.entry.detail.state}`
+        : item.entry.detail._tag,
+    );
+    expect(said).toEqual(["reply", "reply", "question", "connection closed"]);
     await runtime.dispose();
   });
 });

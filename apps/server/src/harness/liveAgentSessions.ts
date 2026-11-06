@@ -134,10 +134,13 @@ const createGatedSession = (
     readonly options?: readonly ModelOptionSelection[] | undefined;
     /** An existing session to continue rather than create. See {@link OpenPlan.resume}. */
     readonly resume?: string | undefined;
+    /** See {@link OpenPlan.operatorQuestions}. */
+    readonly operatorQuestions?: boolean | undefined;
   },
 ) =>
   harness.createSession({
     title: input.title,
+    ...(input.operatorQuestions === true ? { operatorQuestions: true } : {}),
     model: input.model,
     directory: input.directory,
     ...(input.options === undefined ? {} : { options: input.options }),
@@ -278,6 +281,12 @@ export interface OpenPlan<Meta> {
    * {@link sessionId} is ignored when this is set.
    */
   readonly resume?: string | undefined;
+  /**
+   * Whether the session's agent may ask the operator questions through the harness's own
+   * question tool (A7-Q, `AgentHarness.createSession`'s `operatorQuestions`). Only a surface
+   * that draws the question dock and answers it says yes: the importer.
+   */
+  readonly operatorQuestions?: boolean | undefined;
   readonly title: string;
   /** Makes the role directory. Gated by the spine and by no other code path. */
   readonly ensureDirectory: Effect.Effect<
@@ -946,6 +955,9 @@ export const makeLiveAgentSessions = <Meta>(
             sessionId: plan.sessionId,
             ...(plan.options === undefined ? {} : { options: plan.options }),
             ...(plan.resume === undefined ? {} : { resume: plan.resume }),
+            ...(plan.operatorQuestions === true
+              ? { operatorQuestions: true }
+              : {}),
           }).pipe(
             // Held from the moment it exists, so the gate allows it — including when an
             // older opening of the same id ends while this one is still being built.

@@ -102,6 +102,28 @@ export class HarnessProcessError extends Schema.TaggedError<HarnessProcessError>
   }
 }
 
+/**
+ * An answer or a dismissal for a question the harness is no longer waiting on (A7-Q).
+ *
+ * `settled` — the request was answered, dismissed or withdrawn already, or the harness never
+ * held it (OpenCode's `FormAlreadySettledError` and `FormNotFoundError`, Claude Code's
+ * pending map without it). `invalid` — the harness refused the answers themselves
+ * (OpenCode's `FormInvalidAnswerError`); bit checks them first with
+ * `questionAnswersProblem`, so this is the harness and bit disagreeing.
+ */
+export class QuestionNotPending extends Schema.TaggedError<QuestionNotPending>()(
+  "QuestionNotPending",
+  {
+    questionId: Schema.String,
+    reason: Schema.Literals(["settled", "invalid"]),
+    detail: Schema.String,
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 /** Anything the harness seam can fail with as an expected condition. */
 export type HarnessError =
   HarnessTransportError | HarnessDecodeError | HarnessProcessError;

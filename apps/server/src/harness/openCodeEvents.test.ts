@@ -10,8 +10,11 @@ import { FetchHttpClient } from "effect/http";
 import { AgentHarness, type HarnessNarration } from "./agentHarness";
 import { openCodeHarness } from "./openCodeClient";
 import {
+  MANIFEST_EVENT_TYPES,
   NARRATED_EVENT_TYPES,
+  OPENCODE_CLIENT_VERSION,
   OPENCODE_EVENT_MAX_CHARS,
+  openCodeVersionSkew,
   resubscribeDelay,
   resubscribing,
   type Resubscribed,
@@ -145,23 +148,45 @@ describe("resubscribing", () => {
 });
 
 describe("the subscription the driver makes", () => {
-  test("names every session event but the one that carries a prompt's files", () => {
-    expect(NARRATED_EVENT_TYPES).not.toContain("session.inbox.enqueued");
-    for (const type of [
-      "session.inbox.delivered",
-      "session.execution.started",
-      "session.execution.succeeded",
-      "session.text.delta",
-      "session.text.ended",
-      "session.tool.success",
-      "session.step.ended",
-      "session.synthetic",
-    ]) {
+  test("names the question forms' three events, so the dock hears of a question (A7-Q)", () => {
+    for (const type of ["form.created", "form.replied", "form.cancelled"]) {
       expect(NARRATED_EVENT_TYPES).toContain(type);
     }
-    expect(
-      NARRATED_EVENT_TYPES.every((type) => type.startsWith("session.")),
-    ).toBe(true);
+  });
+
+  test("names exactly the types the narration reads, each one the client's server defines, and never the one that carries a prompt's files", async () => {
+    // The `case` labels of `openCodeNarration`'s switch and the keys of its outcome table:
+    // a type the narration reads that is not subscribed to would never arrive.
+    const source = await Bun.file(
+      new URL("./openCodeClient.ts", import.meta.url),
+    ).text();
+    const start = source.indexOf("export const openCodeNarration");
+    const end = source.indexOf("export const connectionNarration");
+    const cases = [
+      ...source.slice(start, end).matchAll(/case "([a-z.]+)":/gu),
+    ].map((match) => match[1] ?? "");
+    const outcomes = [
+      ...source.matchAll(/"(session\.execution\.[a-z]+)": "[a-z]+",/gu),
+    ].map((match) => match[1] ?? "");
+    expect(cases.length).toBeGreaterThan(10);
+    expect([...NARRATED_EVENT_TYPES].sort()).toEqual(
+      [...new Set([...cases, ...outcomes])].sort(),
+    );
+    for (const type of NARRATED_EVENT_TYPES) {
+      expect(MANIFEST_EVENT_TYPES.has(type)).toBe(true);
+    }
+    expect(NARRATED_EVENT_TYPES).not.toContain("session.inbox.enqueued");
+  });
+
+  test("a server a version apart is said at boot, and a match or an unknown client says nothing", () => {
+    expect(openCodeVersionSkew("2.2.5", "2.2.5")).toBeUndefined();
+    expect(openCodeVersionSkew("2.2.5", undefined)).toBeUndefined();
+    const said = openCodeVersionSkew("2.3.0", "2.2.5") ?? "";
+    expect(said).toContain("2.3.0");
+    expect(said).toContain("2.2.5");
+    expect(said).toContain("refuses");
+    // The installed client's own version is found, so the check is live.
+    expect(OPENCODE_CLIENT_VERSION).toMatch(/^\d+\.\d+\.\d+/u);
   });
 
   /** A text event of `session`, as OpenCode sends it. */
@@ -201,6 +226,14 @@ describe("the subscription the driver makes", () => {
     const fetchStub = Object.assign(
       (input: URL | RequestInfo) => {
         const url = String(input instanceof Request ? input.url : input);
+        // A session's pending forms, read as each connection opens (A7-Q): none here.
+        if (/\/api\/session\/[^/]+\/form/u.test(url)) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ data: [] }), {
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
         if (url.includes("/api/model")) {
           return Promise.resolve(
             new Response(

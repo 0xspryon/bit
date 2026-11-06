@@ -133,6 +133,7 @@ import {
   type MessageEntry,
   type MessagePart,
 } from "../harness/agentHarness";
+import { pendingQuestionView } from "../harness/questions";
 import type {
   NarrationSubject,
   RunNarration,
@@ -1214,6 +1215,31 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         roundId: base.roundId,
         goalId: base.goalId,
         importId: base.importId,
+        at: base.at,
+      };
+    case "question":
+      // The agent is waiting on the operator (A7-Q): a frame about the session, not a row
+      // in it. The tool call that asked is its own `tool.call` item, as any call is.
+      return {
+        _tag: "question",
+        questionId: detail.question.questionId,
+        question: pendingQuestionView({
+          question: detail.question,
+          harnessSessionId: item.harnessSessionId,
+          subject: subjectIds(item.subject),
+          answerability: "live",
+        }),
+        settled: null,
+        ...subjectIds(item.subject),
+        at: base.at,
+      };
+    case "questionSettled":
+      return {
+        _tag: "question",
+        questionId: detail.questionId,
+        question: null,
+        settled: detail.settled,
+        ...subjectIds(item.subject),
         at: base.at,
       };
     case "opaque":

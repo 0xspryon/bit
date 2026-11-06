@@ -52,7 +52,10 @@
 import type { AgentSessionActivity } from "@bit/contracts";
 import { Channel, Context, Effect, Layer, PubSub, Stream } from "effect";
 
-import type { HarnessNarration } from "../harness/agentHarness";
+import type {
+  HarnessNarration,
+  HarnessQuestion,
+} from "../harness/agentHarness";
 import { SessionActivities } from "./sessionActivity";
 
 /**
@@ -262,6 +265,14 @@ export class RunNarrations extends Context.Service<
     readonly activity: (
       subject: NarrationSubject,
     ) => Effect.Effect<AgentSessionActivity | undefined>;
+    /**
+     * The newest question one subject's agent is waiting on the operator for (A7-Q), from
+     * what was published for it: the Agent sessions list's Needs you, and the rail's count.
+     * Memory, like {@link activity}; `undefined` when it waits on nothing this process saw.
+     */
+    readonly waiting: (
+      subject: NarrationSubject,
+    ) => Effect.Effect<HarnessQuestion | undefined>;
   }
 >()("bit/run/RunNarrations") {
   static readonly layer: Layer.Layer<RunNarrations> = Layer.effect(
@@ -323,6 +334,7 @@ export class RunNarrations extends Context.Service<
           ),
         subscriberCount: Effect.sync(() => subscribers),
         activity: (subject) => Effect.sync(() => activities.get(subject)),
+        waiting: (subject) => Effect.sync(() => activities.waiting(subject)),
       });
     }),
   );

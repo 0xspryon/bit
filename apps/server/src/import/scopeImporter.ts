@@ -118,6 +118,8 @@ import {
   ConversationModelRefused,
   ConversationStopRefused,
   ImporterConversationRefused,
+  QuestionRefused,
+  questionAnswersProblem,
   SCOPE_IMPORT_MAX_LINKS,
   ScopeImportNotFound,
   type ConversationModelDraft,
@@ -130,6 +132,9 @@ import {
   type ImporterTurnAccepted,
   type ImportModelDraft,
   type ModelOptionSelection,
+  type PendingQuestion,
+  type QuestionAnswers,
+  type QuestionSettled,
   type ScopeImportView,
   type SteerUrgency,
 } from "@bit/contracts";
@@ -162,7 +167,9 @@ import {
   lastAssistantText,
   truncateNarration,
   type AgentHarness,
+  type HarnessFailure,
 } from "../harness/agentHarness";
+import type { QuestionNotPending } from "../harness/errors";
 import {
   makeLiveAgentSessions,
   type LiveAgentSession,
@@ -171,6 +178,10 @@ import {
 } from "../harness/liveAgentSessions";
 import { attachmentView, type MessageAttachment } from "../harness/attachments";
 import { resolveSessionModelOptions } from "../harness/modelOptions";
+import {
+  pendingQuestionView,
+  transcriptQuestionId,
+} from "../harness/questions";
 import {
   checkModelSwitch,
   type CheckedModelSwitch,
@@ -559,6 +570,30 @@ export class ScopeImporter extends Context.Service<
       ConversationStopRefused | ScopeImportNotFound
     >;
     /**
+     * Answers the question one import's agent is waiting on (A7-Q), in the import holding
+     * the session now, as {@link stopTurn} finds it. The answers are checked against the
+     * question the harness holds first. A question the harness is no longer waiting on —
+     * including one read back from the transcript, whose request is gone — is refused
+     * `settled`; the dock then offers the answers as a message.
+     */
+    readonly answerQuestion: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+      readonly questionId: string;
+      readonly answers: QuestionAnswers;
+    }) => Effect.Effect<QuestionSettled, QuestionRefused | ScopeImportNotFound>;
+    /**
+     * Dismisses the question one import's agent is waiting on (A7-Q): the harness's request
+     * is cancelled, so the agent is told the operator declined. A question read back from
+     * the transcript (`call:<id>`) has no request left to cancel, and is put away instead:
+     * the replay stops offering it while this process runs.
+     */
+    readonly dismissQuestion: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+      readonly questionId: string;
+    }) => Effect.Effect<QuestionSettled, QuestionRefused | ScopeImportNotFound>;
+    /**
      * Whether a turn, or background work, is running in one import's session (A6 U6): the
      * spine's `status`, for the import holding the session now, found as {@link stopTurn}
      * finds it. Never fails but for an import this target does not hold: a record that cannot
@@ -887,9 +922,35 @@ export class ScopeImporter extends Context.Service<
         readonly importId: string;
         readonly sessionId: string;
       }) {
-        // Block deltas coalesced into partial updates for the live chat, and published
-        // nowhere else (`run/streamingCoalescer.ts`).
+        /*
+         * The narration's last word for this session (A7-Q, from the chat shell's review 2):
+         * when the narrator goes — the spine interrupts it first on every close, and a
+         * stream can also end — a `connection` `closed` is published, so a chat open on the
+         * session learns that its authority ended here even when the end came from outside
+         * the page (another tab, the API, a shutdown), and a question still docked hears it
+         * is withdrawn. Published under `ensuring`, so an interrupt still sends it.
+         */
+        const closed = Effect.suspend(() =>
+          narrations.publish({
+          targetId: input.targetId,
+          subject: { _tag: "import", importId: input.importId },
+          harnessSessionId: input.sessionId,
+          entry: {
+            type: "bit.connection.closed",
+            sequence: undefined,
+            at: Date.now(),
+            outcome: undefined,
+            detail: {
+              _tag: "connection",
+              state: "closed",
+              reason: "this server stopped holding the session",
+            },
+          },
+          }),
+        );
         const outcome = yield* Effect.result(
+          // Block deltas coalesced into partial updates for the live chat, and published
+          // nowhere else (`run/streamingCoalescer.ts`).
           narrateCoalesced({
             events: input.harness.sessionEvents(input.sessionId),
             publish: (entry) => {
@@ -915,11 +976,11 @@ export class ScopeImporter extends Context.Service<
                 entry,
               });
             },
-          }),
+          }).pipe(Effect.ensuring(closed)),
         );
         if (outcome._tag === "Failure") {
           yield* Effect.logWarning(
-            "a scope import's narration stream ended; this says nothing about the session, and the next message still reaches it",
+            "a scope import's narration stream failed; this says nothing about the session, and the next message still reaches it",
             {
               importId: input.importId,
               sessionId: input.sessionId,
@@ -1023,6 +1084,9 @@ export class ScopeImporter extends Context.Service<
                 input.request.targetId,
                 resume?.directoryImportId ?? input.importId,
               ),
+              // The importer draws the question dock and answers it (A7-Q), so its agent
+              // may ask the operator through the harness's own question tool.
+              operatorQuestions: true,
               // The engagement folder, so the containment check can refuse an import
               // directory inside it. `undefined` says this target has none.
               workspace: input.request.workspacePath ?? undefined,
@@ -2144,7 +2208,59 @@ export class ScopeImporter extends Context.Service<
                 .filter((message) => !written.has(message.messageId))
                 .sort((left, right) => left.acceptedAt - right.acceptedAt)
             : [],
+          question: yield* questionNow(input.importId, held, view.question),
         };
+      });
+
+      /**
+       * Question ids read back from a transcript that the operator put away (A7-Q), by
+       * harness session: the replay stops offering them. In this process's memory only.
+       *
+       * V2(chat): a restart forgets them, so a question the operator dismissed after its
+       * request was already gone is offered again (as a message) until they write again.
+       * Proper V2 keeps the dismissal beside the import's row.
+       */
+      const putAway = new Map<string, Set<string>>();
+
+      /**
+       * The question a replay offers (A7-Q): the newest one the harness is still waiting
+       * on, as `live`, when this process holds the session; otherwise what the transcript
+       * ends on (`importerConversation`), unless the operator put it away.
+       *
+       * A harness that cannot be asked leaves the transcript's answer standing: a question
+       * it may still hold is offered as a message rather than not at all.
+       */
+      const questionNow = Effect.fnUntraced(function* (
+        importId: string,
+        held: LiveAgentSession<ImportSessionMeta> | undefined,
+        fromTranscript: PendingQuestion | null,
+      ) {
+        if (held !== undefined) {
+          const asked = yield* Effect.result(
+            held.harness.pendingQuestions(held.sessionId),
+          );
+          const newest =
+            asked._tag === "Success" ? asked.success.at(-1) : undefined;
+          if (newest !== undefined) {
+            return pendingQuestionView({
+              question: newest,
+              harnessSessionId: held.sessionId,
+              subject: {
+                attemptId: null,
+                roundId: null,
+                goalId: null,
+                importId,
+              },
+              answerability: "live",
+            });
+          }
+        }
+        if (fromTranscript === null) return null;
+        return putAway
+          .get(fromTranscript.harnessSessionId)
+          ?.has(fromTranscript.questionId) === true
+          ? null
+          : fromTranscript;
       });
 
       /** The import ids a switch has claimed (`switchFrom`). */
@@ -2559,6 +2675,122 @@ export class ScopeImporter extends Context.Service<
         };
       });
 
+      /**
+       * The import a question is addressed through, and the session holding it now: the
+       * row read against the target, then followed to the newest run and any successor, as
+       * a Stop is. `undefined` for the session when this process holds none.
+       */
+      const questionSession = Effect.fnUntraced(function* (input: {
+        readonly targetId: string;
+        readonly importId: string;
+        readonly questionId: string;
+      }) {
+        const row = yield* withTargetStore(stores, input.targetId, (store) =>
+          store.importSession(input.importId),
+        ).pipe(
+          Effect.mapError(
+            (failure) =>
+              new QuestionRefused({
+                questionId: input.questionId,
+                reason: "harness_unreachable",
+                detail: `import ${input.importId}'s record could not be read (${failure.message}), so the question was not answered.`,
+              }),
+          ),
+        );
+        if (row === undefined || row.targetId !== input.targetId) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: input.importId,
+            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no question to answer`,
+          });
+        }
+        const importId = yield* holdingNow(
+          newerRun(input.importId, row) ?? input.importId,
+        );
+        return {
+          harnessSessionId: row.harnessSessionId,
+          held: sessions.get(importId),
+        };
+      });
+
+      /** A harness's refusal of an answer or dismissal, as the route's. */
+      const questionRefusal =
+        (questionId: string) =>
+        (failure: HarnessFailure | QuestionNotPending): QuestionRefused =>
+          failure._tag === "QuestionNotPending"
+            ? new QuestionRefused({
+                questionId,
+                reason: failure.reason,
+                detail: failure.detail,
+              })
+            : new QuestionRefused({
+                questionId,
+                reason: "harness_unreachable",
+                detail: `the harness did not answer (${failure.message}), so whether it took this is not known. Your answers are kept; try again.`,
+              });
+
+      const notWaiting = (questionId: string): QuestionRefused =>
+        new QuestionRefused({
+          questionId,
+          reason: "settled",
+          detail:
+            "The agent is no longer waiting on these questions: they were answered or dismissed, a Stop withdrew them, or the session was let go. Send your answers as a message instead.",
+        });
+
+      const answerQuestion: ScopeImporter["Service"]["answerQuestion"] =
+        Effect.fn("ScopeImporter.answerQuestion")(function* (input) {
+          const { held } = yield* questionSession(input);
+          if (held === undefined) {
+            return yield* notWaiting(input.questionId);
+          }
+          const asked = yield* held.harness
+            .pendingQuestions(held.sessionId)
+            .pipe(Effect.mapError(questionRefusal(input.questionId)));
+          const question = asked.find(
+            (candidate) => candidate.questionId === input.questionId,
+          );
+          if (question === undefined) {
+            return yield* notWaiting(input.questionId);
+          }
+          const problem = questionAnswersProblem(
+            question.fields,
+            input.answers,
+          );
+          if (problem !== null) {
+            return yield* new QuestionRefused({
+              questionId: input.questionId,
+              reason: "invalid",
+              detail: problem,
+            });
+          }
+          yield* held.harness
+            .answerQuestion(held.sessionId, input.questionId, input.answers)
+            .pipe(Effect.mapError(questionRefusal(input.questionId)));
+          return { questionId: input.questionId, settled: "answered" as const };
+        });
+
+      const dismissQuestion: ScopeImporter["Service"]["dismissQuestion"] =
+        Effect.fn("ScopeImporter.dismissQuestion")(function* (input) {
+          const { harnessSessionId, held } = yield* questionSession(input);
+          // Read back from a transcript: nothing native to cancel, so it is put away.
+          if (input.questionId.startsWith(transcriptQuestionId(""))) {
+            const set = putAway.get(harnessSessionId) ?? new Set<string>();
+            set.add(input.questionId);
+            putAway.set(harnessSessionId, set);
+            return {
+              questionId: input.questionId,
+              settled: "dismissed" as const,
+            };
+          }
+          if (held === undefined) {
+            return yield* notWaiting(input.questionId);
+          }
+          yield* held.harness
+            .dismissQuestion(held.sessionId, input.questionId)
+            .pipe(Effect.mapError(questionRefusal(input.questionId)));
+          return { questionId: input.questionId, settled: "dismissed" as const };
+        });
+
       const stopTurn: ScopeImporter["Service"]["stopTurn"] = Effect.fn(
         "ScopeImporter.stopTurn",
       )(function* (input) {
@@ -2600,6 +2832,8 @@ export class ScopeImporter extends Context.Service<
         replay,
         switchModel,
         stopTurn,
+        answerQuestion,
+        dismissQuestion,
         activity,
         context,
         holds: (importId) =>
@@ -2661,6 +2895,25 @@ export class ScopeImporter extends Context.Service<
           breakdown: { _tag: "none" as const, reason: "unanswered" as const },
           measuredAt,
         })),
+      // No harness, so no question anything could be waiting on.
+      answerQuestion: (input) =>
+        Effect.fail(
+          new QuestionRefused({
+            questionId: input.questionId,
+            reason: "settled",
+            detail:
+              "this server is configured with no agent harness, so no agent is waiting on a question.",
+          }),
+        ),
+      dismissQuestion: (input) =>
+        Effect.fail(
+          new QuestionRefused({
+            questionId: input.questionId,
+            reason: "settled",
+            detail:
+              "this server is configured with no agent harness, so no agent is waiting on a question.",
+          }),
+        ),
       // No harness, so no session this server could hold: nothing of any import runs here.
       stopTurn: (input) =>
         Effect.succeed(

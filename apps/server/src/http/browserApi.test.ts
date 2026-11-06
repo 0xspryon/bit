@@ -4628,6 +4628,53 @@ describe("a target's importer sessions", () => {
     expect(elsewhere.status).toBe(404);
   });
 
+  test("a question's answer and dismissal: signed in only, checked against the target, the body decoded, and refused as settled with nothing waiting (A7-Q)", async () => {
+    const answerPath = `/targets/${withSessions}/importer-sessions/imp_old/questions/toolu_1/answer`;
+    const dismissPath = `/targets/${withSessions}/importer-sessions/imp_old/questions/toolu_1/dismiss`;
+    const body = { answers: { "Which hosts?": ["api"] } };
+    // No bearer, or somebody else's: the guard answers before anything is looked up.
+    for (const [path, bearer] of [
+      [answerPath, undefined],
+      [dismissPath, "nope"],
+    ] as const) {
+      const refused = await read(
+        await call(path, { method: "POST", body, bearer }),
+      );
+      expect(refused.status).toBe(401);
+    }
+    // Nothing waits here (this server holds no session): a 409 the dock reads as settled.
+    const answered = await read(
+      await signedIn(answerPath, { method: "POST", body }),
+    );
+    expect(answered.status).toBe(409);
+    expect(answered.body).toMatchObject({
+      _tag: "QuestionRefused",
+      questionId: "toolu_1",
+      reason: "settled",
+    });
+    const dismissed = await read(
+      await signedIn(dismissPath, { method: "POST" }),
+    );
+    expect(dismissed.status).toBe(409);
+    expect(dismissed.body).toMatchObject({ reason: "settled" });
+    // A body that is not answers is refused before the importer is asked.
+    const malformed = await read(
+      await signedIn(answerPath, {
+        method: "POST",
+        body: { answers: { "Which hosts?": "api" } },
+      }),
+    );
+    expect(malformed.status).toBe(400);
+    // Another target's id, or one that does not exist, is a 404.
+    const elsewhere = await read(
+      await signedIn(
+        "/targets/not-a-target/importer-sessions/imp_old/questions/toolu_1/dismiss",
+        { method: "POST" },
+      ),
+    );
+    expect(elsewhere.status).toBe(404);
+  });
+
   test("a session's activity with nothing held says nothing runs, and an unknown target is a 404 (A6 U6)", async () => {
     const activity = await read(
       await signedIn(

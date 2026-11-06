@@ -95,12 +95,15 @@ import {
   type HarnessModelView,
   type ModelOptionDescriptor,
   type ModelOptionSelection,
+  type QuestionAnswers,
 } from "@bit/contracts";
 import {
   getSessionInfo as sdkGetSessionInfo,
   getSessionMessages as sdkGetSessionMessages,
   query as sdkQuery,
+  type CanUseTool,
   type EffortLevel,
+  type HookCallbackMatcher,
   type McpServerConfig,
   type Options,
   type Query,
@@ -136,6 +139,7 @@ import {
   truncateReply,
   type HarnessContextUsage,
   type HarnessFailure,
+  type HarnessQuestion,
   type HarnessNarration,
   type McpRegistration,
   type MessageEntry,
@@ -155,7 +159,16 @@ import {
   type AttachmentReplay,
   type MessageAttachment,
 } from "./attachments";
-import { HarnessProcessError, HarnessTransportError } from "./errors";
+import {
+  HarnessProcessError,
+  HarnessTransportError,
+  QuestionNotPending,
+} from "./errors";
+import {
+  CLAUDE_CODE_QUESTION_TOOL,
+  QUESTION_DISMISSED_MESSAGE,
+  questionFieldsOfInput,
+} from "./questions";
 import { claudeCodeMessageId } from "./messageId";
 import {
   leadsOwnGroup,
@@ -555,6 +568,8 @@ interface SessionRecord {
    * operator may say something else at any time and a closed query cannot be prompted.
    */
   readonly multiTurn: boolean;
+  /** From `createSession`'s `operatorQuestions`: whether {@link answerHook} is installed (A7-Q). */
+  readonly operatorQuestions: boolean;
   /**
    * Whether this record stands for a session the CLI already has, to be **resumed**.
    *
@@ -777,6 +792,13 @@ interface SessionRecord {
    * and be narrated as its {@link SubagentState} (A6 U14). See {@link SubagentCalls}.
    */
   readonly subagents: SubagentCalls;
+  /**
+   * The `AskUserQuestion` calls this session's CLI is waiting on the operator for, by
+   * tool-use id (A7-Q): what {@link answerHook} parked, until the operator answers or
+   * dismisses one, a Stop withdraws it, or the session ends. In this process's memory and
+   * nowhere else, because that is where the CLI's request is: a CLI that exits takes it.
+   */
+  readonly questions: Map<string, HeldQuestion>;
   /**
    * Set by {@link interruptSession}, so the outcome is `interrupted` and not `failed`.
    * Cleared at the next `result` on a multi-turn session, whose query outlives the turn.
@@ -2919,6 +2941,9 @@ export const claudeCodeHarness = (
             // Closing a query that has already exited throws in some SDK paths. The
             // session is over either way and this must not become the run's failure.
           }
+          // A CLI that goes takes its questions with it: each is withdrawn, so a dock
+          // showing one hears that its request is gone before the narration ends.
+          withdrawQuestions(record);
           forgetIfFinished(record);
         }).pipe(Effect.andThen(Queue.end(record.narration)));
 
@@ -3469,6 +3494,27 @@ export const claudeCodeHarness = (
                   settingSources: ["user", "project", "local"],
                   // Our `PreToolUse` gate is the permission authority; see the header.
                   permissionMode: "dontAsk",
+                  /*
+                   * The operator's answers to `AskUserQuestion`, for a conversation only (A7-Q).
+                   * See `answerHook` for what was measured and why neither the gate nor the
+                   * permission mode moves.
+                   *
+                   * Only for a session opened with `operatorQuestions` — today the importer's.
+                   *
+                   * V2(chat): the goal conversation, a worker attempt and a planner round are
+                   * not offered the tool — nothing draws their questions yet, so one would
+                   * park the agent until the hook's day-long timeout. When the goal, planner
+                   * and worker chats are built on the shell (whose dock already takes any
+                   * session's question), open them with `operatorQuestions`, give them a route
+                   * to answer through, and their questions count in Needs you already (the
+                   * narration bus's `waiting`).
+                   */
+                  ...(record.multiTurn && record.operatorQuestions
+                    ? {
+                        canUseTool: refuseEveryPrompt,
+                        hooks: { PreToolUse: [answerHook(record)] },
+                      }
+                    : {}),
                   // Without this, a subagent's text never reaches the stream. Narration
                   // drops it (A6 U14); kept for V2 — see the header.
                   forwardSubagentText: true,
@@ -3599,6 +3645,7 @@ export const claudeCodeHarness = (
           mcpServers: {},
           narration,
           multiTurn: input.multiTurn === true,
+          operatorQuestions: input.operatorQuestions === true,
           resumed: input.resume !== undefined,
           idle,
           ended: yield* Deferred.make<void>(),
@@ -3624,6 +3671,7 @@ export const claudeCodeHarness = (
           calls: [],
           streamed: { messageId: undefined, index: undefined, kind: undefined },
           subagents: new Map(),
+          questions: new Map<string, HeldQuestion>(),
           interrupted: false,
           interruptMoved: false,
           tasks: new Map<string, TrackedTask>(),
@@ -4621,6 +4669,46 @@ export const claudeCodeHarness = (
         yield* endRecord(record);
       });
 
+      const heldQuestion = (
+        sessionId: string,
+        questionId: string,
+      ): Effect.Effect<HeldQuestion, QuestionNotPending> => {
+        const held = sessions.get(sessionId)?.questions.get(questionId);
+        return held === undefined
+          ? Effect.fail(
+              new QuestionNotPending({
+                questionId,
+                reason: "settled",
+                detail: `Claude Code is not waiting on question ${questionId} in session ${sessionId}: it was answered, dismissed or withdrawn, or this server never held it.`,
+              }),
+            )
+          : Effect.succeed(held);
+      };
+
+      const pendingQuestions: AgentHarness["Service"]["pendingQuestions"] = (
+        sessionId,
+      ) =>
+        Effect.sync(() => [
+          ...(sessions.get(sessionId)?.questions.values() ?? []),
+        ].map((held) => held.question));
+
+      const answerQuestion: AgentHarness["Service"]["answerQuestion"] = (
+        sessionId,
+        questionId,
+        answers,
+      ) =>
+        Effect.map(heldQuestion(sessionId, questionId), (held) => {
+          held.settle({ _tag: "answered", answers });
+        });
+
+      const dismissQuestion: AgentHarness["Service"]["dismissQuestion"] = (
+        sessionId,
+        questionId,
+      ) =>
+        Effect.map(heldQuestion(sessionId, questionId), (held) => {
+          held.settle({ _tag: "dismissed" });
+        });
+
       const sessionEvents: AgentHarness["Service"]["sessionEvents"] = (
         sessionId,
       ) =>
@@ -4650,6 +4738,9 @@ export const claudeCodeHarness = (
         queuedOnInterrupt: "runs",
         // A queued message runs at once after an interrupt, so nothing is ever held.
         holding: () => Effect.succeed(false),
+        pendingQuestions,
+        answerQuestion,
+        dismissQuestion,
         endSession,
         sessionEvents,
       });
@@ -4665,3 +4756,185 @@ export const claudeCodeHarness = (
  * format is somebody else's and a value built by hand would be our guess at it.
  */
 export const newClaudeCodeSessionId = (): string => crypto.randomUUID();
+
+/* ── The operator's answers to `AskUserQuestion` (A7-Q) ──────────────────────────── */
+
+/** What the operator did with a held question, or that its request went without either. */
+type QuestionDecision =
+  | { readonly _tag: "answered"; readonly answers: QuestionAnswers }
+  | { readonly _tag: "dismissed" }
+  | { readonly _tag: "withdrawn" };
+
+/** One `AskUserQuestion` call parked in {@link answerHook}, as {@link SessionRecord.questions} holds it. */
+interface HeldQuestion {
+  readonly question: HarnessQuestion;
+  /** Ends the wait, once: the first decision wins and the rest are ignored. */
+  readonly settle: (decision: QuestionDecision) => void;
+}
+
+/**
+ * How long the CLI waits on {@link answerHook} for the operator, in seconds: a day.
+ *
+ * The hook is what holds a question open, and the CLI ends a hook at its matcher's timeout.
+ * An operator may well read a question an hour later; a question left for a day has been
+ * left. Measured on 2.1.310: an answer given 70 s in reached the model.
+ *
+ * V2(chat): a question still open after a day is withdrawn by the CLI's timeout (the dock
+ * then offers the answers as a message). V2 could tell the operator before that happens.
+ */
+const QUESTION_HOOK_TIMEOUT_SECONDS = 86_400;
+
+/**
+ * The permission prompt a conversation registers, and why it answers no to everything.
+ *
+ * **Registered only so the CLI offers `AskUserQuestion` at all.** Measured on CLI 2.1.310
+ * (SDK 0.3.310, `claude-haiku-4-5`, `src/spike/askUserQuestionProbe.ts`): a query with no
+ * `canUseTool` has no `AskUserQuestion` in its tool list — the model searched for it with
+ * `ToolSearch` and found "No matching deferred tools". With one registered, the tool is there.
+ *
+ * **It is never asked, and it would refuse if it were.** Under `dontAsk` the CLI denies a
+ * call that was not pre-approved without asking the host (measured: the `AskUserQuestion`
+ * call was denied "because Claude Code is running in don't ask mode" and this was not
+ * called, though the policy gate had answered `allow`). So it loosens nothing: the gate
+ * stays the only thing that pre-approves a call, as `permissionMode: "dontAsk"` demands, and
+ * a call the gate did not allow is refused here too rather than becoming a prompt.
+ */
+const refuseEveryPrompt: CanUseTool = (toolName) =>
+  Promise.resolve({
+    behavior: "deny",
+    message: `${toolName} was not pre-approved by bit's policy gate, and bit asks no one to approve tool calls.`,
+  });
+
+/**
+ * The narrowly scoped hook that answers `AskUserQuestion` with the operator's answers, and
+ * the one change A7-Q makes to a Claude Code session's permissions.
+ *
+ * ## Why a second hook, and not the gate or the mode
+ *
+ * Measured on CLI 2.1.310 (the probe above, each leg a real `claude-haiku-4-5` run):
+ *
+ * - **The gate's `allow` is not an answer.** `AskUserQuestion` is a tool that needs the
+ *   user; an `allow` from a `PreToolUse` hook does not stand in for one, so under `dontAsk`
+ *   the call is still denied, and `canUseTool` — where T3 Code answers it — is never asked.
+ * - **A `PreToolUse` hook's `allow` with `updatedInput` carrying `answers` is one.** The
+ *   tool ran and the model was told `Your questions have been answered: "…"="Blue", …`.
+ *   Claude Code's own dialog answers the same way (`answers` keyed by question text,
+ *   multi-select comma-joined), which is T3 Code's `updatedInput` from another door.
+ * - **Hooks run side by side and every one is waited for, and a `deny` wins.** With the
+ *   gate answering `deny` and this hook `allow` 10 s later, the call was refused with the
+ *   gate's reason at 10 s. So this hook cannot overrule the gate: a question the gate refuses
+ *   (an out-of-scope host in its text, say) stays refused, after the operator has answered.
+ * - **A Stop aborts the wait.** `interrupt()` while this hook waited aborted its signal
+ *   within 20 ms, the CLI stored "The user doesn't want to proceed with this tool use…" as
+ *   the call's result and the turn ended `aborted_tools`. Settled `withdrawn` here.
+ * - **A `deny` is how a dismissal reaches the model**: it read the hook's reason as the
+ *   tool's error and answered "You declined to answer the questions."
+ *
+ * So the policy gate is unchanged, the permission mode is unchanged, and the gate is still
+ * asked about and can still refuse every call this answers. What is added is an in-process
+ * `PreToolUse` callback whose matcher is `AskUserQuestion` alone, which parks the call
+ * until the operator answers or dismisses it, and the no-op {@link refuseEveryPrompt}.
+ *
+ * V2(chat): the gate is asked at the same moment as this hook, and its answer is not known
+ * here, so a question the gate refuses is still shown and can be answered, and only then does
+ * the agent get the gate's refusal. Proper V2 asks the policy service first, from here.
+ */
+const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
+  matcher: CLAUDE_CODE_QUESTION_TOOL,
+  timeout: QUESTION_HOOK_TIMEOUT_SECONDS,
+  hooks: [
+    (hookInput, toolUseId, { signal }) => {
+      if (hookInput.hook_event_name !== "PreToolUse") return Promise.resolve({});
+      const input = hookInput.tool_input;
+      const id = toolUseId ?? hookInput.tool_use_id;
+      const fields = questionFieldsOfInput("claude-code", input);
+      // Nothing to ask the operator: no decision, so the CLI decides as it would have.
+      if (fields === undefined || record.closed) return Promise.resolve({});
+      return new Promise((resolve) => {
+        let settled = false;
+        const settle = (decision: QuestionDecision): void => {
+          if (settled) return;
+          settled = true;
+          record.questions.delete(id);
+          signal.removeEventListener("abort", withdraw);
+          Queue.offerUnsafe(record.narration, {
+            type: "question",
+            sequence: undefined,
+            at: Date.now(),
+            outcome: undefined,
+            detail: {
+              _tag: "questionSettled",
+              questionId: id,
+              settled: decision._tag,
+            },
+          });
+          resolve(answerHookOutput(decision, input));
+        };
+        const withdraw = (): void => settle({ _tag: "withdrawn" });
+        const question: HarnessQuestion = {
+          questionId: id,
+          fields,
+          askedAt: Date.now(),
+          callId: id,
+        };
+        record.questions.set(id, { question, settle });
+        Queue.offerUnsafe(record.narration, {
+          type: "question",
+          sequence: undefined,
+          at: question.askedAt ?? Date.now(),
+          outcome: undefined,
+          detail: { _tag: "question", question },
+        });
+        if (signal.aborted) withdraw();
+        else signal.addEventListener("abort", withdraw, { once: true });
+      });
+    },
+  ],
+});
+
+/** What {@link answerHook} tells the CLI for each decision. */
+const answerHookOutput = (
+  decision: QuestionDecision,
+  input: unknown,
+): Awaited<ReturnType<HookCallbackMatcher["hooks"][number]>> => {
+  switch (decision._tag) {
+    case "answered":
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          permissionDecisionReason: "answered by the operator in bit",
+          updatedInput: {
+            ...(typeof input === "object" && input !== null
+              ? (input as Record<string, unknown>)
+              : {}),
+            // By question text, a choose-any's choices comma-joined, as the CLI's own
+            // dialog answers (`AskUserQuestionOutput.answers`); a skipped one is left out.
+            answers: Object.fromEntries(
+              Object.entries(decision.answers)
+                .filter(([, given]) => given.length > 0)
+                .map(([key, given]) => [key, given.join(", ")]),
+            ),
+          },
+        },
+      };
+    case "dismissed":
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: QUESTION_DISMISSED_MESSAGE,
+        },
+      };
+    case "withdrawn":
+      // The CLI aborted the wait or is going: there is nobody to answer.
+      return {};
+  }
+};
+
+/** Settles every question a session still holds as withdrawn: its CLI is going. */
+const withdrawQuestions = (record: SessionRecord): void => {
+  for (const held of [...record.questions.values()]) {
+    held.settle({ _tag: "withdrawn" });
+  }
+};

@@ -134,6 +134,12 @@ export interface AgentSessionSources {
   readonly activity?:
     | ((subject: NarrationSubject) => AgentSessionActivity | undefined)
     | undefined;
+  /**
+   * What a subject's agent is waiting on the operator for, in the list's words, or `undefined`
+   * (A7-Q): from the narration bus's questions (`RunNarrations.waiting`), never a harness
+   * call. Absent: nobody waits.
+   */
+  readonly waiting?: ((subject: NarrationSubject) => string | undefined) | undefined;
 }
 
 /** A row before it is placed on a page: everything but its group and its title. */
@@ -157,15 +163,20 @@ const ENDED_IMPORTER_FAILURES: ReadonlySet<ImporterSessionEndReason> = new Set([
 /**
  * Folds the four reads into rows.
  *
- * V2(chat): every row's `waiting` is null — A7-Q (the question dock) is what learns that a
- * session is waiting on the operator (a pending harness question, a plan to approve) and
- * sets it here. The Needs you group, the toggle, the hidden-line counts and the rail's
- * warning count all turn on `waiting` already, so A7-Q supplies the state and nothing else.
+ * A row's `waiting` is the question its agent is waiting on the operator for (A7-Q), only
+ * while this process holds the session: a request lives as long as the session's process
+ * does. It is what the Needs you group, the toggle, the hidden-line counts and the rail's
+ * warning count turn on.
+ *
+ * V2(chat): only the importer asks questions today (`operatorQuestions`), so goal, worker
+ * and planner rows read `waiting` as importer rows do but never have one; a planner waiting
+ * for its plan to be approved is not a question and is not reported either.
  */
 export const unionAgentSessions = (
   sources: AgentSessionSources,
 ): { readonly rows: AgentSessionRow[]; readonly workersOmitted: number } => {
   const activity = sources.activity ?? (() => undefined);
+  const waitingOn = sources.waiting ?? (() => undefined);
   const instanceRun = sources.instanceRun ?? (() => true);
 
   const goals = sources.goals.map((goal): AgentSessionRow => {
@@ -195,7 +206,9 @@ export const unionAgentSessions = (
       surface: { section: "goals", place: "Conversation", gone: false },
       lastActivityAt: Math.max(goal.openedAt, doing?.at ?? 0),
       activity: doing,
-      waiting: null,
+      waiting: live
+        ? (waitingOn({ _tag: "goal", goalId: goal.goalId }) ?? null)
+        : null,
       // A conversation this server does not hold has ended only if its goal has: a met goal
       // completed it, an abandoned one stopped it, and a message to either is refused
       // (`plan/goalConversation.ts` answers `goal_not_active`). An active goal's conversation
@@ -270,7 +283,11 @@ export const unionAgentSessions = (
         doing?.at ?? 0,
       ),
       activity: doing,
-      waiting: null,
+      // The newest run's question; an older run's request went with its session.
+      waiting: session.held
+        ? (waitingOn({ _tag: "import", importId: session.latestImportId }) ??
+          null)
+        : null,
       outcome,
       // Only an operator's end is final; anything else not held is carried on by the next
       // message — unless the send would refuse it: an agent this server no longer defines,

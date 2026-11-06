@@ -32,8 +32,8 @@
  *
  * So this file makes the request itself, over the driver's own authenticated client:
  *
- * - **`types` names every `session.*` event but `session.inbox.enqueued`**, so the server
- *   never sends it ({@link NARRATED_EVENT_TYPES}). Nothing here reads it: the driver
+ * - **`types` names only the events the driver reads** ({@link NARRATED_EVENT_TYPES}), so
+ *   the server never sends `session.inbox.enqueued`: nothing here reads it, since the driver
  *   narrates a message's take from `session.inbox.delivered`, which carries ids only.
  * - **The per-event bound is {@link OPENCODE_EVENT_MAX_CHARS}**, for the events that can still
  *   carry a file: a tool's result (`core/src/tool/read-filesystem.ts` reads a file back as
@@ -57,26 +57,108 @@
  * entry, `log.synced`, from `after=0`: no narration, as 2.1.2 did (`sessionEvents`'s own
  * comment). The replay is what holds it.
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { EventManifest } from "@opencode/schema/event-manifest";
 import { Cause, Duration, Effect, Queue, Stream } from "effect";
 import { Sse } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 
 /**
- * The event types the driver subscribes to: every `session.*` type the 2.2.5 server
- * defines, but `session.inbox.enqueued`.
+ * The event types the driver subscribes to: exactly the ones `openCodeNarration` reads
+ * (U13 review 6, A7-Q).
  *
- * Read off `@opencode/schema`'s own manifest rather than listed, because the server refuses
- * a type it does not define (the route's query is a literal union of its definitions) and
- * the manifest is that union at the client's version, which is the server's. Everything a
- * session narrates is under `session.`; the stream's other events (`mcp.status.changed`,
- * `provider.updated`, …) name no session, and {@link sessionOf} dropped them anyway.
- * The server still sends `server.connected` first, whatever `types` says.
+ * It used to be every `session.*` type in the manifest but `session.inbox.enqueued`. Two
+ * things were wrong with that: it left out `form.created`, `form.replied` and
+ * `form.cancelled`, which are how OpenCode 2.2.5's `question` tool asks the operator
+ * something (A7-Q's dock got nothing), and it named some forty types this driver reads none
+ * of — and **the server refuses a subscription naming a type it does not define** (the
+ * route's query is a literal union of its own definitions), so every extra name was one
+ * more way for a server a version apart to refuse the stream, which then stays `lost`.
+ *
+ * A type left out of here is never sent, so a case in `openCodeNarration` whose type is not
+ * listed would never run: `openCodeEvents.test.ts` reads the narration's `case` labels and
+ * holds this list to them. Each is checked against `@opencode/schema`'s manifest at the
+ * client's version too, and {@link openCodeVersionSkew} warns at boot when the server's
+ * version is not the client's. The server still sends `server.connected` first, whatever
+ * `types` says.
  */
-export const NARRATED_EVENT_TYPES: readonly string[] =
-  EventManifest.ServerDefinitions.map((definition) => definition.type).filter(
-    (type) => type.startsWith("session.") && type !== "session.inbox.enqueued",
-  );
+export const NARRATED_EVENT_TYPES: readonly string[] = [
+  "session.step.started",
+  "session.step.failed",
+  "session.step.ended",
+  "session.text.delta",
+  "session.text.ended",
+  "session.reasoning.delta",
+  "session.reasoning.ended",
+  "session.tool.input.started",
+  "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
+  "session.inbox.delivered",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.synthetic",
+  "form.created",
+  "form.replied",
+  "form.cancelled",
+];
+
+/** Every event type the client's `@opencode/schema` defines: what its own server accepts. */
+export const MANIFEST_EVENT_TYPES: ReadonlySet<string> = new Set(
+  EventManifest.ServerDefinitions.map((definition) => definition.type),
+);
+
+/**
+ * The `@opencode/client` version this build talks with, read from its `package.json`, or
+ * `undefined` when it cannot be found (the package exports no version and no `package.json`
+ * subpath, so it is read beside the module it resolves to).
+ */
+export const OPENCODE_CLIENT_VERSION: string | undefined = (() => {
+  try {
+    let dir = dirname(
+      fileURLToPath(import.meta.resolve("@opencode/client/effect")),
+    );
+    for (let depth = 0; depth < 6; depth += 1) {
+      try {
+        const manifest = JSON.parse(
+          readFileSync(join(dir, "package.json"), "utf8"),
+        ) as { name?: unknown; version?: unknown };
+        if (manifest.name === "@opencode/client") {
+          return typeof manifest.version === "string"
+            ? manifest.version
+            : undefined;
+        }
+      } catch {
+        // No `package.json` at this level; keep walking up.
+      }
+      dir = dirname(dir);
+    }
+  } catch {
+    // Not resolvable here: no version to compare.
+  }
+  return undefined;
+})();
+
+/**
+ * The sentence the server logs at boot when the OpenCode server it talks to is not the
+ * client's version (U13 review 6), or `undefined` when they match or either is unknown.
+ *
+ * Why it is worth a warning: the event stream names its types ({@link NARRATED_EVENT_TYPES})
+ * and a server that does not define one refuses the subscription, so every session's
+ * narration would read `lost` with nothing else said; and the client's own decoding of every
+ * other route is the client's version's.
+ */
+export const openCodeVersionSkew = (
+  serverVersion: string,
+  clientVersion: string | undefined = OPENCODE_CLIENT_VERSION,
+): string | undefined =>
+  clientVersion === undefined || serverVersion === clientVersion
+    ? undefined
+    : `the OpenCode server is version ${serverVersion} and this build's client is ${clientVersion}; the event stream names the types it reads (${NARRATED_EVENT_TYPES.length} of them), and a server that does not define one refuses it, so narration may never connect. Run the server at ${clientVersion}, or upgrade @opencode/client and @opencode/schema to ${serverVersion}.`;
 
 /**
  * The largest event this driver reads, in string code units (Effect's measure): 16 Mi.

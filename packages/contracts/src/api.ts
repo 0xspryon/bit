@@ -82,6 +82,11 @@ import {
 } from "./plan";
 import { AgentSessionsQuery, AgentSessionsView } from "./agentSessions";
 import { LiveFrame } from "./live";
+import {
+  QuestionAnswerRequest,
+  QuestionRefused,
+  QuestionSettled,
+} from "./question";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
 import {
   ImporterConversationRefused,
@@ -1629,6 +1634,60 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
         success: ConversationStopped,
         error: [
           ConversationStopRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Answers the question one import's agent is waiting on (A7-Q, E3/E4).
+     *
+     * Addressed by import id and applied to the import that holds the session now, as a
+     * Stop is; `questionId` is the harness's id for the request (`PendingQuestion`). The
+     * answers are checked against the questions first (`questionAnswersProblem`). A question
+     * the harness no longer waits on — answered, dismissed, withdrawn by a Stop, forgotten by
+     * a restart, or another session's — is {@link QuestionRefused} `settled`, and the dock
+     * then offers the answers as a message. An id this target does not hold is a `404`.
+     */
+    HttpApiEndpoint.post(
+      "answerImporterQuestion",
+      "/targets/:targetId/importer-sessions/:importId/questions/:questionId/answer",
+      {
+        params: {
+          targetId: Schema.String,
+          importId: Schema.String,
+          questionId: Schema.String,
+        },
+        payload: QuestionAnswerRequest,
+        success: QuestionSettled,
+        error: [
+          QuestionRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Dismisses the question one import's agent is waiting on (A7-Q): the harness's request
+     * is cancelled and the agent is told the operator declined, and carries on. A question
+     * read back from the transcript, whose request is already gone, is only put away: the
+     * session's replay stops offering it while this server runs. Refused and addressed as
+     * {@link answerImporterQuestion} is.
+     */
+    HttpApiEndpoint.post(
+      "dismissImporterQuestion",
+      "/targets/:targetId/importer-sessions/:importId/questions/:questionId/dismiss",
+      {
+        params: {
+          targetId: Schema.String,
+          importId: Schema.String,
+          questionId: Schema.String,
+        },
+        success: QuestionSettled,
+        error: [
+          QuestionRefused,
           ScopeImportNotFound,
           TargetNotFound,
           TargetUnavailable,

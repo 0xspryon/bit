@@ -152,6 +152,7 @@ import {
 import { liveTranscript } from "../run/liveTranscript";
 import { RunNarrations, type NarrationSubject } from "../run/narration";
 import { activityKey } from "../run/sessionActivity";
+import { waitingWords } from "../harness/questions";
 import { RunSupervisor } from "../run/supervisor";
 import { readTranscript } from "../run/transcript";
 import { PolicyDecisions } from "../policy/service";
@@ -1729,6 +1730,33 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
+       * Answers the question one import's agent is waiting on (A7-Q). The target is checked
+       * here and the import inside the importer, as a Stop's are.
+       */
+      answerImporterQuestion: Effect.fn(function* ({ params, payload }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.answerQuestion({
+          targetId: row.targetId,
+          importId: params.importId,
+          questionId: params.questionId,
+          answers: payload.answers,
+        });
+      }),
+
+      /**
+       * Dismisses the question one import's agent is waiting on (A7-Q): the agent is told the
+       * operator declined. Checked as an answer is.
+       */
+      dismissImporterQuestion: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.dismissQuestion({
+          targetId: row.targetId,
+          importId: params.importId,
+          questionId: params.questionId,
+        });
+      }),
+
+      /**
        * Whether a turn, or background work, is running in one import's session (A6 U6). The
        * target is checked here and the import inside the importer, as a Stop's are.
        */
@@ -2012,13 +2040,21 @@ const fleetHandlers = HttpApiBuilder.group(
           ),
         ];
         const summaries = new Map<string, AgentSessionActivity>();
+        const waiting = new Map<string, string>();
         yield* Effect.forEach(
           subjects,
           (subject) =>
-            Effect.map(narrations.activity(subject), (found) => {
-              if (found !== undefined)
-                summaries.set(activityKey(subject), found);
-            }),
+            Effect.all([
+              narrations.activity(subject),
+              narrations.waiting(subject),
+            ]).pipe(
+              Effect.map(([found, question]) => {
+                if (found !== undefined)
+                  summaries.set(activityKey(subject), found);
+                if (question !== undefined)
+                  waiting.set(activityKey(subject), waitingWords(question));
+              }),
+            ),
           { discard: true },
         );
         const page = pageAgentSessions(
@@ -2030,6 +2066,7 @@ const fleetHandlers = HttpApiBuilder.group(
             workers: read.workers,
             planners: read.planners,
             activity: (subject) => summaries.get(activityKey(subject)),
+            waiting: (subject) => waiting.get(activityKey(subject)),
           }),
           {
             tab: query.tab ?? "active",

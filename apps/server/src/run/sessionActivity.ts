@@ -35,7 +35,10 @@ import {
   BIT_MCP_SERVER_PREFIX,
 } from "@bit/contracts";
 
-import type { HarnessNarration } from "../harness/agentHarness";
+import type {
+  HarnessNarration,
+  HarnessQuestion,
+} from "../harness/agentHarness";
 import type { NarrationSubject } from "./narration";
 
 /** The most characters of a reply the summary keeps: one line on the list. */
@@ -276,11 +279,20 @@ const STARTS_A_TURN: ReadonlySet<string> = new Set([
 /** The summaries, by subject, bounded. A `Map` keeps insertion order, so the oldest is first. */
 export class SessionActivities {
   readonly #kept = new Map<string, ActivityState>();
+  /**
+   * The questions each subject's agent is waiting on the operator for (A7-Q), by question
+   * id, in the order asked: a `question` entry adds one, a `questionSettled` takes it away,
+   * and the narration's `closed` — the surface let the session go, and a request it held
+   * went with it — takes them all. Bounded with the summaries: a subject dropped from
+   * {@link #kept} is dropped here too.
+   */
+  readonly #waiting = new Map<string, Map<string, HarnessQuestion>>();
 
   constructor(readonly limit: number = ACTIVITY_SUBJECTS_KEPT) {}
 
   record(subject: NarrationSubject, entry: HarnessNarration): void {
     const key = activityKey(subject);
+    this.#question(key, entry);
     const next = foldActivityState(this.#kept.get(key), entry);
     // Re-inserted, so it moves to the newest end.
     this.#kept.delete(key);
@@ -289,11 +301,33 @@ export class SessionActivities {
       const oldest = this.#kept.keys().next().value;
       if (oldest === undefined) break;
       this.#kept.delete(oldest);
+      this.#waiting.delete(oldest);
+    }
+  }
+
+  #question(key: string, entry: HarnessNarration): void {
+    const detail = entry.detail;
+    if (detail._tag === "question") {
+      const held = this.#waiting.get(key) ?? new Map<string, HarnessQuestion>();
+      held.set(detail.question.questionId, detail.question);
+      this.#waiting.set(key, held);
+    } else if (detail._tag === "questionSettled") {
+      const held = this.#waiting.get(key);
+      held?.delete(detail.questionId);
+      if (held?.size === 0) this.#waiting.delete(key);
+    } else if (detail._tag === "connection" && detail.state === "closed") {
+      this.#waiting.delete(key);
     }
   }
 
   get(subject: NarrationSubject): AgentSessionActivity | undefined {
     return this.#kept.get(activityKey(subject))?.view;
+  }
+
+  /** The newest question `subject`'s agent is waiting on the operator for, if any (A7-Q). */
+  waiting(subject: NarrationSubject): HarnessQuestion | undefined {
+    const held = this.#waiting.get(activityKey(subject));
+    return held === undefined ? undefined : [...held.values()].at(-1);
   }
 
   get size(): number {

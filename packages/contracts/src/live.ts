@@ -88,6 +88,8 @@
  */
 import { Schema } from "effect";
 
+import { LiveQuestion } from "./question";
+
 import { MessageAttachmentView } from "./messageUpload";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
@@ -924,6 +926,12 @@ export type LiveTurnEnded = typeof LiveTurnEnded.Type;
  * - `lost` — it has kept failing (about 30 s). The server goes on trying, and a later
  *   `restored` still comes; until then the chat shows nothing new, and a reload is how to
  *   see what the harness has.
+ * - `closed` — the server stopped reading the session's narration for good, because the
+ *   session's authority ended here: the operator ended it (in this tab, another, or over the
+ *   API), the server is shutting down, or the harness refused a prompt (A7-Q, from the chat
+ *   shell's review 2). Nothing more comes for it on this connection, so a notice about the
+ *   connection is over; whether the session can be carried on is the session list's answer,
+ *   and a client reads it again.
  *
  * `detail` is the transport's own words for the break, `""` on `restored`. Whose session it
  * is, exactly as {@link LiveUsage} says it. Activity-channel and lossy, like
@@ -931,7 +939,7 @@ export type LiveTurnEnded = typeof LiveTurnEnded.Type;
  */
 export const LiveConnection = Schema.Struct({
   _tag: Schema.Literal("connection"),
-  state: Schema.Literals(["reconnecting", "restored", "lost"]),
+  state: Schema.Literals(["reconnecting", "restored", "lost", "closed"]),
   detail: Schema.String,
   attemptId: Schema.NullOr(Schema.String),
   roundId: Schema.NullOr(Schema.String),
@@ -954,5 +962,6 @@ export const LiveFrame = Schema.Union([
   LiveUsage,
   LiveTurnEnded,
   LiveConnection,
+  LiveQuestion,
 ]);
 export type LiveFrame = typeof LiveFrame.Type;

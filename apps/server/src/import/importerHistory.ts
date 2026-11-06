@@ -76,6 +76,7 @@ import {
   type ImporterContinuationRefusal,
   type ImporterConversationView,
   type ImporterSessionEndReason,
+  type PendingQuestion,
 } from "@bit/contracts";
 import { Effect, type Duration } from "effect";
 
@@ -85,6 +86,11 @@ import {
   SESSION_NOT_FOUND_TAG,
   type AgentHarness,
 } from "../harness/agentHarness";
+import {
+  pendingQuestionView,
+  transcriptQuestionId,
+  unansweredQuestion,
+} from "../harness/questions";
 import type { HarnessResolver } from "../harness/resolver";
 import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
@@ -291,6 +297,9 @@ const empty = (input: {
       // A message still queued in a live session is the caller's to add (`ScopeImporter`'s
       // `replay`): this module reads the harness, which does not hold one until it is taken.
       queued: [],
+      // Nothing was read, so nothing was asked. A question a live session holds is the
+      // caller's to add, as its queued messages are.
+      question: null,
       truncated: false,
       // Nothing was left out, because nothing came back. A count here would imply there had
       // been something to count.
@@ -655,6 +664,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
           standingNote,
         items: [],
         queued: [],
+        question: null,
         truncated: false,
         omittedBlank: blank,
         at,
@@ -675,6 +685,35 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
    * counts items, the unit the screen draws.
    */
   const kept = items.length > limit ? items.slice(items.length - limit) : items;
+  /*
+   * A question the transcript ends on without an answer (A7-Q): its native request is gone
+   * or was never this process's, so it is offered as a message where a message carries the
+   * session on, and as unanswerable where none does. A question the harness is still
+   * waiting on is the caller's to put over this, as `live` (`ScopeImporter`'s `replay`).
+   */
+  const unanswered = unansweredQuestion(items);
+  const question: PendingQuestion | null =
+    unanswered === undefined
+      ? null
+      : pendingQuestionView({
+          question: {
+            questionId: transcriptQuestionId(unanswered.callId),
+            fields: unanswered.fields,
+            askedAt: unanswered.at,
+            callId: unanswered.callId,
+          },
+          harnessSessionId: sessionId,
+          subject: {
+            attemptId: null,
+            roundId: null,
+            goalId: null,
+            importId: input.importId,
+          },
+          answerability:
+            continuation === "live" || continuation === "resume"
+              ? "message"
+              : "not_resumable",
+        });
   return standing(
     {
       ...base,
@@ -694,6 +733,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
         standingNote,
       items: kept,
       queued: [],
+      question,
       truncated: kept.length < items.length,
       omittedBlank: blank,
       at,

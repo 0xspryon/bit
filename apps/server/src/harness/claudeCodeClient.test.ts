@@ -58,6 +58,7 @@ import {
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import type { LiveInterrupt } from "./liveAgentSessions";
 import { turnStopped } from "./turnStop";
+import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 import { projectNarration, projectReplay } from "../run/liveTranscript";
 import {
   assembleImporterPrompt,
@@ -2310,6 +2311,8 @@ const turnDrivenSdk = () => {
     stoppedTasks: [] as string[],
     /** When each `stopTask` was called, by task id, in `Date.now()` milliseconds. */
     stopTaskAt: new Map<string, number>(),
+    /** The options the last `query()` was started with (A7-Q reads its hooks). */
+    options: undefined as Options | undefined,
   };
   /**
    * How the session answers a model switch, changeable mid-test so a retry can succeed.
@@ -2391,6 +2394,7 @@ const turnDrivenSdk = () => {
   const sdk: ClaudeCodeSdk = {
     query: ({ prompt, options }) => {
       sessionId = options.sessionId ?? "";
+      seen.options = options;
       void (async () => {
         for await (const message of prompt) {
           const record = message as unknown as {
@@ -8338,5 +8342,280 @@ describe("the CLI's echo of a model switch (A6 U9, found live)", () => {
     );
     expect(status.activity).toBe("idle");
     expect(status.outcome).toBe("succeeded");
+  });
+});
+
+/* ── Questions: `AskUserQuestion`, answered through a hook (A7-Q) ─────────────── */
+
+describe("the question dock's Claude Code half: AskUserQuestion (A7-Q)", () => {
+  const ASKS = "55555555-0000-4000-8000-000000000001";
+  const INPUT = {
+    questions: [
+      {
+        question: "Which colour do you prefer?",
+        header: "Colour",
+        multiSelect: false,
+        options: [
+          { label: "Red", description: "warm" },
+          { label: "Blue", description: "cool" },
+        ],
+      },
+      {
+        question: "Which sizes do you want?",
+        header: "Size",
+        multiSelect: true,
+        options: [
+          { label: "S", description: "small" },
+          { label: "L", description: "large" },
+        ],
+      },
+    ],
+  };
+
+  /** A conversation opened as the importer opens one, with its opening turn running. */
+  const asking = (
+    harness: AgentHarness["Service"],
+    driver: ReturnType<typeof turnDrivenSdk>,
+    operatorQuestions = true,
+  ) =>
+    Effect.gen(function* () {
+      const ref = yield* harness.createSession({
+        title: "importer",
+        model: "claude-haiku-4-5",
+        directory: "/tmp/import",
+        sessionId: ASKS,
+        multiTurn: true,
+        ...(operatorQuestions ? { operatorQuestions: true } : {}),
+      });
+      yield* harness.prompt(ASKS, "go");
+      yield* Effect.promise(() => driver.pulled(1));
+      return ref;
+    });
+
+  /** The hook bit registered for `AskUserQuestion`, as the CLI would call it. */
+  const askVia = (
+    driver: ReturnType<typeof turnDrivenSdk>,
+    toolUseId: string,
+    input: unknown = INPUT,
+  ) => {
+    const matcher = driver.seen.options?.hooks?.PreToolUse?.[0];
+    const hook = matcher?.hooks[0];
+    if (hook === undefined) throw new Error("no AskUserQuestion hook");
+    const abort = new AbortController();
+    const answer = hook(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "AskUserQuestion",
+        tool_input: input,
+        tool_use_id: toolUseId,
+        session_id: ASKS,
+        transcript_path: "/tmp/t.jsonl",
+        cwd: "/tmp/import",
+      } as never,
+      toolUseId,
+      { signal: abort.signal },
+    );
+    return { answer, abort };
+  };
+
+  /** The question and settle entries narrated so far, read off the session's stream. */
+  const questionEntries = (harness: AgentHarness["Service"], count: number) =>
+    harness.sessionEvents(ASKS).pipe(
+      Stream.filter(
+        (entry) =>
+          entry.detail._tag === "question" ||
+          entry.detail._tag === "questionSettled",
+      ),
+      Stream.take(count),
+      Stream.runCollect,
+      Effect.timeout("2 seconds"),
+      Effect.map((entries) =>
+        [...entries].map((entry) =>
+          entry.detail._tag === "question"
+            ? `asked ${entry.detail.question.questionId}`
+            : entry.detail._tag === "questionSettled"
+              ? `${entry.detail.settled} ${entry.detail.questionId}`
+              : entry.detail._tag,
+        ),
+      ),
+    );
+
+  test("only a session opened with operatorQuestions is offered the tool: a hook matching AskUserQuestion alone, and a permission prompt that refuses everything", async () => {
+    const offered = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const options = driver.seen.options;
+        const decision = yield* Effect.promise(
+          () =>
+            options?.canUseTool?.(
+              "Bash",
+              { command: "ls" },
+              {
+                signal: new AbortController().signal,
+                toolUseID: "t",
+                requestId: "r",
+              },
+            ) ?? Promise.resolve(undefined),
+        );
+        return {
+          mode: options?.permissionMode,
+          matchers: (options?.hooks?.PreToolUse ?? []).map(
+            (matcher) => matcher.matcher,
+          ),
+          timeout: options?.hooks?.PreToolUse?.[0]?.timeout,
+          decision,
+        };
+      }),
+    );
+    // The gate's mode is untouched; the prompt answers no, so it loosens nothing.
+    expect(offered.mode).toBe("dontAsk");
+    expect(offered.matchers).toEqual(["AskUserQuestion"]);
+    expect(offered.timeout).toBe(86_400);
+    expect(offered.decision).toMatchObject({ behavior: "deny" });
+
+    const notOffered = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver, false);
+        return {
+          canUseTool: driver.seen.options?.canUseTool,
+          hooks: driver.seen.options?.hooks,
+        };
+      }),
+    );
+    expect(notOffered.canUseTool).toBeUndefined();
+    expect(notOffered.hooks).toBeUndefined();
+  });
+
+  test("a question waits in the session until answered: listed, narrated, and the tool allowed with the answers by question text, a choose-any comma-joined", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const narrated = yield* Effect.forkChild(questionEntries(harness, 2));
+        const { answer } = askVia(driver, "toolu_1");
+        const pending = yield* harness.pendingQuestions(ASKS);
+        yield* harness.answerQuestion(ASKS, "toolu_1", {
+          "Which colour do you prefer?": ["Blue"],
+          "Which sizes do you want?": ["S", "L"],
+        });
+        const output = yield* Effect.promise(() => answer);
+        const again = yield* Effect.result(
+          harness.answerQuestion(ASKS, "toolu_1", {}),
+        );
+        return {
+          pending,
+          output,
+          again,
+          after: yield* harness.pendingQuestions(ASKS),
+          narrated: yield* Fiber.join(narrated),
+        };
+      }),
+    );
+    expect(outcome.pending.map((question) => question.questionId)).toEqual([
+      "toolu_1",
+    ]);
+    expect(
+      outcome.pending[0]?.fields.map(
+        (field) => `${field.key} ${field.kind} ${field.header ?? ""}`,
+      ),
+    ).toEqual([
+      "Which colour do you prefer? one Colour",
+      "Which sizes do you want? any Size",
+    ]);
+    expect(outcome.output).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason: "answered by the operator in bit",
+        updatedInput: {
+          ...INPUT,
+          answers: {
+            "Which colour do you prefer?": "Blue",
+            "Which sizes do you want?": "S, L",
+          },
+        },
+      },
+    });
+    expect(outcome.again).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending", reason: "settled" },
+    });
+    expect(outcome.after).toEqual([]);
+    expect(outcome.narrated).toEqual(["asked toolu_1", "answered toolu_1"]);
+  });
+
+  test("a dismissal denies the call with the sentence the agent is told", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const narrated = yield* Effect.forkChild(questionEntries(harness, 2));
+        const { answer } = askVia(driver, "toolu_2");
+        yield* harness.dismissQuestion(ASKS, "toolu_2");
+        return {
+          output: yield* Effect.promise(() => answer),
+          narrated: yield* Fiber.join(narrated),
+        };
+      }),
+    );
+    expect(outcome.output).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: QUESTION_DISMISSED_MESSAGE,
+      },
+    });
+    expect(outcome.narrated).toEqual(["asked toolu_2", "dismissed toolu_2"]);
+  });
+
+  test("a Stop withdraws it: the CLI aborts the hook, which answers nothing, and the question is no longer pending", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const narrated = yield* Effect.forkChild(questionEntries(harness, 2));
+        const { answer, abort } = askVia(driver, "toolu_3");
+        // What `interrupt()` does to a waiting hook, measured on 2.1.310.
+        abort.abort();
+        const output = yield* Effect.promise(() => answer);
+        const late = yield* Effect.result(
+          harness.dismissQuestion(ASKS, "toolu_3"),
+        );
+        return {
+          output,
+          late,
+          pending: yield* harness.pendingQuestions(ASKS),
+          narrated: yield* Fiber.join(narrated),
+        };
+      }),
+    );
+    expect(outcome.output).toEqual({});
+    expect(outcome.pending).toEqual([]);
+    expect(outcome.late).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending" },
+    });
+    expect(outcome.narrated).toEqual(["asked toolu_3", "withdrawn toolu_3"]);
+  });
+
+  test("ending the session withdraws what it still waits on, and a call with no questions is left to the CLI", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        const ref = yield* asking(harness, driver);
+        const empty = yield* Effect.promise(
+          () => askVia(driver, "toolu_4", { questions: [] }).answer,
+        );
+        const emptyPending = yield* harness.pendingQuestions(ASKS);
+        const { answer } = askVia(driver, "toolu_5");
+        yield* harness.endSession(ref);
+        return {
+          empty,
+          emptyPending,
+          output: yield* Effect.promise(() => answer),
+          pending: yield* harness.pendingQuestions(ASKS),
+        };
+      }),
+    );
+    expect(outcome.empty).toEqual({});
+    expect(outcome.emptyPending).toEqual([]);
+    expect(outcome.output).toEqual({});
+    expect(outcome.pending).toEqual([]);
   });
 });

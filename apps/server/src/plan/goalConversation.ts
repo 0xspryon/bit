@@ -862,6 +862,11 @@ const make = Effect.fnUntraced(function* () {
           // parenting a conversation onto it would hand the goal agent a prompt-cache
           // prefix built from a different role's prompts.
           title: `bit goal agent: ${targetName}`,
+          // V2(chat): no `operatorQuestions` (A7-Q): the goal chat draws no question dock
+          // yet, so Claude Code is not offered `AskUserQuestion` here. OpenCode offers its
+          // `question` tool to every session, so a goal agent on OpenCode can still ask, and
+          // that question waits with nothing on screen until the turn is stopped. The goal
+          // chat's rebuild on the shared shell takes the dock and should open with it.
           ensureDirectory: fleet.ensureGoalDirectory(
             input.targetId,
             input.goalId,
