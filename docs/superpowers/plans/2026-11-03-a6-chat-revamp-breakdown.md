@@ -1205,9 +1205,10 @@ changed only for a forced rename: import paths of moved modules, and
 **Proofs.**
 
 - **Server:** `conversation/conversations.test.ts`, a probe owner on goal credentials and the
-  goal subject, 6 tests.
+  goal subject, 6 tests (13 after review 1).
 - **Web:**
-  - `test/dom/conversationSessions.test.ts`, a goal-shaped owner routed by `goalId`, 7 tests;
+  - `test/dom/conversationSessions.test.ts`, a goal-shaped owner routed by `goalId`, 7 tests
+    (20 after review 1);
   - `test/readOnlyConversation.test.ts`, a worker attempt from a replay plus live frames, 3
     tests;
   - `test/dom/modelSelector.test.ts`, the selector mounted alone, 1 test.
@@ -1300,6 +1301,69 @@ and the model switch.
 - `PendingQuestion.tag`: drawing it in the dock and setting it from `ask_operator`.
 - The `#rereadHistory` path still releases its mark in a `finally`, as the first read did.
   No test shows a double read there, since it is only reached once a replay is installed.
+
+#### Review 1 fixes (2026-11-06)
+
+Each fix's guarding test was checked by mutating the code it guards once (it then failed)
+and restoring the file from a copy.
+
+- **An ability left out is a control not drawn.** `ConversationSessions.abilities` (read off
+  the server when it is installed; everything for the state picker's prototype, which has
+  none) decides what is drawn. No `stopAll`: no Stop all pill, and `stop(true)` asks nothing
+  rather than falling back to Stop. No `answerQuestion`: no dock (`question` is undefined);
+  the question is only the transcript's tool row. No `dismissQuestion`: the dock has no
+  dismiss control and Esc does not dismiss (`ChatQuestion.dismiss` is optional). A question
+  that could neither be sent nor dismissed (`not_resumable`, or `message` where no message
+  goes) is not docked, since it would hold the box for good. `stopSubagent` is in the
+  record too, for the page that draws cards. The importer is unchanged.
+- **Credentials by period.** The core's role is now `ConversationRole`: `issue` and
+  `revokePeriod` take a `ConversationPeriod` (owner id, period id, target), and the binding
+  names the owner with `ownerOf`. The registry hands its `issue` and `revokeStray` the open's
+  meta so the core can. The importer's owner is its target, and it revokes by import id, so
+  it behaves as before. The probe mints a goal grant under an owner id that is no period's
+  and revokes by the period's own token. A test ends one of two periods of the same owner
+  and finds the other's credential valid. The goal's need is under "What the goal binding
+  will need".
+- **Words.** The turn builder's "has not answered yet" and "wrote nothing in reply" take the
+  owner's agent noun (the importer's text is byte-identical). The "this import already had a
+  session open" sentence and the two activity/context log lines read as on `main` again,
+  through the binding's `period`/`aPeriod` nouns. `Conversations.turning`/`turnOf` (no
+  callers) are gone.
+- **Routing seams.** The web binding names `connectionKey` (equal to `usageScope` of its
+  frames, which a test pins for both owners), and `#forgetConnection`, the chat's connection
+  note and the title bar's meter go through it. The ended-row clearing stays in the list read
+  (see "The harness mechanics"), and the seams list names every place a period id on frames
+  lands.
+- **Proofs added.** Server, through the probe: a queued send; held steers dropped at idle; a
+  message waiting on an open in flight; an old id followed by its row's latest period; a
+  Stop and activity read reaching an unconfirmed successor (`holdingNow`'s successor walk,
+  which no test guarded, here or on `main`); Stop and Stop all on a busy period. Web, through
+  the goal-shaped owner: a refused open, an unanswered one, parked words, the queued/taken
+  marks and a carry, a sub-agent's Stop, `closed`, the turn notes' agent noun, and the dock
+  and Stop all ability cases, drawn by the real `ChatShell` (`fixtures/ProbeChat.svelte`).
+  The read-only dedupe case now has its duplicate above the floor, and the selector's
+  harness pick is asserted unconditionally.
+
+**Gates (review 1 fixes, `--force`, memory-capped).** typecheck 3/3; test: server 2029, web
+unit 754, web DOM 635, all passing; test:persistence 1199; build 3/3; lint clean;
+format:check only `sprint-roadmap.html`. `lint:oxlint`: 787 problems on both, the same
+rule/message multiset as `main` (findings moved with their files).
+
+**Live (review 1 fixes, 1024 px over CDP).**
+
+- **Claude Code, `claude-haiku-4-5`:**
+  - the dock came up with its dismiss control and "Esc reply in chat instead";
+  - "Send 1 answer" took it away in 0.16 s, and the reply named Red;
+  - a second question went on a real Esc in 0.15 s, with focus back in the box, and the
+    agent said the operator had dismissed it;
+  - with a background sub-agent running, the pill read "Stop all" (title "Stop the
+    importer's sub-agents, then its turn") in Stop's place; it settled in 0.46 s, the card
+    read "stopped", and no turn opened after it.
+- **OpenCode, `zai-coding-plan/glm-5.3-flash`:**
+  - the dock, its answer (0.16 s) and an Esc dismissal (0.15 s) worked as on Claude Code;
+  - Stop of a long answer settled in 0.15 s with the usual sentence.
+  - After one of three Esc dismissals, focus was on a button rather than the box. The other
+    two put it in the box. The focus-return code is unchanged by these fixes.
 
 ## Order
 
