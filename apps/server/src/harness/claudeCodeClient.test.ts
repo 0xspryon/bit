@@ -9030,6 +9030,73 @@ describe("sub-agent cards: lines, activity, count and Stop (A7-S)", () => {
     });
   });
 
+  test("live: a stopped sub-agent's call in flight takes the CLI's rejection after the end, as the replay reads it", async () => {
+    const lines = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "conversation",
+          model: "claude-haiku-4-5",
+          directory: "/tmp/ws",
+          sessionId: ID,
+          multiTurn: true,
+        });
+        const narration = yield* Effect.forkChild(
+          Stream.runCollect(
+            harness
+              .sessionEvents(ID)
+              .pipe(
+                Stream.takeUntil(
+                  (entry) =>
+                    entry.detail._tag === "subagent" &&
+                    entry.detail.lines[0]?.result?.startsWith("The user") ===
+                      true,
+                ),
+              ),
+          ),
+        );
+        yield* harness.prompt(ID, "go");
+        yield* Effect.promise(() => driver.pulled(1));
+        driver.emit(agentCall(BG, true, "Sleep."));
+        driver.emit(taskStarted(BG, "a_bg", true));
+        driver.emit(subCall(BG, "t1", "Bash", { command: "sleep 60" }));
+        driver.emit(
+          frame({
+            type: "system",
+            subtype: "task_notification",
+            task_id: "a_bg",
+            tool_use_id: BG,
+            status: "stopped",
+            output_file: "",
+            summary: "Sleep",
+          }),
+        );
+        driver.emit(
+          subResult(
+            BG,
+            "t1",
+            "The user doesn't want to proceed with this tool use.",
+            true,
+          ),
+        );
+        return [...(yield* Fiber.join(narration))].flatMap((entry) =>
+          entry.detail._tag === "subagent"
+            ? [
+                `${entry.detail.status} ${entry.detail.lines
+                  .map(
+                    (line) => `${String(line.result)}:${String(line.failed)}`,
+                  )
+                  .join(",")}`,
+              ]
+            : [],
+        );
+      }),
+    );
+    expect(lines.slice(-2)).toEqual([
+      "stopped stopped:true",
+      "stopped The user doesn't want to proceed with this tool use.:true",
+    ]);
+  });
+
   test("replay: a card's lines and count are read from the sub-agent's own transcript, by the agent id its result names", async () => {
     const SESSION_ID = "00000000-0000-4000-8000-0000000000f9";
     const FOREGROUND = "toolu_017TrDc21wUaAJ83MdQSfYyo";
