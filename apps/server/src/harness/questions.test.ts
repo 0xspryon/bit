@@ -275,6 +275,12 @@ describe("a narrated question on the live stream and the sessions list", () => {
     record({ _tag: "question", question });
     record({ _tag: "connection", state: "closed", reason: "" });
     expect(store.waiting(subject)).toBeUndefined();
+    // A connection back: started again from the driver's list, which follows it.
+    record({ _tag: "question", question });
+    record({ _tag: "connection", state: "restored", reason: "" });
+    expect(store.waiting(subject)).toBeUndefined();
+    record({ _tag: "question", question });
+    expect(store.waiting(subject)?.questionId).toBe("toolu_9");
     // A question is not the agent at work: it does not start a turn on the summary.
     expect(store.get(subject)?.running).toBe(false);
   });

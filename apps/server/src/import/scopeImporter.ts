@@ -2713,22 +2713,6 @@ export class ScopeImporter extends Context.Service<
         };
       });
 
-      /** A harness's refusal of an answer or dismissal, as the route's. */
-      const questionRefusal =
-        (questionId: string) =>
-        (failure: HarnessFailure | QuestionNotPending): QuestionRefused =>
-          failure._tag === "QuestionNotPending"
-            ? new QuestionRefused({
-                questionId,
-                reason: failure.reason,
-                detail: failure.detail,
-              })
-            : new QuestionRefused({
-                questionId,
-                reason: "harness_unreachable",
-                detail: `the harness did not answer (${failure.message}), so whether it took this is not known. Your answers are kept; try again.`,
-              });
-
       const notWaiting = (questionId: string): QuestionRefused =>
         new QuestionRefused({
           questionId,
@@ -2736,6 +2720,24 @@ export class ScopeImporter extends Context.Service<
           detail:
             "The agent is no longer waiting on these questions: they were answered or dismissed, a Stop withdrew them, or the session was let go. Send your answers as a message instead.",
         });
+
+      /** A harness's refusal of an answer or dismissal, as the route's. */
+      const questionRefusal =
+        (questionId: string) =>
+        (failure: HarnessFailure | QuestionNotPending): QuestionRefused =>
+          failure._tag === "QuestionNotPending"
+            ? failure.reason === "settled"
+              ? notWaiting(questionId)
+              : new QuestionRefused({
+                  questionId,
+                  reason: failure.reason,
+                  detail: failure.detail,
+                })
+            : new QuestionRefused({
+                questionId,
+                reason: "harness_unreachable",
+                detail: `the harness did not answer (${failure.message}), so whether it took this is not known. Your answers are kept; try again.`,
+              });
 
       const answerQuestion: ScopeImporter["Service"]["answerQuestion"] =
         Effect.fn("ScopeImporter.answerQuestion")(function* (input) {

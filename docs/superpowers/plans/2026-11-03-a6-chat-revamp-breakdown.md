@@ -320,6 +320,48 @@ it in a `subagents/` folder) labelled as the sub-agent's.
 - Step 0 measures each harness live: an interrupt while waiting, a reload, a restart, and a
   dismiss.
 
+**Step 0, measured (2026-11-06; CLI 2.1.310 / SDK 0.3.310 on `claude-haiku-4-5`, OpenCode
+2.2.5 on `zai-coding-plan/glm-5.3-flash`; probe `apps/server/src/spike/askUserQuestionProbe.ts`
+and bit's own routes).**
+
+- **How `AskUserQuestion` reaches bit under `dontAsk` + the gate.** Without a `canUseTool` the
+  CLI does not offer the tool at all (the model's `ToolSearch` found nothing). With one, the
+  model calls it, the gate hook answers `allow`, and the CLI still **denies** it ("running in
+  don't ask mode") without asking `canUseTool`: a hook's `allow` is not an answer to a tool that
+  needs the user. What works: a second, in-process `PreToolUse` hook (SDK `hooks`, matcher
+  `AskUserQuestion` only) that waits for the operator and answers `allow` with
+  `updatedInput.answers` (by question text, choose-any comma-joined). Hooks run side by side, the
+  CLI waits for all of them, and a `deny` wins: with the gate denying, the call is refused with the
+  gate's reason after the answer hook returns. So the gate and the mode are unchanged; the
+  `canUseTool` registered answers `deny` to anything and is never asked. A 70 s wait was fine
+  (the hook's timeout is a day).
+- **Claude Code.** *Waiting*: the call parks in the hook; bit lists it from its own map, so a
+  reload reads it back `live`. *Answer*: the tool result is "Your questions have been answered:
+  …" and the model used the answers. *Dismiss* (hook `deny` with bit's sentence): the model read
+  it as the tool's error and replied "You declined to answer." *Stop*: `interrupt()` aborts the
+  hook's signal within ~20 ms; the transcript stores "The user doesn't want to proceed with this
+  tool use…" and the interrupt marker; the turn ends `aborted_tools`. The request is gone and the
+  session continues: **`message`**. *bit restart*: the CLI dies with bit; the call is replayed as
+  "[Tool call interrupted …]", and bit's startup continuation ("[bit] This server restarted …")
+  resumes the session, so the question is moved past (offered as `message` only when no
+  continuation ran). A session the operator ended, or one a harness forgot: **`not_resumable`**.
+- **OpenCode.** *Waiting*: `form.created` arrives on the filtered stream, `session.form.list`
+  reads it back `live`. *Answer*: `session.form.reply`; result "User has answered your
+  questions: …". *Dismiss*: `session.form.cancel` **with a message** makes the tool fail with
+  that message and the model carries on ("You declined…"); without a message the tool dies and
+  ends the step. *Stop*: the form is cancelled, the tool fails "Tool execution interrupted",
+  "Step interrupted"; a later reply to it is `FormNotFoundError`/settled: **`message`**, and the
+  answers sent as an ordinary message were used by the model. *OpenCode shut down* (bit
+  restarting its own `opencode serve`): the form is cancelled, "Interaction cancelled because the
+  location shut down". *OpenCode killed* (SIGKILL): bit's form list fails ("harness
+  unreachable"), and the restarted server stores the call as "Tool execution interrupted:
+  question". Either way the request is gone: **`message`**; after bit's restart continuation GLM
+  re-asked the question by itself, under the new import, `live` again.
+- **Found along the way.** OpenCode's `question` tool refuses options without a `description`
+  (GLM's first call failed "Invalid arguments"). An OpenCode process killed for good leaves the
+  session counted in Needs you until bit restarts (a `V2(chat):` note in
+  `run/sessionActivity.ts`).
+
 **A7-S — Sub-agent cards and panel (M), A7-Q → A7-S. Decided by the operator (2026-11-05):
 replaces U14's "omit content".** A7's E7/E8.
 
