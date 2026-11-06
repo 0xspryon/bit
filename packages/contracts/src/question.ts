@@ -99,6 +99,15 @@ export const PendingQuestion = Schema.Struct({
   /** When the agent asked, on the server's clock, when known. */
   askedAt: Schema.NullOr(EpochMillis),
   answerability: QuestionAnswerability,
+  /**
+   * What kind of question this is, when the agent says it is more than a question (A9 H2):
+   * `critical` is a critical action the goal agent must ask before acting, which the board
+   * tags "Critical action" in warning. Absent on every question today — the harnesses'
+   * question tools carry no such field, and nothing in this build sets it or draws it; it is
+   * the seam the goal binding's `ask_operator` sets and the dock draws (A6, chat
+   * generalisation slice 2, decision 7).
+   */
+  tag: Schema.optionalKey(Schema.Literal("critical")),
   attemptId: Schema.NullOr(Schema.String),
   roundId: Schema.NullOr(Schema.String),
   goalId: Schema.NullOr(Schema.String),

@@ -37,10 +37,18 @@
  */
 import { Schema } from "effect";
 
-import { SteerUrgency } from "./conversationTurn";
-import { LiveItem } from "./live";
-import { MessageAttachmentView } from "./messageUpload";
-import { PendingQuestion } from "./question";
+import {
+  CONVERSATION_MESSAGE_MAX_CHARS,
+  ConversationContinuation,
+  ConversationEndReason,
+  ConversationMessageDraft,
+  ConversationQueuedMessage,
+  ConversationSource,
+  ConversationStart,
+  conversationSessionFields,
+  conversationTurnAcceptedFields,
+  conversationViewFields,
+} from "./conversation";
 
 /**
  * The three tools the importer has, and the only three values this can ever hold.
@@ -263,93 +271,22 @@ export const ImporterSessionTally = Schema.Struct({
 export type ImporterSessionTally = typeof ImporterSessionTally.Type;
 
 /**
- * Why an import's authority period ended (`0027`).
- *
- * Only `operator` means the authority is over: the operator ended the conversation, the
- * importer's tools refuse every write under it, and a message to it is refused. The other
- * three are this server letting go — `shutdown` on the way down, `refused` for a prompt the
- * harness would not take, `open_failed` for a session that never opened — and a message to
- * such an import opens a fresh session under a new import id rather than being refused.
+ * Why an import's authority period ended (`0027`): {@link ConversationEndReason}, whose
+ * `operator` is also the one end the importer's tools refuse writes on.
  */
-export const ImporterSessionEndReason = Schema.Literals([
-  "operator",
-  "shutdown",
-  "refused",
-  "open_failed",
-]);
-export type ImporterSessionEndReason = typeof ImporterSessionEndReason.Type;
+export const ImporterSessionEndReason = ConversationEndReason;
+export type ImporterSessionEndReason = ConversationEndReason;
 
 /**
  * One harness session the scope importer ran on, as the session picker and the Assets
- * screen's "last session" strip read it.
+ * screen's "last session" strip read it: {@link conversationSessionFields}, the import a
+ * message goes to, and what the session wrote.
  *
- * **A pointer, not a conversation.** `sessionId` is the harness's own id, the thing to ask
- * the harness with; nothing about what was said is on this view, and a row here never means
- * the harness still holds the session. Several import runs on one session are one view.
+ * OpenCode keeps the `bit scope importer: <target>` a session was opened under as its title,
+ * which the server answers as a null `title` (a name this server gave it, not one it earned).
  */
 export const ImporterSessionView = Schema.Struct({
-  /** The harness's session id. Unique within the list. */
-  sessionId: Schema.String,
-  /**
-   * The harness instance that minted it, or null for a row written before instances were
-   * recorded. A session recorded against an instance this server does not run must not be
-   * asked about — the harness we do have would answer "no such session" for a session that
-   * may be alive elsewhere.
-   */
-  harnessInstanceId: Schema.NullOr(Schema.String),
-  /** The model it ran on, as `provider/model`. */
-  model: Schema.String,
-  /**
-   * When the session was opened, in epoch milliseconds.
-   *
-   * From bit's own durable row, so it is always here — including for a session the harness
-   * has since deleted. It is what identifies a session when {@link title} cannot, and what
-   * tells two sessions apart that the harness named alike. {@link title} sits beside it and
-   * never replaces it.
-   */
-  openedAt: Schema.Int,
-  /**
-   * What the harness calls this session, as one line of at most 120 characters, or null.
-   *
-   * Read from the harness on every list and never stored: both harnesses retitle a
-   * conversation as it develops, and a title is as perishable as the conversation's words
-   * (DECISIONS.md §8). It is agent- or person-authored text, so it is a plain label — never
-   * markup.
-   *
-   * **Null means there is no name to show, and the screen labels the session by
-   * {@link openedAt}.** It covers every reason at once, because each is drawn the same way:
-   * the harness has deleted the session, holds it with no title yet (both title a
-   * conversation after its first turn), could not be asked within the list's short budget, or
-   * answered with a name this server gave it rather than one it earned — OpenCode keeps the
-   * `bit scope importer: <target>` a session was opened under. A null here can become a title
-   * on the next read.
-   */
-  title: Schema.NullOr(Schema.String),
-  /**
-   * Whether an import run on this session is going **right now, in this server process**.
-   *
-   * Read from the live registry and not stored: a restart forgets it, so `false` is "not
-   * known to be running" and a session that was running when the server died reads `false`.
-   */
-  running: Schema.Boolean,
-  /**
-   * When the session was ended, in epoch milliseconds, or null while it is open.
-   *
-   * Stored (`0026`), unlike `running`: set when the operator stops it, when the server
-   * shuts down, when the harness refuses a prompt into it, or when an open fails — and never
-   * cleared. It is what lets the picker mark a session closed rather than infer it from this
-   * process's memory. It says nothing holds the session's authority, not that the session
-   * is over: the server records why beside it (`0027`), and only an operator's end is final.
-   * **Null is not "live"**: a session open when the server died reads null and is
-   * unreachable through this process all the same.
-   */
-  endedAt: Schema.NullOr(Schema.Int),
-  /**
-   * Why, beside {@link endedAt}: the reason the session's latest authority period ended, or
-   * null while it has not (or for a row ended before the reason was recorded). `operator` is
-   * the one a composer is disabled on.
-   */
-  endedReason: Schema.NullOr(ImporterSessionEndReason),
+  ...conversationSessionFields,
   /**
    * The import a message to this session is addressed to: the session's newest run.
    *
@@ -357,13 +294,6 @@ export const ImporterSessionView = Schema.Struct({
    * closed and opened again would carry more than one — and a message goes to the latest.
    */
   importId: Schema.String,
-  /**
-   * The agent this session runs as (`AgentView.id`), pinned when its first message was sent.
-   *
-   * Every run of a session carries the same one: a reopen reads it back off the row rather
-   * than choosing again, so a conversation never changes agent under the operator.
-   */
-  agentId: Schema.String,
   tally: ImporterSessionTally,
 });
 export type ImporterSessionView = typeof ImporterSessionView.Type;
@@ -639,96 +569,34 @@ export const SCOPE_IMPORT_DATA_NOT_INSTRUCTIONS = [
 
 /* ── The conversation (the importer conversation design, S3) ─────────────────── */
 
-const EpochMillis = Schema.Finite.annotate({
-  description: "Milliseconds since the Unix epoch.",
-});
-
-/**
- * The longest message the importer takes, in characters.
- *
- * A bound so a request body cannot carry an unbounded prompt into a harness session, set
- * well above what an operator types or pastes from one program page: a long policy page's
- * scope section, pasted whole, is a few thousand characters. A message over it is refused by
- * the decoder before anything is opened for it.
+/*
+ * The importer's conversation is the generic one (`conversation.ts`): these are its names
+ * for the shapes every chat shares, and the two shapes that carry the import's own id and
+ * figures. Nothing on the wire differs from the generic shapes but those fields.
  */
-export const IMPORTER_MESSAGE_MAX_CHARS = 32_000;
+
+/** The longest message the importer takes: {@link CONVERSATION_MESSAGE_MAX_CHARS}. */
+export const IMPORTER_MESSAGE_MAX_CHARS = CONVERSATION_MESSAGE_MAX_CHARS;
+
+/** What a browser sends to say something to an importer session. */
+export const ImporterMessageDraft = ConversationMessageDraft;
+export type ImporterMessageDraft = ConversationMessageDraft;
+
+/** Whether a message opened a session, resumed one, or was given to one already live. */
+export const ImporterConversationStart = ConversationStart;
+export type ImporterConversationStart = ConversationStart;
 
 /**
- * What a browser sends to say something to an importer session.
- *
- * The operator's words, and how urgently they should land, and nothing else, for
- * `GoalMessageDraft`'s reason: the session is the server's, and a browser that could name its
- * harness, directory or credential would be choosing where an agent runs and what it may
- * reach. Trimmed and never empty, so an empty
- * composer submit is refused by the decoder before a session is opened for it.
- */
-export const ImporterMessageDraft = Schema.Struct({
-  text: Schema.Trim.check(
-    Schema.isNonEmpty(),
-    Schema.isMaxLength(IMPORTER_MESSAGE_MAX_CHARS),
-  ).annotate({
-    description: `What to say to the importer. Trimmed, never empty, and at most ${String(IMPORTER_MESSAGE_MAX_CHARS)} characters.`,
-  }),
-  /**
-   * How a message sent while a turn runs should land: `queued` (the default, when absent)
-   * or `preemptive` ("send now"). See {@link SteerUrgency}. It says nothing about the
-   * session the message goes to, which stays the server's.
-   */
-  urgency: Schema.optional(SteerUrgency),
-});
-export type ImporterMessageDraft = typeof ImporterMessageDraft.Type;
-
-/**
- * Whether a message opened a session, resumed one, or was given to one already live.
- *
- * - `opened` — a session was **created** for this message: the first message of a new
- *   conversation, or a message to an import whose session cannot be carried on at all (the
- *   harness swept its transcript, or holds one that was killed before its first prompt was
- *   saved). The importer in it has read nothing of what came before.
- * - `resumed` — the session this process no longer held was **continued** (S6): a fresh
- *   `query({ resume })` on Claude Code, an ordinary prompt on OpenCode. The conversation
- *   keeps its identity — {@link ImporterTurnAccepted.harnessSessionId} is the same session
- *   id as before — and the agent in it has its own history back.
- * - `continued` — the session was live in this process and the message was delivered into
- *   it, queued behind whatever it was doing.
- *
- * **`opened` and `resumed` both mint a new import id**, which
- * {@link ImporterTurnAccepted.importId} carries, because an import id names one *authority
- * period* and a new credential is a new period (`0027`). `continued` keeps the id it was
- * addressed with. The distinction between the first two is therefore not about the id: it is
- * about whether the conversation survived, which is the only part an operator can see.
- */
-export const ImporterConversationStart = Schema.Literals([
-  "opened",
-  "resumed",
-  "continued",
-]);
-export type ImporterConversationStart = typeof ImporterConversationStart.Type;
-
-/**
- * One operator message to the importer, accepted.
- *
- * **Accepted, not answered**, as a goal message is: the route returns once the session has
- * the message, and the turn is the model's to take.
+ * One operator message to the importer, accepted: {@link conversationTurnAcceptedFields},
+ * the import it landed in, and the pages it made citable.
  */
 export const ImporterTurnAccepted = Schema.Struct({
-  targetId: Schema.String,
+  ...conversationTurnAcceptedFields,
   /**
    * The import the message landed in. Equal to the one addressed on a `continued` turn; a
    * new id on an `opened` one, which is the id the next message should be addressed to.
    */
   importId: Schema.String,
-  /** The harness's own session id: the join to the session index. */
-  harnessSessionId: Schema.String,
-  harnessInstanceId: Schema.String,
-  /** As `provider/model`. */
-  model: Schema.String,
-  conversation: ImporterConversationStart,
-  /**
-   * A sentence for the operator about the session this landed in, in the server's words.
-   * Empty on an ordinary `continued` turn.
-   */
-  note: Schema.String,
   /**
    * Pages this message made citable: addresses the operator put on a line of their own,
    * newly added to the pages the import's entries may name as their source. The composer
@@ -741,20 +609,6 @@ export const ImporterTurnAccepted = Schema.Struct({
    * as one session reads (`SCOPE_IMPORT_MAX_LINKS`). Empty in the usual case.
    */
   pagesNotAdded: Schema.Array(Schema.String),
-  acceptedAt: EpochMillis,
-  /**
-   * The id the message was delivered under, on a `continued` turn: the steer the live
-   * session was given. A `turn.taken` item carrying the same id says the harness has taken
-   * it off its queue (A6 U4), which is how a chat tells a message sent mid-turn that is
-   * still waiting from one the importer is working on. Absent on `opened` and `resumed`,
-   * whose message opens the turn it is in.
-   */
-  messageId: Schema.optionalKey(Schema.String),
-  /**
-   * The files the message carried, as the server stored them (A6 U13): the operator's turn
-   * shows each with its path before any replay could. Absent on a message with none.
-   */
-  attachments: Schema.optionalKey(Schema.Array(MessageAttachmentView)),
 });
 export type ImporterTurnAccepted = typeof ImporterTurnAccepted.Type;
 
@@ -807,68 +661,13 @@ export class ImporterConversationRefused extends Schema.TaggedError<ImporterConv
   }
 }
 
-/**
- * Where an importer conversation's prose came from, or why there is none.
- *
- * {@link GoalConversationSource}'s five answers, with the same five meanings, because they
- * are the same five facts about the same kind of absence — and said separately here only
- * because a goal and an import are not the same resource.
- *
- * - `harness` — the harness answered with messages. Ephemeral: it may delete them.
- * - `pending` — this process holds the session and the harness holds nothing under it yet.
- *   The first second of the first message.
- * - `forgotten` — the harness no longer holds the session, or cannot be asked about it.
- *   **A note, never an error**: Claude Code sweeps its transcripts on `cleanupPeriodDays`
- *   and OpenCode's retention is its own, so for an import opened weeks ago this is the
- *   expected answer. What the session *wrote* is unaffected — the entries are on the Scope
- *   tab and the assets in the Estate, which is what makes losing the prose acceptable
- *   (DECISIONS.md §8).
- * - `none` — the harness still knows the session and holds nothing under it. The session
- *   really produced nothing.
- * - `absent` — nothing has ever been said in this import: its row was written before the
- *   session existed (`0025`) and the session was never created, so there is no conversation
- *   rather than no prose. Reporting that with the harness's "I no longer hold that session"
- *   sentence would tell an operator their message had been lost.
- */
-export const ImporterConversationSource = Schema.Literals([
-  "harness",
-  "pending",
-  "forgotten",
-  "none",
-  "absent",
-]);
-export type ImporterConversationSource = typeof ImporterConversationSource.Type;
+/** Where an importer conversation's prose came from: {@link ConversationSource}. */
+export const ImporterConversationSource = ConversationSource;
+export type ImporterConversationSource = ConversationSource;
 
-/**
- * What the next message to this import will do, decided by the server and never guessed by
- * a browser.
- *
- * **This is the field that stops a composer being offered for a message that will fail.**
- * The four answers are the four things the server will actually do, each checked against
- * the driver rather than assumed:
- *
- * - `live` — this process holds the session: the message is delivered into it as a queued
- *   steer, under this same import id.
- * - `resume` — this process does not hold it and the harness can continue it: a fresh
- *   `query({ resume })` on Claude Code, an ordinary prompt on OpenCode. The conversation
- *   keeps its identity and the agent keeps its own history; what changes is the import id,
- *   because an import id names one authority period (`0027`) and a new period gets a new
- *   one.
- * - `fresh` — the conversation cannot be continued, so the next message opens a **new
- *   session**: the harness has swept the transcript, or it holds a session that was killed
- *   before its first prompt was saved — which can be neither continued nor recreated. The
- *   note says which, and what is carried forward.
- * - `refused` — no message is accepted, and a new session is the way on. **Not only the
- *   operator's end**: {@link ImporterConversationView.refusal} says which refusal it is,
- *   and a screen must word it from that rather than read every `refused` as an end.
- */
-export const ImporterContinuation = Schema.Literals([
-  "live",
-  "resume",
-  "fresh",
-  "refused",
-]);
-export type ImporterContinuation = typeof ImporterContinuation.Type;
+/** What the next message to an import will do: {@link ConversationContinuation}. */
+export const ImporterContinuation = ConversationContinuation;
+export type ImporterContinuation = ConversationContinuation;
 
 /**
  * Why a replay answered `refused`, in the send's own vocabulary and with its sentence.
@@ -891,128 +690,18 @@ export const ImporterContinuationRefusal = Schema.Struct({
 export type ImporterContinuationRefusal =
   typeof ImporterContinuationRefusal.Type;
 
-/**
- * A message the operator sent into a live importer session that the harness's transcript
- * does **not yet hold**: delivered as a steer, and either still queued behind the turn
- * running, or taken and not yet written (A6 U4 review, review 2).
- *
- * The harness's transcript does not hold such a message until it takes it — and Claude Code
- * narrates the take 30–130 ms before it writes the entry — so a replay of the transcript
- * alone loses it on a reload, and the reply to it then reads as part of the turn before.
- * This process holds it from the moment the send is accepted until a replay has read it in
- * the transcript, or the session settles or closes (review 3), and the replay carries it
- * beside the transcript for as long as the transcript
- * does not hold its id (`LiveItem.messageIds` on the replayed `turn.operator`), so a
- * reloaded tab draws it once: queued while it waits, as its own turn once taken.
- */
-export const ImporterQueuedMessage = Schema.Struct({
-  /** The id the send was answered with (`ImporterTurnAccepted.messageId`). */
-  messageId: Schema.String,
-  /** The operator's own words, as sent. Untrusted text, as every message is. */
-  text: Schema.String,
-  /** When the server accepted it (`ImporterTurnAccepted.acceptedAt`). */
-  acceptedAt: EpochMillis,
-  /**
-   * Whether the harness has said it took the message (`turn.taken`): it is being worked on,
-   * not waiting, and is drawn as its own turn rather than queued. A take is narrated only
-   * on the lossy live channel, so a tab reloaded after it has no other way to know.
-   */
-  taken: Schema.Boolean,
-  /**
-   * When the harness took this message **together with others** in one take (A6 U4 review
-   * 3), every message of that take, this one included, oldest first — Claude Code stores
-   * such a take as one entry, and a chat draws it as one turn. Absent on a message taken
-   * alone and on one still waiting.
-   */
-  takenTogether: Schema.optionalKey(Schema.Array(Schema.String)),
-});
-export type ImporterQueuedMessage = typeof ImporterQueuedMessage.Type;
+/** A message held beside the transcript: {@link ConversationQueuedMessage}. */
+export const ImporterQueuedMessage = ConversationQueuedMessage;
+export type ImporterQueuedMessage = ConversationQueuedMessage;
 
 /**
- * One importer session as a reloaded tab replays it (S6).
- *
- * **The harness's copy, and nothing of ours.** This build stores no word of a conversation
- * (DECISIONS.md §8), so this is the only thing a refresh can show and the harness decides
- * how long it lasts. The durable half of the same screen is the import's own work: the
- * entries on the Scope tab, the assets in the Estate, the tally in the session list — all
- * rows, all there whatever this answers.
- *
- * `200` in every case, including a session the harness has entirely forgotten, for the
- * reason the goal replay is a `200`: "gone" is the ordinary end state of anything old
- * enough, and an error status would make a browser treat it as a fault.
+ * One importer session as a reloaded tab replays it (S6): {@link conversationViewFields}
+ * and the import asked about.
  */
 const ImporterConversationViewFields = {
-  targetId: Schema.String,
+  ...conversationViewFields,
   /** The import asked about, as addressed. */
   importId: Schema.String,
-  /** The session this was read from, or null when the import never got one. */
-  harnessSessionId: Schema.NullOr(Schema.String),
-  /**
-   * Whether **this process** is holding that session.
-   *
-   * False with a non-null session id is the restart case: the id is ours, the prose may
-   * still come back, and the in-memory grant that let the agent act is gone. Whether the
-   * conversation can be carried on from there is a *separate* question, and
-   * `continuation` is the one that answers it — collapsing the two would make a readable
-   * conversation look continuable, or a continuable one look dead.
-   */
-  live: Schema.Boolean,
-  source: ImporterConversationSource,
-  /** True only for `harness`: what is shown can disappear. */
-  ephemeral: Schema.Boolean,
-  /** A sentence for the operator, set on every source including a successful read. */
-  note: Schema.String,
-  /**
-   * The conversation as the **same items the live stream carries** (A6 F10), oldest first
-   * and all of them up to the limit, each with `importId` set: the importer's replies,
-   * thinking and tool calls with their results, and the operator's own messages as
-   * `turn.operator` items. A `user` entry is **the operator's own words**: the server trims
-   * its own framing off at the delimiter it wrote itself (`import/importerPrompt.ts`), an
-   * exact split rather than a guess. Ids are `replay:<n>`: a render key, not a cursor.
-   */
-  items: Schema.Array(LiveItem),
-  /**
-   * The operator's messages this process delivered into the live session that {@link items}
-   * does not hold, oldest first (A6 U4 review): the transcript does not have one until the
-   * harness has taken it and written it. Each is drawn at the end of the conversation,
-   * queued until it is `taken`. **The one exception to "nothing of ours"**: held in memory
-   * by this process only, never stored, and empty on any session this process does not hold
-   * (`live` false).
-   *
-   * **Joined to {@link items} by id, never by time** (A6 U4 review 2): what this process
-   * held is read **before** the transcript, and a message the transcript then holds — a
-   * replayed `turn.operator` naming it in `messageIds` — is left out here. So every message
-   * accepted before the read began is in exactly one of the two. "Holds" means anywhere in
-   * the transcript, not only in {@link items}' window (review 3), and a message a read has
-   * once found there is not this process's to hold any more: a copy older than the limit,
-   * or one a compaction later summarised away, is not put back at the end of the
-   * conversation.
-   */
-  queued: Schema.Array(ImporterQueuedMessage),
-  /**
-   * The question the session's agent is waiting on, or null (A7-Q).
-   *
-   * Re-read on every replay: from the harness when this process holds the session — Claude
-   * Code's pending `AskUserQuestion`, OpenCode's pending forms — and `live` then; otherwise
-   * from the transcript, when its last question call was never answered and no message of the
-   * operator's came after it, as `message` where a message would carry the session on and
-   * `not_resumable` where none would. The newest one, when a harness holds several.
-   */
-  question: Schema.NullOr(PendingQuestion),
-  /** Messages this answer stopped short of. */
-  truncated: Schema.Boolean,
-  /** How many harness entries produced no item. See `RoundNarration.omittedBlank`. */
-  omittedBlank: Schema.Int,
-  /**
-   * When this answer was built, on the server's clock.
-   *
-   * **Not the replay/live floor**, and it must not be used as one: the floor is an activity
-   * *publish order*, which the browser takes before the request leaves and holds against
-   * each live entry's `activity:<n>` (`importerFeed`). A floor taken from a timestamp would
-   * be comparing the server's clock with the browser's. This is here for the same reason
-   * `GoalConversationView.at` is — so a reader can tell how old the answer on screen is.
-   */
-  at: EpochMillis,
 };
 
 /**
