@@ -8,7 +8,8 @@
  * - **Whether the box takes a message**: not for a session on a harness this server does not
  *   run, one the operator ended (the index row, or the replay's `ended` refusal), one the
  *   replay refused for another reason (its sentence is the placeholder and the note), or
- *   while the owner says nothing can be sent at all ({@link ChatSessionInput.unavailable}).
+ *   while the owner says nothing can be sent at all. The state decides
+ *   (`ConversationSessions.messageBlocked`), so the dock's rule reads the same answer.
  * - **The sentences above the box**, in D3's order: a message waiting behind a model switch,
  *   the switch's answer, the server's word on the last message.
  * - **Stop, Stop all and the dock**, wired to the state, and offered only where the server
@@ -71,8 +72,10 @@ export interface ChatSessionInput<S extends ConversationSession> {
   /** The server's last word on one period's narration connection, if any. */
   readonly connection: (conversationId: string) => LiveConnection | undefined;
   /**
-   * Why nothing can be sent to this owner at all, when that is so — the importer's "no
-   * model to run on" — as the note and the placeholder. `undefined` when messages can go.
+   * The note and the placeholder for an owner nothing can be sent to at all — the
+   * importer's "no model to run on". Read only while the state says so
+   * (`ConversationSessions.messagesUnavailable`, from its constructor): the fact is the
+   * state's, so the dock's rule reads it too.
    */
   readonly unavailable?: () =>
     { readonly note: string; readonly placeholder: string } | undefined;
@@ -112,12 +115,11 @@ export const chatSessionOf = <S extends ConversationSession>(
   const refusedBecause = () =>
     !ended() && refusal() !== undefined ? refusal()?.detail : undefined;
   const stranded = () => session()?.strandedOn;
-  const unavailable = () => input.unavailable?.();
-  const blocked = () =>
-    stranded() !== undefined ||
-    ended() ||
-    refusedBecause() !== undefined ||
-    unavailable() !== undefined;
+  // The fact is the state's (`messagesUnavailable`); the words for it are the owner's.
+  const unavailable = () =>
+    input.state.messagesUnavailable ? input.unavailable?.() : undefined;
+  // The state's, so the box and the dock's rule (`state.question`) read one answer.
+  const blocked = () => input.state.messageBlocked;
   const agentLabel = () => {
     const id = session()?.agentId ?? input.state.agents?.defaultAgentId;
     return (
@@ -277,22 +279,17 @@ export const chatSessionOf = <S extends ConversationSession>(
      * session, when the dock reads only.
      */
     get question(): ChatQuestion | undefined {
-      // No `answerQuestion`, no question here (the state offers none): no dock.
+      /*
+       * The state's question is the one to dock: none without `answerQuestion`, and none
+       * that could neither be sent nor dismissed (review 2 of slice 2), so a page's "waiting
+       * on you" dot reading the same field cannot disagree with this.
+       */
       const pending = input.state.question;
       if (pending === undefined) return undefined;
       const sendAsMessage = blocked()
         ? undefined
         : (text: string) => input.state.sendAnswersAsMessage(text);
       const dismisses = input.state.abilities.dismissQuestion;
-      /*
-       * A dock with nothing it can send and no dismissal would hold the box for good: a
-       * question no longer waiting natively, on an owner that cannot dismiss, is left to the
-       * transcript's tool row.
-       */
-      const readOnly =
-        pending.answerability === "not_resumable" ||
-        (pending.answerability === "message" && sendAsMessage === undefined);
-      if (readOnly && !dismisses) return undefined;
       return {
         pending,
         asker: `The ${agentLabel().toLowerCase()}`,

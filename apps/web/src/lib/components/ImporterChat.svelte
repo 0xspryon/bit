@@ -360,11 +360,10 @@
    * an answer counts: an import model not asked for yet is not this. Two different
    * conditions, said differently: the server answering that no harness is ready
    * (`noHarness`), and the lookup failing some other way — no server answered, say — which
-   * is not a claim about harnesses at all.
+   * is not a claim about harnesses at all. The state's fact (`App.importer`'s
+   * `unavailable`), so the box and the dock's rule read it too.
    */
-  let noModel = $derived(
-    app.importerModel === undefined && app.importModelDetail !== "",
-  );
+  let noModel = $derived(importer.messagesUnavailable);
   let noHarness = $derived(noModel && app.importModelNoHarness);
 
   /** The importer's words for the generic chat: every sentence that names it or its pages. */

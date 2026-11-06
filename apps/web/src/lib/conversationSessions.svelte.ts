@@ -493,6 +493,11 @@ export class ConversationSessions<
    * pairing a replayed write with a record by position (`buildImporterChat`).
    */
   #skipped: () => number = () => 0;
+  /**
+   * Whether the owner says nothing can be sent at all (the importer's "no model to run
+   * on"), read where {@link messageBlocked} is derived, for {@link #live}'s reason.
+   */
+  #unavailable: () => boolean = () => false;
   #sent = 0;
   /**
    * The page's empty session whose first message is with the server, and that message's
@@ -733,11 +738,13 @@ export class ConversationSessions<
     now: () => number = () => Date.now(),
     live: () => readonly LiveItem[] = () => [],
     skipped: () => number = () => 0,
+    unavailable: () => boolean = () => false,
   ) {
     this.#binding = binding;
     this.#now = now;
     this.#live = live;
     this.#skipped = skipped;
+    this.#unavailable = unavailable;
     this.reset({ sessions: [binding.emptySession(now())] });
   }
 
@@ -2714,15 +2721,47 @@ export class ConversationSessions<
   #closedPeriods = new Set<string>();
 
   /**
-   * The question the session on screen is waiting on, or `undefined`: the replay's answer
-   * (`ImporterConversationView.question`), moved by the live `question` frames since.
+   * True when no message can go to the session on screen: it is on a harness this server
+   * does not run, the operator ended it (the index row, or the replay's refusal), the replay
+   * refused to carry it on for another reason, or the owner says nothing can be sent at all
+   * (the constructor's `unavailable`). The box's `blocked`, and the dock's rule below.
    */
-  question = $derived<PendingQuestion | undefined>(
+  messageBlocked = $derived.by(() => {
+    const session = this.current;
+    return (
+      session?.strandedOn !== undefined ||
+      session?.ended === true ||
+      session?.history.standing?.continuation === "refused" ||
+      this.#unavailable()
+    );
+  });
+
+  /** Whether the owner says nothing can be sent at all: the constructor's `unavailable`. */
+  get messagesUnavailable(): boolean {
+    return this.#unavailable();
+  }
+
+  /**
+   * The question the session on screen is waiting on **that the operator can act on here**,
+   * or `undefined`: the replay's answer (`ImporterConversationView.question`), moved by the
+   * live `question` frames since. The one reader of the pending question (review 2 of slice
+   * 2): the dock and any "waiting on you" dot read this, so they cannot disagree.
+   */
+  question = $derived.by((): PendingQuestion | undefined => {
     // An owner that cannot answer has no dock: the question is the transcript's tool row.
-    this.abilities.answerQuestion
-      ? (this.current?.history.question ?? undefined)
-      : undefined,
-  );
+    if (!this.abilities.answerQuestion) return undefined;
+    const pending = this.current?.history.question ?? undefined;
+    if (pending === undefined || this.abilities.dismissQuestion) return pending;
+    /*
+     * A dock with nothing it can send and no dismissal would hold the box for good: a
+     * question no longer waiting natively, on an owner that cannot dismiss, is left to the
+     * transcript's tool row, and nothing says it waits on the operator.
+     */
+    const readOnly =
+      pending.answerability === "not_resumable" ||
+      (pending.answerability === "message" && this.messageBlocked);
+    return readOnly ? undefined : pending;
+  });
 
   /**
    * A live `question` frame (A7-Q): a question asked is put on its session; one answered or

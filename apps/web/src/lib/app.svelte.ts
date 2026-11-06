@@ -1794,6 +1794,9 @@ export class App {
     undefined,
     () => (this.liveTargetId === this.viewTargetId ? this.liveItems : []),
     () => (this.liveTargetId === this.viewTargetId ? this.liveSkipped : 0),
+    // Nothing to send to: which model an import would run on could not be had. Only an
+    // answer counts — an import model not asked for yet is not this (`ImporterChat`).
+    () => this.importerModel === undefined && this.importModelDetail !== "",
   );
   /**
    * Which half of the Auto-load page is showing: the links and the model, or the import's

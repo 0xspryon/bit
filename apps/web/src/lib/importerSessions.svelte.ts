@@ -122,8 +122,9 @@ export class ImporterSessions extends ConversationSessions<ImporterSession> {
     now: () => number = () => Date.now(),
     live?: () => readonly import("@bit/contracts").LiveItem[],
     skipped?: () => number,
+    unavailable?: () => boolean,
   ) {
-    super(IMPORTER_BINDING, now, live, skipped);
+    super(IMPORTER_BINDING, now, live, skipped, unavailable);
     this.#clock = now;
     this.load("default");
   }

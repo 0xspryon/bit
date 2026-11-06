@@ -5,6 +5,7 @@
  * chat is to be built from — with fake endpoints standing in for its routes.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { SvelteSet } from "svelte/reactivity";
 
 import type {
   ConversationStopped,
@@ -130,6 +131,8 @@ const settle = async (): Promise<void> => {
 const world = (
   options: {
     readonly leaveOut?: readonly (keyof ConversationEndpoints<ProbeTurn>)[];
+    /** The owner says nothing can be sent at all, as the importer does with no model. */
+    readonly unavailable?: () => boolean;
   } = {},
 ) => {
   const calls: string[] = [];
@@ -259,6 +262,8 @@ const world = (
     BINDING,
     () => AT,
     () => live,
+    undefined,
+    options.unavailable,
   );
   return {
     state,
@@ -642,6 +647,44 @@ describe("the generic chat state through a goal-shaped owner", () => {
     probe.state.noteQuestion(asked("not_resumable"));
     // Nothing could be sent from it and it could not be put away: it would hold the box.
     expect(probeChat(probe.state).chat.question).toBeUndefined();
+  });
+
+  /*
+   * One reader of the pending question (review 2 of slice 2). The importer's title bar
+   * draws its "waiting on you" dot from `state.question !== undefined`; a page doing the
+   * same for this owner must not show a question its dock will not offer.
+   */
+  test("a question the dock will not offer is not one the page's dot shows either", async () => {
+    // Reactive, as the importer's model lookup is: the state derives from it.
+    const unavailable = new SvelteSet<string>();
+    const probe = world({
+      leaveOut: ["dismissQuestion"],
+      unavailable: () => unavailable.has("no model"),
+    });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    const { chat } = probeChat(probe.state);
+    /** The title bar's reading of it, as `TitleBar.svelte` draws the dot. */
+    const dot = () => probe.state.question !== undefined;
+    const seen = () => [dot(), chat.question !== undefined];
+
+    probe.state.noteQuestion(asked("not_resumable"));
+    const notResumable = seen();
+    // A `message` one while a message can go: docked, with the send and no dismissal.
+    probe.state.noteQuestion(asked("message", "q_2"));
+    const sendable = seen();
+    const sends = chat.question?.sendAsMessage !== undefined;
+    // The same one once nothing can be sent: neither the dock nor the dot.
+    unavailable.add("no model");
+    const blocked = seen();
+    expect(probe.state.messageBlocked).toBe(true);
+    expect(chat.composer).toMatchObject({ blocked: true });
+
+    expect(notResumable).toEqual([false, false]);
+    expect(sendable).toEqual([true, true]);
+    expect(sends).toBe(true);
+    expect(blocked).toEqual([false, false]);
   });
 
   test("an owner without a meter or a switch leaves them out", async () => {
