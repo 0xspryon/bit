@@ -148,7 +148,7 @@ export interface ActivityState {
 
 /** The name a running sub-agent is shown by: its type, else its task's description. */
 const subagentName = (detail: {
-  readonly agentType: string | undefined;
+  readonly agentType: string | null | undefined;
   readonly description: string;
 }): string => {
   const type = detail.agentType?.trim() ?? "";

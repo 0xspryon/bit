@@ -95,6 +95,7 @@ export const NARRATED_EVENT_TYPES: readonly string[] = [
   "session.reasoning.ended",
   "session.tool.input.started",
   "session.tool.called",
+  "session.tool.progress",
   "session.tool.success",
   "session.tool.failed",
   "session.inbox.delivered",

@@ -88,6 +88,7 @@ import {
   QuestionSettled,
 } from "./question";
 import { HarnessModelView, ModelOptionSelection } from "./modelOption";
+import { SubagentStopped, SubagentStopRefused } from "./subagent";
 import {
   ImporterConversationRefused,
   ImporterConversationView,
@@ -1629,6 +1630,56 @@ export class FleetApiGroup extends HttpApiGroup.make("fleet")
     HttpApiEndpoint.post(
       "stopImporterTurn",
       "/targets/:targetId/importer-sessions/:importId/stop",
+      {
+        params: { targetId: Schema.String, importId: Schema.String },
+        success: ConversationStopped,
+        error: [
+          ConversationStopRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * Stops one sub-agent the import's agent started, and nothing else (A7-S, E7).
+     *
+     * `callId` is the calling tool call's id ({@link SubagentView.callId}). Only a sub-agent
+     * whose view says `stop: "own"` can be stopped this way: a Claude Code background
+     * sub-agent (its task is stopped; the CLI then opens a turn to tell the agent), or an
+     * OpenCode one (its child session is interrupted; the agent is told by the harness).
+     * One that runs inside the turn, has ended, or this server cannot reach is
+     * {@link SubagentStopRefused}. Applied to the import holding the session now, as a Stop
+     * is; an id this target does not hold is a `404`.
+     */
+    HttpApiEndpoint.post(
+      "stopImporterSubagent",
+      "/targets/:targetId/importer-sessions/:importId/subagents/:callId/stop",
+      {
+        params: {
+          targetId: Schema.String,
+          importId: Schema.String,
+          callId: Schema.String,
+        },
+        success: SubagentStopped,
+        error: [
+          SubagentStopRefused,
+          ScopeImportNotFound,
+          TargetNotFound,
+          TargetUnavailable,
+        ],
+      },
+    ),
+    /**
+     * E7's **Stop all**: every running sub-agent the import's agent started that can be
+     * stopped on its own, then the turn and background work as {@link stopImporterTurn}
+     * stops them (A7-S). Sub-agents first, so a background one's end is in the session
+     * before the turn's Stop lands, and not a reason to open a turn after it. Answered as a
+     * Stop is.
+     */
+    HttpApiEndpoint.post(
+      "stopImporterAll",
+      "/targets/:targetId/importer-sessions/:importId/subagents/stop",
       {
         params: { targetId: Schema.String, importId: Schema.String },
         success: ConversationStopped,

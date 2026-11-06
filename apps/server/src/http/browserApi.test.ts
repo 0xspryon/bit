@@ -4675,6 +4675,42 @@ describe("a target's importer sessions", () => {
     expect(elsewhere.status).toBe(404);
   });
 
+  test("a sub-agent's Stop and Stop all: signed in only, checked against the target, and said plainly with nothing held (A7-S)", async () => {
+    const one = `/targets/${withSessions}/importer-sessions/imp_old/subagents/toolu_1/stop`;
+    const all = `/targets/${withSessions}/importer-sessions/imp_old/subagents/stop`;
+    // No bearer, or somebody else's: the guard answers before anything is looked up.
+    for (const [path, bearer] of [
+      [one, undefined],
+      [all, "nope"],
+    ] as const) {
+      const refused = await read(await call(path, { method: "POST", bearer }));
+      expect(refused.status).toBe(401);
+    }
+    // This server holds no session: a sub-agent cannot be reached, which is a 409 that
+    // says so, and Stop all is a Stop of nothing, a 200.
+    const stopped = await read(await signedIn(one, { method: "POST" }));
+    expect(stopped.status).toBe(409);
+    expect(stopped.body).toMatchObject({
+      _tag: "SubagentStopRefused",
+      reason: "not_live",
+    });
+    const everything = await read(await signedIn(all, { method: "POST" }));
+    expect(everything.status).toBe(200);
+    expect(everything.body).toMatchObject({
+      conversationId: "imp_old",
+      outcome: "not_live",
+      working: false,
+    });
+    // Another target's id is a 404, never looked up in this one's sessions.
+    for (const path of [
+      "/targets/not-a-target/importer-sessions/imp_old/subagents/toolu_1/stop",
+      "/targets/not-a-target/importer-sessions/imp_old/subagents/stop",
+    ]) {
+      const elsewhere = await read(await signedIn(path, { method: "POST" }));
+      expect(elsewhere.status).toBe(404);
+    }
+  });
+
   test("a session's activity with nothing held says nothing runs, and an unknown target is a 404 (A6 U6)", async () => {
     const activity = await read(
       await signedIn(

@@ -142,9 +142,19 @@ describe("a sub-agent at work (A7 U8b review)", () => {
       _tag: "subagent",
       callId,
       tool: "Agent",
-      agentType,
+      agentType: agentType ?? null,
       description,
+      task: "",
+      background: false,
       status,
+      startedAt: null,
+      endedAt: null,
+      calls: null,
+      lines: [],
+      activity: null,
+      result: null,
+      failure: null,
+      stop: "none",
     });
 
   // The store's fold, which keeps the running sub-agents by call id.

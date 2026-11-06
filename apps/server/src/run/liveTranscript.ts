@@ -108,6 +108,7 @@ import {
   type LiveFrame,
   type LiveItem,
   type LiveOpened,
+  type SubagentView,
 } from "@bit/contracts";
 import type { RecordedEvent } from "@bit/contracts";
 import {
@@ -132,6 +133,7 @@ import {
   truncateReply,
   type MessageEntry,
   type MessagePart,
+  type SubagentState,
 } from "../harness/agentHarness";
 import { pendingQuestionView } from "../harness/questions";
 import type {
@@ -731,6 +733,25 @@ const markerItem = (
   outcome: null,
 });
 
+/** A sub-agent's state as the contract's view: every field but the tag and the model. */
+const subagentView = (detail: SubagentState): SubagentView => ({
+  callId: detail.callId,
+  tool: detail.tool,
+  agentType: detail.agentType,
+  description: detail.description,
+  task: detail.task,
+  background: detail.background,
+  status: detail.status,
+  startedAt: detail.startedAt,
+  endedAt: detail.endedAt,
+  calls: detail.calls,
+  lines: detail.lines,
+  activity: detail.activity,
+  result: detail.result,
+  failure: detail.failure,
+  stop: detail.stop,
+});
+
 /**
  * One reply, thinking block, tool call, tool result or sub-agent state as one item, or
  * nothing — **the one
@@ -776,6 +797,8 @@ export const projectPart = (
         output: null,
         callId: detail.callId,
         outcome: detail.status,
+        // The card's whole view (A7-S, E7): the contract's fields, without the tag and model.
+        subagent: subagentView(detail),
         ...model,
       };
     case "reply":

@@ -1730,6 +1730,29 @@ const fleetHandlers = HttpApiBuilder.group(
       }),
 
       /**
+       * Stops one sub-agent of one import's session (A7-S, E7). The target is checked here
+       * and the import inside the importer, as a Stop's are: a call id is only ever looked
+       * up in the session of an import this target holds.
+       */
+      stopImporterSubagent: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.stopSubagent({
+          targetId: row.targetId,
+          importId: params.importId,
+          callId: params.callId,
+        });
+      }),
+
+      /** E7's Stop all for one import's session (A7-S), checked as a Stop is. */
+      stopImporterAll: Effect.fn(function* ({ params }) {
+        const row = yield* openableTarget(fleet, params.targetId);
+        return yield* importer.stopAll({
+          targetId: row.targetId,
+          importId: params.importId,
+        });
+      }),
+
+      /**
        * Answers the question one import's agent is waiting on (A7-Q). The target is checked
        * here and the import inside the importer, as a Stop's are.
        */

@@ -211,6 +211,12 @@ const REPORT = "Read the first page. The second returned no scope table.";
 
 /** What the scripted session did, so a test can assert on it. */
 interface Script {
+  /** Every `stopSubagent`, as `<session> <call>` (A7-S). */
+  readonly subagentStops: string[];
+  /** What `stopSubagent` answers, or `fail` for a harness that does not answer. */
+  subagentAnswer: "stopped" | "not_running" | "not_stoppable" | "fail";
+  /** `stopSubagents` and `interruptSession`, in the order they were asked (A7-S). */
+  readonly stopsInOrder: string[];
   /** Pages the scripted agent "could read". Anything else yields no calls at all. */
   readonly readable: Set<string>;
   readonly registrations: { url: string; bearer: string }[];
@@ -398,6 +404,9 @@ const newScript = (readable: readonly string[]): Script => {
     contextLatency: 0,
     contextModel: undefined,
     questions: scriptedQuestions(),
+    subagentStops: [],
+    subagentAnswer: "stopped",
+    stopsInOrder: [],
   };
 };
 
@@ -608,21 +617,50 @@ const scriptedHarness = (script: Script) => {
               return { delivered: true };
             }),
     waitForIdle: () => Effect.promise(() => script.done),
+    stopSubagent: (sessionId, callId) =>
+      Effect.suspend(() => {
+        script.subagentStops.push(`${sessionId} ${callId}`);
+        return script.subagentAnswer === "fail"
+          ? Effect.fail(
+              new HarnessTransportError({
+                operation: "session.interrupt",
+                status: undefined,
+                tag: undefined,
+                detail: "the scripted harness did not answer",
+                cause: undefined,
+              }),
+            )
+          : Effect.succeed(script.subagentAnswer);
+      }),
+    stopSubagents: (sessionId) =>
+      Effect.sync(() => {
+        script.stopsInOrder.push(`subagents ${sessionId}`);
+        return ["call_bg"];
+      }),
     interruptSession: (sessionId) =>
-      script.failInterrupt
-        ? Effect.fail(
-            new HarnessTransportError({
-              operation: "session.interrupt",
-              status: undefined,
-              tag: undefined,
-              detail: "the scripted harness did not acknowledge the interrupt",
-              cause: undefined,
-            }),
-          )
-        : Effect.sync(() => {
-            script.interrupted.push(sessionId);
-            return true;
+      Effect.tap(
+        Effect.suspend(() =>
+          script.failInterrupt
+            ? Effect.fail(
+                new HarnessTransportError({
+                  operation: "session.interrupt",
+                  status: undefined,
+                  tag: undefined,
+                  detail:
+                    "the scripted harness did not acknowledge the interrupt",
+                  cause: undefined,
+                }),
+              )
+            : Effect.sync(() => {
+                script.interrupted.push(sessionId);
+                return true;
+              }),
+        ),
+        () =>
+          Effect.sync(() => {
+            script.stopsInOrder.push(`turn ${sessionId}`);
           }),
+      ),
     endSession: ({ id: sessionId }) =>
       Effect.sync(() => {
         script.ended.push(sessionId);
@@ -5004,6 +5042,126 @@ describe("a question the importer's agent waits on (A7-Q)", () => {
         : item.entry.detail._tag,
     );
     expect(said).toEqual(["reply", "reply", "question", "connection closed"]);
+    await runtime.dispose();
+  });
+});
+
+/* ── A7-S: a sub-agent's Stop, and Stop all ──────────────────────────────────── */
+
+describe("stopping a sub-agent, and Stop all (A7-S)", () => {
+  const stopOne = (
+    runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+    importId: string,
+    callId: string,
+    targetId = TARGET,
+  ) =>
+    runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.stopSubagent({ targetId, importId, callId }),
+        ),
+      ),
+    );
+  const stopEverything = (
+    runtime: ManagedRuntime.ManagedRuntime<ScopeImporter, unknown>,
+    importId: string,
+  ) =>
+    runtime.runPromise(
+      Effect.result(
+        Effect.flatMap(ScopeImporter, (importer) =>
+          importer.stopAll({ targetId: TARGET, importId }),
+        ),
+      ),
+    );
+
+  test("asks the harness to stop that one sub-agent in the session this import holds, and says so", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const stopped = await stopOne(runtime, importId, "call_bg");
+    expect(stopped._tag).toBe("Success");
+    if (stopped._tag === "Success") {
+      expect(stopped.success).toMatchObject({
+        conversationId: importId,
+        callId: "call_bg",
+      });
+    }
+    expect(built.script.subagentStops).toEqual(["ses_import call_bg"]);
+    // A sub-agent's Stop is not the turn's.
+    expect(built.script.interrupted).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a sub-agent that runs inside the turn, has ended, or that the harness does not answer about is refused with a sentence", async () => {
+    const { built, runtime, importId } = await liveOne();
+    for (const [answer, reason] of [
+      ["not_stoppable", "not_stoppable"],
+      ["not_running", "not_running"],
+      ["fail", "harness_unreachable"],
+    ] as const) {
+      built.script.subagentAnswer = answer;
+      const refused = await stopOne(runtime, importId, "call_fg");
+      expect(refused._tag).toBe("Failure");
+      if (refused._tag === "Failure") {
+        expect(refused.failure).toMatchObject({
+          _tag: "SubagentStopRefused",
+          reason,
+        });
+        expect(refused.failure.message.length).toBeGreaterThan(20);
+      }
+    }
+    await runtime.dispose();
+  });
+
+  test("another target's or an unknown import's sub-agent is never looked up: a 404, and nothing asked of the harness", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const unknown = await stopOne(runtime, "imp_nonesuch", "call_bg");
+    expect(unknown._tag).toBe("Failure");
+    if (unknown._tag === "Failure") {
+      expect(unknown.failure._tag).toBe("ScopeImportNotFound");
+    }
+    // Addressed under a target that is not this import's: its file is not this one's, so
+    // the import is not found in it (the route answers 404 before this, `browserApi`).
+    const elsewhere = await stopOne(
+      runtime,
+      importId,
+      "call_bg",
+      "other-target",
+    );
+    expect(elsewhere._tag).toBe("Failure");
+    expect(built.script.subagentStops).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("Stop all stops the sub-agents first, then the turn, and is answered as a Stop", async () => {
+    const { built, runtime, importId } = await liveOne();
+    const stopped = await stopEverything(runtime, importId);
+    expect(stopped._tag).toBe("Success");
+    if (stopped._tag === "Success") {
+      expect(stopped.success).toMatchObject({
+        conversationId: importId,
+        outcome: "interrupted",
+      });
+    }
+    expect(built.script.stopsInOrder).toEqual([
+      "subagents ses_import",
+      "turn ses_import",
+    ]);
+    await runtime.dispose();
+  });
+
+  test("with no session held, a sub-agent's Stop is refused as not live and Stop all stops nothing", async () => {
+    const { built, runtime, importId } = await liveOne();
+    // A Stop the harness does not acknowledge lets the session go (A6 F5).
+    built.script.failInterrupt = true;
+    await stopOf(runtime, importId);
+    built.script.failInterrupt = false;
+    const refused = await stopOne(runtime, importId, "call_bg");
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure") {
+      expect(refused.failure).toMatchObject({ reason: "not_live" });
+    }
+    const all = await stopEverything(runtime, importId);
+    expect(all._tag).toBe("Success");
+    if (all._tag === "Success") expect(all.success.outcome).toBe("not_live");
     await runtime.dispose();
   });
 });

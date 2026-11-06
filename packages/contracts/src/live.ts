@@ -91,6 +91,7 @@ import { Schema } from "effect";
 import { LiveQuestion } from "./question";
 
 import { MessageAttachmentView } from "./messageUpload";
+import { SubagentView } from "./subagent";
 
 /** Epoch milliseconds. `Schema.Finite` so NaN and Infinity are refused, not shipped. */
 const EpochMillis = Schema.Finite.annotate({
@@ -381,10 +382,12 @@ export const LIVE_ITEM_KINDS = [
    * - `outcome`: `running`, `finished`, `failed` or `stopped`.
    * - `tool` / `toolName`: the calling tool as the harness named it; `callId` as above.
    *
-   * A sub-agent's own words — its final report, a background one's completion notice —
-   * are never on an item: not on this one, and not on the `turn.other` note (`task`) a
-   * Claude Code replay draws for a notification whose call it does not hold (launched
-   * before a compaction), which carries the notification's summary or status alone.
+   * Since A7-S (E7, decided by the operator: cards replace U14's "omit content") the item
+   * also carries {@link LiveItem.subagent}: its last tool lines, what it is doing now, and
+   * once finished what it returned, as the sub-agent wrote it. Its own thinking and replies
+   * are still not rows of the calling agent's. The `turn.other` note (`task`) a Claude Code
+   * replay draws for a notification whose call it does not hold (launched before a
+   * compaction) still carries the notification's summary or status alone.
    */
   "subagent",
   "action.denied",
@@ -680,6 +683,14 @@ export const LiveItem = Schema.Struct({
    * else, and an optional key so older frames still decode.
    */
   endUnknown: Schema.optionalKey(Schema.Literal(true)),
+  /**
+   * On a `subagent` item, the sub-agent as its card draws it (A7-S, E7): its task, timing,
+   * call count, last tool lines, what it is doing now, what it returned, why it failed and
+   * whether it can be stopped on its own. The item's own `headline`, `body` and `outcome`
+   * still say its type, description and status, as they did before A7-S. Absent on every
+   * other kind, and an optional key so older frames still decode.
+   */
+  subagent: Schema.optionalKey(SubagentView),
 });
 export type LiveItem = typeof LiveItem.Type;
 

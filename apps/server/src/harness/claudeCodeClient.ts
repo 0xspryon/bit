@@ -96,10 +96,19 @@ import {
   type ModelOptionDescriptor,
   type ModelOptionSelection,
   type QuestionAnswers,
+  SUBAGENT_ERROR_MAX,
+  SUBAGENT_LINE_MAX,
+  SUBAGENT_LINES_KEPT,
+  SUBAGENT_RESULT_MAX,
+  type SubagentFailure,
+  type SubagentStop,
+  type SubagentToolLine,
 } from "@bit/contracts";
 import {
   getSessionInfo as sdkGetSessionInfo,
   getSessionMessages as sdkGetSessionMessages,
+  getSubagentMessages as sdkGetSubagentMessages,
+  listSubagents as sdkListSubagents,
   query as sdkQuery,
   type CanUseTool,
   type EffortLevel,
@@ -134,7 +143,13 @@ import {
   AgentHarness,
   OPEN_PROMPT,
   SESSION_NOT_FOUND_TAG,
+  SUBAGENT_DESCRIPTION_MAX,
+  capped,
+  firstLine,
+  newestSubagents,
+  oneLine,
   subagentDescription,
+  toolInputLine,
   truncateNarration,
   truncateReply,
   type HarnessContextUsage,
@@ -440,6 +455,20 @@ export interface ClaudeCodeSdk {
     sessionId: string,
     options: { readonly dir?: string },
   ) => Promise<SDKSessionInfo | undefined>;
+  /**
+   * One sub-agent's own transcript (`<session>/subagents/agent-<agentId>.jsonl`), what a
+   * replayed card's tool lines and count are read from (A7-S). `[]` when there is none.
+   */
+  readonly subagentMessages: (
+    sessionId: string,
+    agentId: string,
+    options: { readonly dir?: string },
+  ) => Promise<readonly SessionMessage[]>;
+  /** The ids of the sub-agents whose transcripts are stored for the session. */
+  readonly listSubagents: (
+    sessionId: string,
+    options: { readonly dir?: string },
+  ) => Promise<readonly string[]>;
 }
 
 /** The real SDK. The default, and the only thing the server passes. */
@@ -448,6 +477,9 @@ export const liveClaudeCodeSdk: ClaudeCodeSdk = {
   sessionMessages: (sessionId, options) =>
     sdkGetSessionMessages(sessionId, options),
   sessionInfo: (sessionId, options) => sdkGetSessionInfo(sessionId, options),
+  subagentMessages: (sessionId, agentId, options) =>
+    sdkGetSubagentMessages(sessionId, agentId, options),
+  listSubagents: (sessionId, options) => sdkListSubagents(sessionId, options),
 };
 
 /** The main thread's block being streamed. See {@link SessionRecord.streamed}. */
@@ -1396,11 +1428,16 @@ type BlockKey = { readonly blockId?: string; readonly call?: string };
  */
 const SUBAGENT_TOOLS: ReadonlySet<string> = new Set(["Agent", "Task"]);
 
-/** What one sub-agent call said about itself, kept for its later states. */
+/**
+ * One sub-agent call, as this process has seen it so far (A6 U14; A7-S): what the call said
+ * about itself, and what its task frames, its own forwarded frames and its end have said
+ * since. Mutable, and snapshotted as a {@link SubagentState} each time it changes.
+ */
 interface SubagentCall {
   readonly tool: string;
-  readonly agentType: string | undefined;
+  readonly agentType: string | null;
   readonly description: string;
+  readonly task: string;
   readonly model: string | undefined;
   /**
    * The call returned at once and the sub-agent runs on: its result is a placeholder, and
@@ -1409,8 +1446,27 @@ interface SubagentCall {
    * the placeholder itself ({@link ASYNC_LAUNCH}), whichever says so first.
    */
   background: boolean;
-  /** The CLI's task id for it, from `task_started`, which `task_updated` names it by. */
+  /**
+   * The CLI's task id for it, from `task_started` live, or from the `agentId:` its result
+   * names on a replay (the same id: the sub-agent's transcript is `agent-<id>.jsonl`).
+   * What `task_updated` names it by, and what {@link stopSubagent} stops.
+   */
   taskId?: string;
+  status: SubagentStatus;
+  startedAt: number | null;
+  endedAt: number | null;
+  /** The CLI's own count (`task_progress`, the notification's `usage`), else ours. */
+  calls: number | null;
+  /** The tool calls it has made, counted from its forwarded frames. */
+  seen: number;
+  /** Its last {@link SUBAGENT_LINES_KEPT} tool calls, with their `tool_use` ids. */
+  lines: { id: string; line: SubagentToolLine }[];
+  /** The CLI's `task_progress` phrase for what it is doing now. */
+  activity: string | null;
+  /** Its newest text block: what it returns when it hands back. */
+  lastText: string | null;
+  result: string | null;
+  failure: SubagentFailure | null;
 }
 
 /**
@@ -1436,6 +1492,7 @@ const subagentCall = (
   tool: string,
   input: unknown,
   model: string | undefined,
+  at: number | null,
 ): SubagentCall => {
   const fields = (input ?? {}) as {
     subagent_type?: unknown;
@@ -1449,26 +1506,93 @@ const subagentCall = (
       typeof fields.subagent_type === "string" &&
       fields.subagent_type.trim() !== ""
         ? subagentDescription(fields.subagent_type, undefined)
-        : undefined,
+        : null,
     description: subagentDescription(fields.description, fields.prompt),
+    task:
+      typeof fields.prompt === "string"
+        ? firstLine(fields.prompt, SUBAGENT_DESCRIPTION_MAX)
+        : "",
     model,
     background: fields.run_in_background === true,
+    status: "running",
+    startedAt: at,
+    endedAt: null,
+    calls: null,
+    seen: 0,
+    lines: [],
+    activity: null,
+    lastText: null,
+    result: null,
+    failure: null,
   };
 };
+
+/**
+ * Whether a sub-agent can be stopped on its own (A7-S): a running **background** one whose
+ * task id this process knows, in a session it holds (`live`), is stopped with `stopTask`;
+ * a running **foreground** one is `with_turn`.
+ *
+ * V2(chat): a foreground sub-agent is offered no Stop of its own, as the operator decided
+ * for A7-S ("only the whole turn can be stopped"). Measured in A7-S Step 0 (CLI 2.1.310,
+ * haiku): `stopTask(<its task id>)` on a **foreground** sub-agent does stop it alone — its
+ * `task_notification` says `stopped`, the parent's `Agent` call returns an error result
+ * (`[Request interrupted by user for tool use]`) and the parent's turn goes on and replies.
+ * Offering it is this function answering `own` for it too, and `stopSubagent` already
+ * stops by task id whatever the call's shape.
+ */
+const subagentStop = (call: SubagentCall, live: boolean): SubagentStop =>
+  call.status !== "running"
+    ? "none"
+    : !call.background
+      ? "with_turn"
+      : live && call.taskId !== undefined
+        ? "own"
+        : "none";
 
 const subagentState = (
   callId: string,
   call: SubagentCall,
-  status: SubagentStatus,
+  live = true,
 ): SubagentState => ({
   _tag: "subagent",
   callId,
   tool: call.tool,
   agentType: call.agentType,
   description: call.description,
-  status,
+  task: call.task,
+  background: call.background,
+  status: call.status,
+  startedAt: call.startedAt,
+  endedAt: call.endedAt,
+  calls:
+    call.calls === null
+      ? call.seen > 0
+        ? call.seen
+        : null
+      : Math.max(call.calls, call.seen),
+  lines: call.lines.map((each) => each.line),
+  activity: call.status === "running" ? call.activity : null,
+  result: call.status === "finished" ? call.result : null,
+  failure: call.status === "failed" ? call.failure : null,
+  stop: subagentStop(call, live),
   ...(call.model === undefined ? {} : { model: call.model }),
 });
+
+/** Ends a sub-agent: its status, when, and the activity it no longer has. */
+const endSubagent = (
+  call: SubagentCall,
+  status: SubagentStatus,
+  at: number | null,
+): void => {
+  call.status = status;
+  call.endedAt = at;
+  call.activity = null;
+  call.lines = call.lines.map((each) =>
+    each.line.result === null && status !== "finished"
+      ? { ...each, line: { ...each.line, result: "stopped", failed: true } }
+      : each,
+  );
+};
 
 /**
  * How the CLI words a tool call a Stop cut short: the call's `tool_result` is an error whose
@@ -1480,12 +1604,48 @@ const subagentState = (
 const REJECTED_TOOL_USE = "The user doesn't want to proceed with this tool use";
 
 /**
- * A sub-agent call's result as its state: `finished`; `stopped` when the result is an error
- * a Stop caused — the CLI's {@link REJECTED_TOOL_USE} words, or, live, any error while this
- * session's turn is being interrupted; `failed` for any other error — and **nothing** for a
- * background launch's placeholder, since that sub-agent is still running and its
- * notification will say when it ends. The result's text is never carried: a foreground
- * result is the sub-agent's own final report.
+ * How the CLI words a foreground `Agent` call whose sub-agent was stopped on its own
+ * (`stopTask`, measured in A7-S Step 0): the call's result is an error reading exactly the
+ * interrupt marker. Read as `stopped`, as {@link REJECTED_TOOL_USE} is.
+ */
+const INTERRUPTED_TOOL_USE = "[Request interrupted by user for tool use]";
+
+/**
+ * The sub-agent's own report, out of the text a finished foreground `Agent` call returns
+ * (measured on 2.1.310): `[Subagent hand-back] …The report follows:\n`, the report with
+ * every line indented two spaces, then `agentId: <id> (…)` and a `<usage>` block. Read off
+ * the frame; the text as it stands when it does not look like that.
+ */
+const handBackReport = (text: string): string => {
+  const marker = "The report follows:\n";
+  const at = text.indexOf(marker);
+  let body = at < 0 ? text : text.slice(at + marker.length);
+  const cut = body.search(/\nagentId: /);
+  if (cut >= 0) body = body.slice(0, cut);
+  return body
+    .split("\n")
+    .map((line) => (line.startsWith("  ") ? line.slice(2) : line))
+    .join("\n")
+    .trim();
+};
+
+/** The `agentId: <id>` a hand-back or a background launch's placeholder names. */
+const agentIdIn = (text: string): string | undefined =>
+  /(?:^|\n)agentId: ([A-Za-z0-9_-]+)/.exec(text)?.[1];
+
+/** The `tool_uses` count a hand-back's or a stored notification's usage block names. */
+const toolUsesIn = (text: string): number | undefined => {
+  const found = /tool_uses(?::\s*|>)(\d+)/.exec(text)?.[1];
+  return found === undefined ? undefined : Number(found);
+};
+
+/**
+ * A sub-agent call's result as its state: `finished`, with its report; `stopped` when the
+ * result is an error a Stop caused — the CLI's {@link REJECTED_TOOL_USE} or
+ * {@link INTERRUPTED_TOOL_USE} words, or, live, any error while this session's turn is being
+ * interrupted; `failed` for any other error, with the error as the CLI said it — and
+ * **nothing** for a background launch's placeholder, since that sub-agent is still running
+ * and its notification will say when it ends.
  */
 const subagentResult = (
   callId: string,
@@ -1493,17 +1653,41 @@ const subagentResult = (
   text: string,
   failed: boolean,
   interrupted: boolean,
+  at: number | null,
+  live: boolean,
 ): MessagePart[] => {
+  const agentId = agentIdIn(text);
+  if (agentId !== undefined && call.taskId === undefined) call.taskId = agentId;
   if (!failed && text.trimStart().startsWith(ASYNC_LAUNCH)) {
     call.background = true;
   }
-  if (call.background) return [];
+  if (call.background) {
+    // Still running; the placeholder is news only to a card that could not stop it yet.
+    return [subagentState(callId, call, live)];
+  }
+  const said = text.trimStart();
   const status: SubagentStatus = !failed
     ? "finished"
-    : interrupted || text.trimStart().startsWith(REJECTED_TOOL_USE)
+    : interrupted ||
+        said.startsWith(REJECTED_TOOL_USE) ||
+        said.startsWith(INTERRUPTED_TOOL_USE)
       ? "stopped"
       : "failed";
-  return [subagentState(callId, call, status)];
+  if (status === "finished") {
+    call.result = capped(
+      call.lastText ?? handBackReport(text),
+      SUBAGENT_RESULT_MAX,
+    );
+    const uses = toolUsesIn(text);
+    if (uses !== undefined) call.calls = uses;
+  } else if (status === "failed") {
+    call.failure = {
+      reason: "The sub-agent call failed",
+      error: capped(text, SUBAGENT_ERROR_MAX),
+    };
+  }
+  endSubagent(call, status, at);
+  return [subagentState(callId, call, live)];
 };
 
 /**
@@ -1529,21 +1713,218 @@ const notifiedStatus = (status: string): SubagentStatus | undefined => {
 /**
  * A background sub-agent's end, from its task's notification, or nothing when the
  * notification is not about one. A foreground sub-agent's task is notified too — just
- * before its result — and is left to the result, so each sub-agent ends once.
+ * before its result — and is left to the result, so each sub-agent ends once; its count is
+ * taken from it.
+ *
+ * `said` is what the notification carries besides its status: live, the frame's `summary`
+ * (its final text when completed, its description otherwise) and `usage.tool_uses`; on a
+ * replay, the stored note's `<result>` and `<usage>`.
  */
 const subagentNotified = (
   subagents: SubagentCalls,
   toolUseId: string | undefined,
   status: string,
+  said: {
+    readonly text: string | undefined;
+    readonly calls: number | undefined;
+    readonly at: number | null;
+  },
+  live: boolean,
 ): MessagePart[] => {
   const call = toolUseId === undefined ? undefined : subagents.get(toolUseId);
   const ended = notifiedStatus(status);
-  return call === undefined ||
-    toolUseId === undefined ||
-    !call.background ||
-    ended === undefined
-    ? []
-    : [subagentState(toolUseId, call, ended)];
+  if (call === undefined || toolUseId === undefined || ended === undefined) {
+    return [];
+  }
+  if (said.calls !== undefined) call.calls = said.calls;
+  if (!call.background) return [];
+  if (ended === "finished") {
+    call.result = capped(call.lastText ?? said.text ?? "", SUBAGENT_RESULT_MAX);
+  } else if (ended === "failed") {
+    call.failure = {
+      reason: "The sub-agent failed",
+      error: capped(said.text ?? "The CLI said it failed.", SUBAGENT_ERROR_MAX),
+    };
+  }
+  endSubagent(call, ended, said.at);
+  return [subagentState(toolUseId, call, live)];
+};
+
+/**
+ * One of a sub-agent's own frames — forwarded with `parent_tool_use_id` naming its call —
+ * read into its call (A7-S): a `tool_use` block adds a tool line and counts a call, a
+ * `tool_result` closes the line it answers, a `text` block is its newest words. Answers the
+ * new state when a line moved, else nothing. Its thinking is not read, and none of it is the
+ * calling agent's row ({@link narrate}).
+ */
+const subagentFrame = (
+  call: SubagentCall,
+  callId: string,
+  message: SDKMessage,
+): MessagePart[] => {
+  const content = (message as { message?: { content?: unknown } }).message
+    ?.content;
+  const blocks = Array.isArray(content) ? content : [];
+  let moved = false;
+  for (const block of blocks) {
+    const record = (block ?? {}) as {
+      type?: unknown;
+      id?: unknown;
+      name?: unknown;
+      input?: unknown;
+      text?: unknown;
+      tool_use_id?: unknown;
+      content?: unknown;
+      is_error?: unknown;
+    };
+    if (
+      message.type === "assistant" &&
+      record.type === "tool_use" &&
+      typeof record.id === "string"
+    ) {
+      call.seen += 1;
+      call.lines = [
+        ...call.lines,
+        {
+          id: record.id,
+          line: {
+            tool: typeof record.name === "string" ? record.name : "tool",
+            input: toolInputLine(record.input, SUBAGENT_LINE_MAX),
+            result: null,
+            failed: false,
+          },
+        },
+      ].slice(-SUBAGENT_LINES_KEPT);
+      moved = true;
+    } else if (
+      message.type === "assistant" &&
+      record.type === "text" &&
+      typeof record.text === "string" &&
+      record.text.trim() !== ""
+    ) {
+      call.lastText = record.text;
+    } else if (
+      message.type === "user" &&
+      record.type === "tool_result" &&
+      typeof record.tool_use_id === "string"
+    ) {
+      const id = record.tool_use_id;
+      const failed = record.is_error === true;
+      call.lines = call.lines.map((each) =>
+        each.id === id
+          ? {
+              ...each,
+              line: {
+                ...each.line,
+                result: firstLine(
+                  resultText(record.content),
+                  SUBAGENT_LINE_MAX,
+                ),
+                failed,
+              },
+            }
+          : each,
+      );
+      moved = call.lines.some((each) => each.id === id) || moved;
+    }
+  }
+  return moved && call.status === "running"
+    ? [subagentState(callId, call)]
+    : [];
+};
+
+/**
+ * A sub-agent's own transcript (`<session>/subagents/agent-<id>.jsonl`, read with
+ * `getSubagentMessages`) read into its call on a replay (A7-S): its tool calls counted and
+ * its last ones as lines, its newest words, and when it started and last wrote. What a
+ * replayed card shows that the parent's transcript does not hold.
+ */
+const readSubagentTranscript = (
+  call: SubagentCall,
+  entries: readonly SessionMessage[],
+): void => {
+  let seen = 0;
+  const lines: { id: string; line: SubagentToolLine }[] = [];
+  let lastText: string | null = null;
+  let first: number | null = null;
+  let last: number | null = null;
+  for (const entry of entries) {
+    const stamp = (entry as { readonly timestamp?: unknown }).timestamp;
+    const at = typeof stamp === "string" ? Date.parse(stamp) : Number.NaN;
+    if (Number.isFinite(at)) {
+      first ??= at;
+      last = at;
+    }
+    const content = (entry.message as { content?: unknown } | undefined)
+      ?.content;
+    const blocks = Array.isArray(content) ? content : [];
+    for (const block of blocks) {
+      const record = (block ?? {}) as {
+        type?: unknown;
+        id?: unknown;
+        name?: unknown;
+        input?: unknown;
+        text?: unknown;
+        tool_use_id?: unknown;
+        content?: unknown;
+        is_error?: unknown;
+      };
+      if (
+        entry.type === "assistant" &&
+        record.type === "tool_use" &&
+        typeof record.id === "string"
+      ) {
+        seen += 1;
+        lines.push({
+          id: record.id,
+          line: {
+            tool: typeof record.name === "string" ? record.name : "tool",
+            input: toolInputLine(record.input, SUBAGENT_LINE_MAX),
+            result: null,
+            failed: false,
+          },
+        });
+      } else if (
+        entry.type === "assistant" &&
+        record.type === "text" &&
+        typeof record.text === "string" &&
+        record.text.trim() !== ""
+      ) {
+        lastText = record.text;
+      } else if (
+        entry.type === "user" &&
+        record.type === "tool_result" &&
+        typeof record.tool_use_id === "string"
+      ) {
+        const id = record.tool_use_id;
+        const line = lines.find((each) => each.id === id);
+        if (line !== undefined) {
+          line.line = {
+            ...line.line,
+            result: firstLine(resultText(record.content), SUBAGENT_LINE_MAX),
+            failed: record.is_error === true,
+          };
+        }
+      }
+    }
+  }
+  call.seen = seen;
+  // A call still open when it ended reads as stopped, as `endSubagent` has it live.
+  call.lines = lines
+    .slice(-SUBAGENT_LINES_KEPT)
+    .map((each) =>
+      each.line.result === null &&
+      call.status !== "running" &&
+      call.status !== "finished"
+        ? { ...each, line: { ...each.line, result: "stopped", failed: true } }
+        : each,
+    );
+  if (lastText !== null) call.lastText = lastText;
+  if (call.startedAt === null) call.startedAt = first;
+  if (call.status !== "running" && call.endedAt === null) call.endedAt = last;
+  if (call.status === "finished" && call.result === null && lastText !== null) {
+    call.result = capped(lastText, SUBAGENT_RESULT_MAX);
+  }
 };
 
 /**
@@ -1552,12 +1933,39 @@ const subagentNotified = (
  */
 const storedNotification = (
   text: string,
-): { readonly toolUseId: string; readonly status: string } | undefined => {
-  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1];
-  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1];
+):
+  | {
+      readonly toolUseId: string;
+      readonly status: string;
+      readonly taskId: string | undefined;
+      /** The sub-agent's final words (`<result>`), when the note carries them. */
+      readonly result: string | undefined;
+      /** Its tool-call count (`<usage>…<tool_uses>`), when the note carries it. */
+      readonly calls: number | undefined;
+    }
+  | undefined => {
+  // The CLI's own tags come before `<result>`, whose text is the sub-agent's and may hold
+  // tags of its own (see `notificationLine`).
+  const head = text.split("<result>", 1)[0] ?? "";
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(head)?.[1];
+  const status = /<status>([^<]+)<\/status>/.exec(head)?.[1];
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(head)?.[1]?.trim();
+  const opened = text.indexOf("<result>");
+  const closed = text.lastIndexOf("</result>");
+  const result =
+    opened >= 0 && closed > opened
+      ? text.slice(opened + "<result>".length, closed).trim()
+      : undefined;
+  const tail = closed >= 0 ? text.slice(closed) : head;
   return toolUseId === undefined || status === undefined
     ? undefined
-    : { toolUseId: toolUseId.trim(), status: status.trim() };
+    : {
+        toolUseId: toolUseId.trim(),
+        status: status.trim(),
+        taskId,
+        result,
+        calls: toolUsesIn(tail),
+      };
 };
 
 /**
@@ -1601,6 +2009,11 @@ const assistantParts = (
   model: string | undefined,
   key: (kind: "text" | "thinking", position: number) => BlockKey,
   subagents: SubagentCalls,
+  /**
+   * When the message was written — now, live; the entry's timestamp on a replay — and
+   * whether this process holds the session, which is what a sub-agent's Stop needs (A7-S).
+   */
+  when: { readonly at: number | null; readonly live: boolean },
 ): MessagePart[] => {
   const parts: MessagePart[] = [];
   const named = model === undefined ? {} : { model };
@@ -1641,9 +2054,9 @@ const assistantParts = (
       SUBAGENT_TOOLS.has(record.name)
     ) {
       // A sub-agent: its entry, not its call (A6 U14).
-      const call = subagentCall(record.name, record.input, model);
+      const call = subagentCall(record.name, record.input, model, when.at);
       subagents.set(record.id, call);
-      parts.push(subagentState(record.id, call, "running"));
+      parts.push(subagentState(record.id, call, when.live));
     } else if (record.type === "tool_use" && typeof record.id === "string") {
       parts.push({
         _tag: "toolCall",
@@ -1669,6 +2082,7 @@ const userParts = (
   blocks: readonly unknown[],
   subagents: SubagentCalls,
   interrupted: boolean,
+  when: { readonly at: number | null; readonly live: boolean },
 ): MessagePart[] =>
   blocks.flatMap((block): MessagePart[] => {
     const record = (block ?? {}) as {
@@ -1688,6 +2102,8 @@ const userParts = (
         resultText(record.content),
         record.is_error === true,
         interrupted,
+        when.at,
+        when.live,
       );
     }
     return record.type === "tool_result" &&
@@ -1771,7 +2187,14 @@ const narrate = (
     (message.type === "assistant" || message.type === "user") &&
     fromSubagent(message)
   ) {
-    return [];
+    // Read into its call's card instead (A7-S): a tool line, a result, its newest words.
+    const parent = (message as { parent_tool_use_id?: unknown })
+      .parent_tool_use_id;
+    const call =
+      typeof parent === "string" ? session.subagents.get(parent) : undefined;
+    return call === undefined || typeof parent !== "string"
+      ? []
+      : subagentFrame(call, parent, message).map(frame);
   }
   /*
    * A task's start and end, read for the sub-agents among them: a start or update says
@@ -1781,26 +2204,65 @@ const narrate = (
    */
   if (message.type === "system") {
     if (message.subtype === "task_started") {
+      const callId = message.tool_use_id;
       const call =
-        message.tool_use_id === undefined
-          ? undefined
-          : session.subagents.get(message.tool_use_id);
-      if (call !== undefined) {
+        callId === undefined ? undefined : session.subagents.get(callId);
+      if (call !== undefined && callId !== undefined) {
         call.taskId = message.task_id;
         if (message.is_backgrounded === true) call.background = true;
+        // Now it has a task id: a background one can be stopped on its own (A7-S).
+        return [subagentState(callId, call)].map(frame);
       }
     } else if (message.subtype === "task_updated") {
       // Names its task only; a sub-agent moved to the background after it started.
       if (message.patch.is_backgrounded === true) {
-        for (const call of session.subagents.values()) {
-          if (call.taskId === message.task_id) call.background = true;
+        for (const [callId, call] of session.subagents) {
+          if (call.taskId === message.task_id && !call.background) {
+            call.background = true;
+            return [subagentState(callId, call)].map(frame);
+          }
         }
       }
+    } else if (message.subtype === "task_progress") {
+      /*
+       * At each of a sub-agent's tool calls (A7-S Step 0): the CLI's phrase for it
+       * ("Running List files", "Reading notes.txt") and its tool-call count. Said only when
+       * it moves the card; it arrives within milliseconds of the call's own frame, before
+       * or after it.
+       */
+      const callId = message.tool_use_id;
+      const call =
+        callId === undefined ? undefined : session.subagents.get(callId);
+      if (
+        call !== undefined &&
+        callId !== undefined &&
+        call.status === "running"
+      ) {
+        const activity =
+          message.summary !== undefined && message.summary.trim() !== ""
+            ? oneLine(message.summary, SUBAGENT_LINE_MAX)
+            : message.description.trim() === ""
+              ? call.activity
+              : oneLine(message.description, SUBAGENT_LINE_MAX);
+        const calls = message.usage.tool_uses;
+        if (activity !== call.activity || calls !== call.calls) {
+          call.activity = activity;
+          call.calls = calls;
+          return [subagentState(callId, call)].map(frame);
+        }
+      }
+      return [];
     } else if (message.subtype === "task_notification") {
       const ended = subagentNotified(
         session.subagents,
         message.tool_use_id,
         message.status,
+        {
+          text: message.summary,
+          calls: message.usage?.tool_uses,
+          at,
+        },
+        true,
       );
       if (ended.length > 0) return ended.map(frame);
     }
@@ -1826,6 +2288,7 @@ const narrate = (
         (kind) =>
           finishedBlockKey(message, blocks.length, kind, session.streamed),
         session.subagents,
+        { at, live: true },
       ),
     );
   } else if (message.type === "user") {
@@ -1836,7 +2299,10 @@ const narrate = (
       details.push({ _tag: "marker", marker: INTERRUPT_MARKER, text: marker });
     } else {
       details.push(
-        ...userParts(blocks, session.subagents, session.interrupted),
+        ...userParts(blocks, session.subagents, session.interrupted, {
+          at,
+          live: true,
+        }),
       );
     }
   }
@@ -2369,9 +2835,18 @@ const flattenTranscript = (
    * entry's `messageIds`. Empty for a session this process does not hold.
    */
   steers: ReadonlyMap<string, readonly string[]> = new Map(),
+  /**
+   * Whether this process holds the session — what says a running background sub-agent can
+   * be stopped from here (A7-S) — and the map its sub-agents are read into, which the
+   * caller fills further from their own transcripts (`readSubagentTranscript`).
+   */
+  held: { readonly live: boolean; readonly subagents: SubagentCalls } = {
+    live: false,
+    subagents: new Map(),
+  },
 ): MessageEntry[] => {
   const blocksSeen = new Map<string, number>();
-  const subagents: SubagentCalls = new Map();
+  const subagents = held.subagents;
   // One reader for the whole read: each folder's realpath is asked once.
   const readAttachments = attachmentReader(replay);
   return entries.map((entry): MessageEntry => {
@@ -2431,12 +2906,30 @@ const flattenTranscript = (
      */
     const notified = marker === "task" ? storedNotification(text) : undefined;
     if (notified !== undefined && subagents.has(notified.toolUseId)) {
+      const call = subagents.get(notified.toolUseId);
+      if (
+        call !== undefined &&
+        call.taskId === undefined &&
+        notified.taskId !== undefined
+      ) {
+        call.taskId = notified.taskId;
+      }
       return {
         type: entry.type,
         text: "",
         marker: "task",
         error: undefined,
-        parts: subagentNotified(subagents, notified.toolUseId, notified.status),
+        parts: subagentNotified(
+          subagents,
+          notified.toolUseId,
+          notified.status,
+          {
+            text: notified.result,
+            calls: notified.calls,
+            at: Number.isFinite(at) ? at : null,
+          },
+          held.live,
+        ),
         model: undefined,
         at: Number.isFinite(at) ? at : undefined,
       };
@@ -2501,9 +2994,13 @@ const flattenTranscript = (
                   ? {}
                   : claudeCodeBlockKey(callId, first + position),
               subagents,
+              { at: Number.isFinite(at) ? at : null, live: held.live },
             )
           : entry.type === "user"
-            ? userParts(blocks, subagents, false)
+            ? userParts(blocks, subagents, false, {
+                at: Number.isFinite(at) ? at : null,
+                live: held.live,
+              })
             : [],
       model: entry.type === "assistant" ? modelOfMessage(message) : undefined,
       at: Number.isFinite(at) ? at : undefined,
@@ -4466,6 +4963,8 @@ export const claudeCodeHarness = (
             ),
         });
         const kept = entries.filter((entry) => !isLocalCommandEntry(entry));
+        const live = record !== undefined && !record.closed;
+        const subagents: SubagentCalls = new Map();
         /*
          * Each steer this session was delivered, by the UUID the CLI stores it under, and
          * steers it took together by the last one's (`storedSteers`). The derivation is
@@ -4473,7 +4972,7 @@ export const claudeCodeHarness = (
          * against the ids this process delivered, which it holds only while it holds the
          * session.
          */
-        return flattenTranscript(
+        const flat = flattenTranscript(
           kept,
           { uploadsFolder: read?.uploadsFolder },
           storedSteers(
@@ -4481,8 +4980,92 @@ export const claudeCodeHarness = (
             record?.takenTogether ?? new Map(),
             new Set(kept.map((entry) => entry.uuid)),
           ),
+          { live, subagents },
         );
+        if (subagents.size === 0) return flat;
+        yield* readSubagents(sessionId, directory, subagents, record);
+        /*
+         * A sub-agent is drawn as its newest state (`foldSubagents`), so its **last** part
+         * is replaced by what is known of it now: its own transcript's lines, and, for a
+         * session this process holds, the live record's — a sub-agent still running when
+         * the page reloads says where it is, not where the transcript last was. Its earlier
+         * parts stay as the transcript had them.
+         */
+        return newestSubagents(flat, (callId) => {
+          const call = record?.subagents.get(callId) ?? subagents.get(callId);
+          return call === undefined
+            ? undefined
+            : subagentState(callId, call, live);
+        });
       });
+
+      /**
+       * Reads each replayed sub-agent's own transcript into its call (A7-S): by the task id
+       * its result or notification named, else — a foreground one stopped by a Stop of the
+       * turn, whose result names none — the listed sub-agent whose prompt it was given. A
+       * sub-agent the session's live record already follows is left to it. A transcript
+       * that cannot be read leaves its card as the parent's transcript drew it.
+       */
+      const readSubagents = (
+        sessionId: string,
+        directory: string | undefined,
+        subagents: SubagentCalls,
+        record: SessionRecord | undefined,
+      ) =>
+        Effect.tryPromise({
+          try: async () => {
+            const dir = directory === undefined ? {} : { dir: directory };
+            const unnamed = [...subagents.values()].filter(
+              (call) => call.taskId === undefined,
+            );
+            if (unnamed.length > 0) {
+              const listed = await sdk.listSubagents(sessionId, dir);
+              const named = new Set(
+                [...subagents.values()].map((call) => call.taskId),
+              );
+              for (const agentId of listed) {
+                if (named.has(agentId) || unnamed.length === 0) continue;
+                const own = await sdk.subagentMessages(sessionId, agentId, dir);
+                const opening = own[0]?.message as
+                  { content?: unknown } | undefined;
+                const prompt =
+                  typeof opening?.content === "string"
+                    ? firstLine(opening.content, SUBAGENT_DESCRIPTION_MAX)
+                    : undefined;
+                const match = unnamed.findIndex(
+                  (call) => prompt !== undefined && call.task === prompt,
+                );
+                if (match < 0) continue;
+                const call = unnamed[match];
+                unnamed.splice(match, 1);
+                if (call === undefined) continue;
+                call.taskId = agentId;
+                readSubagentTranscript(call, own);
+              }
+            }
+            for (const [callId, call] of subagents) {
+              if (
+                call.taskId === undefined ||
+                call.seen > 0 ||
+                record?.subagents.has(callId) === true
+              ) {
+                continue;
+              }
+              readSubagentTranscript(
+                call,
+                await sdk.subagentMessages(sessionId, call.taskId, dir),
+              );
+            }
+          },
+          catch: (cause) => cause,
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning(
+              "a replayed sub-agent's own transcript could not be read; its card shows what the parent's transcript holds",
+              { sessionId, detail: String(cause) },
+            ),
+          ),
+        );
 
       const interruptSession: AgentHarness["Service"]["interruptSession"] =
         Effect.fn("claudeCodeHarness.interruptSession")(function* (sessionId) {
@@ -4653,6 +5236,64 @@ export const claudeCodeHarness = (
           }
         });
 
+      /**
+       * Stops one background sub-agent with `stopTask` on its task (A7-S). Measured in A7-S
+       * Step 0 (CLI 2.1.310, haiku): `task_notification` `stopped` ~5 ms after the call, its
+       * tool call in flight rejected, and the CLI then opens a turn of its own to tell the
+       * agent, which is how the agent hears of it. A foreground sub-agent is
+       * `not_stoppable` (the operator's decision; see {@link subagentStop}), and is stopped
+       * by the turn's Stop.
+       */
+      const stopSubagent: AgentHarness["Service"]["stopSubagent"] = Effect.fn(
+        "claudeCodeHarness.stopSubagent",
+      )(function* (sessionId, callId) {
+        const record = sessions.get(sessionId);
+        const call = record?.subagents.get(callId);
+        if (
+          record === undefined ||
+          record.closed ||
+          record.query === undefined ||
+          call === undefined ||
+          call.status !== "running"
+        ) {
+          return "not_running" as const;
+        }
+        const how = subagentStop(call, true);
+        if (how === "with_turn") return "not_stoppable" as const;
+        const taskId = call.taskId;
+        if (how !== "own" || taskId === undefined) {
+          return "not_running" as const;
+        }
+        const live = record.query;
+        yield* Effect.tryPromise({
+          try: () => live.stopTask(taskId),
+          catch: (cause) =>
+            transport(
+              "task.stop",
+              `the session would not stop the sub-agent: ${String(cause)}`,
+            ),
+        }).pipe(
+          Effect.timeout(taskStopTimeout),
+          Effect.catchTag("TimeoutError", () =>
+            Effect.fail(
+              transport(
+                "task.stop",
+                "the session did not acknowledge stopping the sub-agent in time",
+              ),
+            ),
+          ),
+        );
+        return "stopped" as const;
+      });
+
+      /*
+       * Nothing of its own: the turn's Stop asks `interrupt()`, which stops every background
+       * sub-agent with no turn opened after it (A6 F5, measured), where a `stopTask` each
+       * would make the CLI open one per sub-agent. A foreground one goes with its turn.
+       */
+      const stopSubagents: AgentHarness["Service"]["stopSubagents"] = () =>
+        Effect.succeed([]);
+
       /*
        * The query is closed, then the CLI and its process group are stopped and waited for:
        * `Query.close()` alone ends the CLI's stdin and leaves it running for 2 s, which is
@@ -4740,6 +5381,8 @@ export const claudeCodeHarness = (
         sessionTitle,
         messages,
         interruptSession,
+        stopSubagent,
+        stopSubagents,
         queuedOnInterrupt: "runs",
         // A queued message runs at once after an interrupt, so nothing is ever held.
         holding: () => Effect.succeed(false),

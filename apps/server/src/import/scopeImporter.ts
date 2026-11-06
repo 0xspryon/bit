@@ -138,6 +138,8 @@ import {
   type QuestionSettled,
   type ScopeImportView,
   type SteerUrgency,
+  SubagentStopRefused,
+  type SubagentStopped,
 } from "@bit/contracts";
 import {
   Clock,
@@ -585,6 +587,34 @@ export class ScopeImporter extends Context.Service<
      * itself would.
      */
     readonly stopTurn: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+    }) => Effect.Effect<
+      ConversationStopped,
+      ConversationStopRefused | ScopeImportNotFound
+    >;
+    /**
+     * Stops one sub-agent the import's agent started (A7-S, E7), in the import holding the
+     * session now, as {@link stopTurn} finds it: the harness's `stopSubagent`. One that runs
+     * inside the turn, has ended, or that this server cannot reach is refused, with a
+     * sentence that says which.
+     */
+    readonly stopSubagent: (input: {
+      readonly targetId: string;
+      readonly importId: string;
+      readonly callId: string;
+    }) => Effect.Effect<
+      SubagentStopped,
+      SubagentStopRefused | ScopeImportNotFound
+    >;
+    /**
+     * E7's Stop all (A7-S): every running sub-agent the harness can stop on its own
+     * (`stopSubagents`), then {@link stopTurn}. Sub-agents first, so a background one's end
+     * is in the session before the turn's Stop, which then also stops a notification turn
+     * it opened. A harness that would not stop a sub-agent fails the whole as
+     * `harness_unreachable`: the turn is still stopped, and the sentence says so.
+     */
+    readonly stopAll: (input: {
       readonly targetId: string;
       readonly importId: string;
     }) => Effect.Effect<
@@ -2959,6 +2989,108 @@ export class ScopeImporter extends Context.Service<
         return turnStopped({ found, conversationId: importId, what });
       });
 
+      /** The import holding the session now, for a sub-agent's Stop, as `stopTurn` finds it. */
+      const subagentSession = Effect.fnUntraced(function* (input: {
+        readonly targetId: string;
+        readonly importId: string;
+      }) {
+        const row = yield* withTargetStore(stores, input.targetId, (store) =>
+          store.importSession(input.importId),
+        ).pipe(
+          Effect.mapError(
+            (failure) =>
+              new SubagentStopRefused({
+                reason: "store_unavailable",
+                detail: `import ${input.importId}'s record could not be read (${failure.message}), so nothing was stopped.`,
+              }),
+          ),
+        );
+        if (row === undefined || row.targetId !== input.targetId) {
+          return yield* new ScopeImportNotFound({
+            reason: "unknown_import",
+            importId: input.importId,
+            detail: `no scope import '${input.importId}' is recorded on target '${input.targetId}', so there is no sub-agent to stop`,
+          });
+        }
+        const importId = yield* holdingNow(
+          newerRun(input.importId, row) ?? input.importId,
+        );
+        return { importId, held: sessions.get(importId) };
+      });
+
+      const stopSubagent: ScopeImporter["Service"]["stopSubagent"] = Effect.fn(
+        "ScopeImporter.stopSubagent",
+      )(function* (input) {
+        const { importId, held } = yield* subagentSession(input);
+        if (held === undefined) {
+          return yield* new SubagentStopRefused({
+            reason: "not_live",
+            detail:
+              "This server does not hold the session now, so it cannot reach the sub-agent. Reload the page to see where it stands.",
+          });
+        }
+        const answer = yield* held.harness
+          .stopSubagent(held.sessionId, input.callId)
+          .pipe(
+            Effect.mapError(
+              (failure) =>
+                new SubagentStopRefused({
+                  reason: "harness_unreachable",
+                  detail: `The harness did not answer the Stop (${failure.message}), so whether the sub-agent stopped is not known.`,
+                }),
+            ),
+          );
+        if (answer === "not_stoppable") {
+          return yield* new SubagentStopRefused({
+            reason: "not_stoppable",
+            detail:
+              "This sub-agent runs inside the importer's turn: Stop the turn to stop it.",
+          });
+        }
+        if (answer === "not_running") {
+          return yield* new SubagentStopRefused({
+            reason: "not_running",
+            detail:
+              "The sub-agent is no longer running, or this session did not start it.",
+          });
+        }
+        return {
+          conversationId: importId,
+          callId: input.callId,
+          detail:
+            "The sub-agent was stopped. The harness tells the importer, which may answer about it.",
+        };
+      });
+
+      const stopAll: ScopeImporter["Service"]["stopAll"] = Effect.fn(
+        "ScopeImporter.stopAll",
+      )(function* (input) {
+        const found = yield* subagentSession(input).pipe(
+          Effect.mapError((failure) =>
+            failure._tag === "SubagentStopRefused"
+              ? new ConversationStopRefused({
+                  reason: "store_unavailable",
+                  detail: failure.detail,
+                })
+              : failure,
+          ),
+        );
+        const children =
+          found.held === undefined
+            ? undefined
+            : yield* Effect.result(
+                found.held.harness.stopSubagents(found.held.sessionId),
+              );
+        const stopped = yield* stopTurn(input);
+        if (children?._tag === "Failure") {
+          return yield* new ConversationStopRefused({
+            reason: "harness_unreachable",
+            detail: `${stopped.detail} The harness did not answer a sub-agent's Stop (${children.failure.message}), so it may still be running.`,
+          });
+        }
+        return stopped;
+      });
+
       return ScopeImporter.of({
         start,
         stop,
@@ -2968,6 +3100,8 @@ export class ScopeImporter extends Context.Service<
         replay,
         switchModel,
         stopTurn,
+        stopSubagent,
+        stopAll,
         answerQuestion,
         dismissQuestion,
         activity,
@@ -3057,6 +3191,22 @@ export class ScopeImporter extends Context.Service<
             found: { _tag: "not_live" },
             conversationId: input.importId,
             what: "this session",
+          }),
+        ),
+      stopAll: (input) =>
+        Effect.succeed(
+          turnStopped({
+            found: { _tag: "not_live" },
+            conversationId: input.importId,
+            what: "this session",
+          }),
+        ),
+      stopSubagent: () =>
+        Effect.fail(
+          new SubagentStopRefused({
+            reason: "not_live",
+            detail:
+              "this server is configured with no agent harness, so no sub-agent runs here.",
           }),
         ),
       switchModel: () =>

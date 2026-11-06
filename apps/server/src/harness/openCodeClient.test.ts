@@ -30,6 +30,7 @@ import {
   lastAssistantText,
   type HarnessNarration,
   type MessageEntry,
+  type SubagentState,
   NARRATION_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
 } from "./agentHarness";
@@ -37,6 +38,7 @@ import {
   openCodeCompactionAt,
   openCodeContext,
   openCodeHarness,
+  openCodeChildNarration,
   openCodeNarration,
   openCodeQuestionOf,
   openCodeSubagents,
@@ -3596,12 +3598,13 @@ describe("a replayed message's files", () => {
  * OpenCode's sub-agent tool, as 2.2.5 runs it (`packages/core/src/tool/plugin/subagent.ts`
  * in the opencode source): the tool is `subagent` (`task` before 2.2), its input
  * `{ agent, description, prompt, background? }`. The sub-agent runs as a **child session**,
- * whose events carry its own `sessionID` and never reach the parent's stream
- * (`sessionOf`). Its call's result `metadata` is `{ sessionID, status }`: `completed` when
- * it handed back, `running` when it was launched in the background, after which a
- * `session.synthetic` notice on the parent, metadata `{ source: "subagent", childID, state }`
- * (`session/subagent-completion.ts`), says it ended. Built from those sources, not
- * recorded: no live OpenCode run with a sub-agent backs these shapes.
+ * whose events carry its own `sessionID`. Its call's result `metadata` is
+ * `{ sessionID, status }`: `completed` when it handed back, `running` when it was launched
+ * in the background. Since A7-S (measured live on 2.2.5, Step 0): the parent's
+ * `session.tool.progress` names the child at once, the child's own events arrive on the
+ * same stream under its id and are read into the card (`openCodeChildNarration`), and a
+ * background child's end comes live as its own `session.execution.*` — the parent's
+ * `session.synthetic` notice is a replay's (live it is inside `session.inbox.enqueued`).
  */
 describe("sub-agents, as one entry each (A6 U14)", () => {
   const event = (type: string, data: Record<string, unknown>) => ({
@@ -3610,21 +3613,26 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     durable: { aggregateID: "ses_1", seq: 4, version: 1 },
     data: { sessionID: "ses_1", assistantMessageID: "msg_1", ...data },
   });
-  const states = (details: readonly { readonly _tag: string }[]) =>
-    details.flatMap((detail) =>
-      detail._tag === "subagent"
-        ? [
-            ((state: {
-              callId: string;
-              status: string;
-              agentType: string | undefined;
-              description: string;
-            }) =>
-              `${state.callId} ${state.status} ${String(state.agentType)} · ${state.description}`)(
-              detail as never,
-            ),
-          ]
-        : [],
+  /** Each sub-agent's states, one line per change of status. */
+  const states = (details: readonly { readonly _tag: string }[]) => {
+    const last = new Map<string, string>();
+    return details.flatMap((detail) => {
+      if (detail._tag !== "subagent") return [];
+      const state = detail as SubagentState;
+      const line = `${state.callId} ${state.status} ${String(state.agentType)} · ${state.description}`;
+      if (last.get(state.callId) === line) return [];
+      last.set(state.callId, line);
+      return [line];
+    });
+  };
+  /** Each sub-agent's newest state, by call id. */
+  const newest = (details: readonly { readonly _tag: string }[]) =>
+    new Map(
+      details.flatMap((detail) =>
+        detail._tag === "subagent"
+          ? [[(detail as SubagentState).callId, detail as SubagentState]]
+          : [],
+      ),
     );
   const live = (events: readonly unknown[]) => {
     const names = new Map<string, string>();
@@ -3662,7 +3670,7 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     }),
   ];
 
-  test("live: a subagent call is one entry that runs, then finishes, and its reply is not carried", () => {
+  test("live: a subagent call is one entry that runs, then finishes, quoting what it returned", () => {
     const details = live(foreground);
     expect(states(details)).toEqual([
       "call_fg running explore · Find the login form",
@@ -3670,16 +3678,172 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     ]);
     expect(details.some((detail) => detail._tag === "toolCall")).toBe(false);
     expect(details.some((detail) => detail._tag === "toolResult")).toBe(false);
-    expect(JSON.stringify(details)).not.toContain("It posts to /session.");
+    // Its reply is its card's quote, without OpenCode's `<subagent>` wrapper, and nobody
+    // else's row (A7-S, E7).
+    expect(
+      JSON.stringify(details.filter((detail) => detail._tag !== "subagent")),
+    ).not.toContain("It posts to /session.");
+    const ended = newest(details).get("call_fg");
+    expect(ended?.result).toBe("It posts to /session.");
+    expect(ended?.endedAt).toBe(10);
     expect(details[2]).toEqual({
       _tag: "subagent",
       callId: "call_fg",
       tool: "subagent",
       agentType: "explore",
       description: "Find the login form",
+      task: "Look for a login form on the page and say where it posts.",
+      background: false,
       status: "running",
+      startedAt: 10,
+      endedAt: null,
+      calls: null,
+      lines: [],
+      activity: null,
+      result: null,
+      failure: null,
+      // Its child session is not known yet, so it cannot be stopped on its own.
+      stop: "none",
       model: "zai/glm-5.3-flash",
     });
+  });
+
+  test("live: the child session's own events are read into the card, and its Stop is offered once the child is known", () => {
+    const names = new Map<string, string>();
+    const models = new Map<string, string>();
+    const subagents = openCodeSubagents();
+    const child = (type: string, data: Record<string, unknown>) => ({
+      type,
+      created: 20,
+      durable: { aggregateID: "ses_child", seq: 1, version: 1 },
+      data: { sessionID: "ses_child", assistantMessageID: "msg_c", ...data },
+    });
+    const parent = (each: unknown) =>
+      openCodeNarration(each, names, undefined, models, subagents).detail;
+    // Its call, then the progress that names its child (measured on 2.2.5).
+    parent(foreground[0]);
+    parent(foreground[1]);
+    parent(foreground[2]);
+    const named = parent(
+      event("session.tool.progress", {
+        id: "call_fg",
+        metadata: { sessionID: "ses_child", status: "running" },
+      }),
+    ) as SubagentState;
+    expect(named.stop).toBe("own");
+    expect(named.calls).toBe(0);
+    const read = [
+      child("session.reasoning.ended", {
+        ordinal: 0,
+        text: "Let me list the files first.\nThen read one.",
+      }),
+      child("session.tool.input.started", { id: "t1", name: "shell" }),
+      child("session.tool.called", { id: "t1", input: { command: "ls -la" } }),
+      child("session.tool.success", {
+        id: "t1",
+        content: [{ type: "text", text: "notes.txt\nother.txt\n" }],
+      }),
+      child("session.tool.input.started", { id: "t2", name: "read" }),
+      child("session.tool.called", { id: "t2", input: { path: "gone.txt" } }),
+      child("session.tool.failed", {
+        id: "t2",
+        error: { message: "File not found: gone.txt" },
+      }),
+      // A step's usage moves nothing on the card: no entry, so no slot on the bus.
+      child("session.step.ended", { tokens: { input: 1, output: 1 } }),
+    ].map((each) => openCodeChildNarration(each, subagents));
+    expect(read.at(-1)).toBeUndefined();
+    const last = read.findLast((each) => each !== undefined)
+      ?.detail as SubagentState;
+    expect(last.activity).toBe("Let me list the files first.");
+    expect(last.calls).toBe(2);
+    expect(last.lines).toEqual([
+      { tool: "shell", input: "ls -la", result: "notes.txt", failed: false },
+      {
+        tool: "read",
+        input: "gone.txt",
+        result: "File not found: gone.txt",
+        failed: true,
+      },
+    ]);
+    // A child of a sub-agent this stream never saw started is not read at all.
+    expect(
+      openCodeChildNarration(
+        {
+          ...child("session.tool.called", { id: "x" }),
+          data: { sessionID: "ses_other", id: "x" },
+        },
+        subagents,
+      ),
+    ).toBeUndefined();
+    // A foreground child's own end is left to its call's result on the parent.
+    expect(
+      openCodeChildNarration(
+        child("session.execution.succeeded", {}),
+        subagents,
+      ),
+    ).toBeUndefined();
+  });
+
+  test("live: a background child's own execution end ends its card — finished, failed or stopped", () => {
+    for (const [type, data, status] of [
+      ["session.execution.succeeded", {}, "finished"],
+      [
+        "session.execution.failed",
+        { error: { message: "Free usage limit reached" } },
+        "failed",
+      ],
+      ["session.execution.interrupted", { reason: "user" }, "stopped"],
+    ] as const) {
+      const names = new Map<string, string>();
+      const subagents = openCodeSubagents();
+      for (const each of [
+        event("session.tool.input.started", {
+          id: "call_bg",
+          name: "subagent",
+        }),
+        event("session.tool.called", {
+          id: "call_bg",
+          input: {
+            agent: "general",
+            prompt: "Check robots.txt",
+            background: true,
+          },
+        }),
+        event("session.tool.success", {
+          id: "call_bg",
+          content: [{ type: "text", text: "working in the background" }],
+          metadata: { sessionID: "ses_bg", status: "running" },
+        }),
+      ]) {
+        openCodeNarration(each, names, undefined, new Map(), subagents);
+      }
+      const at = (kind: string, more: Record<string, unknown>) => ({
+        type: kind,
+        created: 30,
+        data: { sessionID: "ses_bg", ...more },
+      });
+      openCodeChildNarration(
+        at("session.text.ended", { ordinal: 0, text: "Disallows /admin." }),
+        subagents,
+      );
+      const end = openCodeChildNarration(at(type, data), subagents)
+        ?.detail as SubagentState;
+      expect(end.status).toBe(status);
+      expect(end.endedAt).toBe(30);
+      expect(end.stop).toBe("none");
+      expect(end.result).toBe(
+        status === "finished" ? "Disallows /admin." : null,
+      );
+      expect(end.failure).toEqual(
+        status === "failed"
+          ? {
+              reason: "The sub-agent failed",
+              error: "Free usage limit reached",
+            }
+          : null,
+      );
+    }
   });
 
   test("live: a background subagent runs until the parent's completion notice, which ends it", () => {
@@ -3721,9 +3885,20 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       "call_bg running general · Check robots.txt",
       "call_bg finished general · Check robots.txt",
     ]);
-    expect(details[2]).toEqual({ _tag: "opaque" });
+    // The placeholder result says it runs in the background, with its child: Stop is offered.
+    expect(details[2]).toMatchObject({
+      _tag: "subagent",
+      status: "running",
+      background: true,
+      stop: "own",
+    });
     expect(details[4]?._tag).toBe("subagent");
-    expect(JSON.stringify(details)).not.toContain("disallows");
+    expect(newest(details).get("call_bg")?.result).toBe(
+      "robots.txt disallows /admin",
+    );
+    expect(
+      JSON.stringify(details.filter((detail) => detail._tag !== "subagent")),
+    ).not.toContain("disallows");
   });
 
   test("live: a failed or cancelled subagent ends its entry so; a call with the old name `task` is one too", () => {
@@ -3755,6 +3930,12 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       "c2 running general · Cancelled one",
       "c2 stopped general · Cancelled one",
     ]);
+    // A failed card carries the reason and OpenCode's own words (A7-S, E7).
+    expect(newest(failed).get("c1")?.failure).toEqual({
+      reason: "The sub-agent call failed",
+      error: "Subagent failed (sessionID: ses_c1): boom",
+    });
+    expect(newest(failed).get("c2")?.failure).toBeNull();
   });
 
   test("replay equals live: the stored tool parts and the completion notice are the same entries", async () => {
@@ -3793,7 +3974,8 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
             {
               agent: "explore",
               description: "Find the login form",
-              prompt: "Look for a login form.",
+              prompt:
+                "Look for a login form on the page and say where it posts.",
             },
             "It posts to /session.",
             { sessionID: "ses_child", status: "completed" },
@@ -3844,7 +4026,8 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       "call_bg running general · Check robots.txt",
       "call_bg finished general · Check robots.txt",
     ]);
-    // The notice's words — the sub-agent's reply — are gone, and it is no `synthetic` note.
+    // The notice's words — the sub-agent's reply — are its card's quote and nobody's row,
+    // and it is no `synthetic` note.
     const subject = { _tag: "import", importId: "imp_1" } as const;
     const replayed = projectReplay({
       entries,
@@ -3853,9 +4036,13 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       users: "operator",
       fallbackAt: 0,
     }).items;
-    expect(JSON.stringify(replayed)).not.toContain("disallows");
-    expect(JSON.stringify(replayed)).not.toContain("It posts to");
+    const rows = replayed.filter((item) => item.kind !== "subagent");
+    expect(JSON.stringify(rows)).not.toContain("disallows");
+    expect(JSON.stringify(rows)).not.toContain("It posts to");
     expect(replayed.some((item) => item.kind === "turn.other")).toBe(false);
+    const quoted = newest(entries.flatMap((entry) => entry.parts));
+    expect(quoted.get("call_fg")?.result).toBe("It posts to /session.");
+    expect(quoted.get("call_bg")?.result).toBe("robots.txt disallows /admin");
 
     // The same events, live, project to the same sub-agent items.
     const liveDetails = live([
@@ -3880,7 +4067,7 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
         executed: true,
       }),
       event("session.synthetic", {
-        text: "…",
+        text: '<subagent sessionID="ses_bg" state="completed">\nrobots.txt disallows /admin\n</subagent>',
         metadata: { source: "subagent", childID: "ses_bg", state: "completed" },
       }),
     ]);
@@ -3900,14 +4087,31 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       });
       return frame?._tag === "item" ? [frame] : [];
     });
-    const shape = (item: LiveItem) =>
-      Object.fromEntries(
-        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
-      );
-    const agents = (items: readonly LiveItem[]) =>
-      items.filter((item) => item.kind === "subagent").map(shape);
+    /*
+     * What a reader keeps — the newest per call — is the same both ways, but for what only
+     * one side can know: the clock, and whether this process watches the session to stop
+     * anything in (the replay here is of a session it does not).
+     */
+    const shape = (item: LiveItem) => ({
+      ...Object.fromEntries(
+        Object.entries(item).filter(
+          ([key]) => key !== "id" && key !== "at" && key !== "subagent",
+        ),
+      ),
+      subagent:
+        item.subagent === undefined
+          ? undefined
+          : { ...item.subagent, startedAt: 0, endedAt: 0, stop: "none" },
+    });
+    const agents = (items: readonly LiveItem[]) => [
+      ...new Map(
+        items
+          .filter((item) => item.kind === "subagent")
+          .map((item) => [item.callId, shape(item)] as const),
+      ).values(),
+    ];
     expect(agents(liveItems)).toEqual(agents(replayed));
-    expect(agents(replayed)).toHaveLength(4);
+    expect(agents(replayed)).toHaveLength(2);
   });
 });
 
@@ -4280,5 +4484,145 @@ describe("the question dock's OpenCode half: forms (A7-Q)", () => {
       _tag: "Failure",
       failure: { _tag: "HarnessTransportError" },
     });
+  });
+});
+
+/* ── Stopping a sub-agent (A7-S) ─────────────────────────────────────────────── */
+
+describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => {
+  test("a sub-agent the stream saw start is stopped by interrupting its child, and Stop all asks each running one", async () => {
+    const frame = (
+      session: string,
+      type: string,
+      data: Record<string, unknown>,
+    ) =>
+      `data: ${JSON.stringify({
+        type,
+        created: 1_793_347_011_894,
+        durable: { aggregateID: session, seq: 1, version: 1 },
+        data: { sessionID: session, assistantMessageID: "msg_p", ...data },
+      })}\n\n`;
+    let push: ((frame: string) => void) | undefined;
+    const events = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        push = (each) => {
+          controller.enqueue(new TextEncoder().encode(each));
+        };
+      },
+    });
+    const { layer, recorded } = clientWith((url) =>
+      url.includes("/api/event")
+        ? Promise.resolve(
+            new Response(events, {
+              headers: { "content-type": "text/event-stream" },
+            }),
+          )
+        : url.includes("/interrupt")
+          ? json({ interrupted: true })
+          : json(sessionInfo()),
+    );
+    const seen: SubagentState[] = [];
+    const answers = await Effect.runPromise(
+      Effect.scoped(
+        Effect.provide(
+          Effect.flatMap(AgentHarness, (harness) =>
+            Effect.gen(function* () {
+              const reading = yield* harness.sessionEvents("ses_1").pipe(
+                Stream.runForEach((entry) =>
+                  Effect.sync(() => {
+                    if (entry.detail._tag === "subagent")
+                      seen.push(entry.detail);
+                  }),
+                ),
+                Effect.forkChild,
+              );
+              yield* Effect.sleep("30 millis");
+              push?.(
+                frame("ses_1", "session.tool.input.started", {
+                  id: "call_a",
+                  name: "subagent",
+                }),
+              );
+              push?.(
+                frame("ses_1", "session.tool.called", {
+                  id: "call_a",
+                  input: {
+                    agent: "general",
+                    description: "Sleep",
+                    prompt: "sleep 30",
+                  },
+                }),
+              );
+              const before = yield* harness.stopSubagent("ses_1", "call_a");
+              push?.(
+                frame("ses_1", "session.tool.progress", {
+                  id: "call_a",
+                  metadata: { sessionID: "ses_kid", status: "running" },
+                }),
+              );
+              // The child's own call, on the same stream under its id.
+              push?.(
+                frame("ses_kid", "session.tool.input.started", {
+                  id: "k1",
+                  name: "shell",
+                }),
+              );
+              push?.(
+                frame("ses_kid", "session.tool.called", {
+                  id: "k1",
+                  input: { command: "sleep 30" },
+                }),
+              );
+              // Another session's event is not this one's.
+              push?.(
+                frame("ses_other", "session.tool.called", {
+                  id: "o1",
+                  input: { command: "rm" },
+                }),
+              );
+              for (
+                let tries = 0;
+                tries < 200 && seen.at(-1)?.calls !== 1;
+                tries += 1
+              ) {
+                yield* Effect.sleep("5 millis");
+              }
+              const one = yield* harness.stopSubagent("ses_1", "call_a");
+              const nobody = yield* harness.stopSubagent("ses_1", "call_none");
+              const all = yield* harness.stopSubagents("ses_1");
+              yield* Fiber.interrupt(reading);
+              return { before, one, nobody, all };
+            }),
+          ),
+          layer,
+        ),
+      ),
+    );
+    expect(answers).toEqual({
+      before: "not_running",
+      one: "stopped",
+      nobody: "not_running",
+      // Still running as far as the stream knows (no end has come), so asked again.
+      all: ["call_a"],
+    });
+    const interrupts = recorded.urls.filter((url) =>
+      url.includes("/interrupt"),
+    );
+    expect(interrupts).toHaveLength(2);
+    expect(
+      interrupts.every((url) => url.includes("/api/session/ses_kid/interrupt")),
+    ).toBe(true);
+    expect(recorded.urls.some((url) => url.includes("ses_1/interrupt"))).toBe(
+      false,
+    );
+    expect(seen.at(-1)).toMatchObject({
+      callId: "call_a",
+      stop: "own",
+      calls: 1,
+      lines: [
+        { tool: "shell", input: "sleep 30", result: null, failed: false },
+      ],
+    });
+    expect(JSON.stringify(seen)).not.toContain("rm");
   });
 });

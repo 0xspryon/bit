@@ -379,6 +379,10 @@ export const stubHarness = (
       Effect.fail(notPending(questionId)),
     dismissQuestion: (_sessionId, questionId) =>
       Effect.fail(notPending(questionId)),
+    // No sub-agent runs here, so none can be stopped (A7-S). A test about a Stop of one
+    // says what the harness answers.
+    stopSubagent: () => Effect.succeed("not_running" as const),
+    stopSubagents: () => Effect.succeed([]),
     // Nothing measured, no window: what a harness that has made no call answers.
     contextUsage: () =>
       Effect.succeed({

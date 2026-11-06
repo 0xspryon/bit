@@ -95,6 +95,7 @@ import type {
   QuestionAnswers,
   QuestionField,
   QuestionSettlement,
+  SubagentView,
 } from "@bit/contracts";
 import {
   Context,
@@ -810,56 +811,42 @@ export interface HarnessQuestion {
 }
 
 /**
- * Where a sub-agent stands, as {@link SubagentState} says it.
+ * Where a sub-agent stands, as {@link SubagentState} says it: the contract's
+ * `SubagentStatus`.
  *
  * `running` from the call until something ends it; `finished` when it handed back;
  * `failed` when the harness says the call or the task failed; `stopped` when it was stopped
  * or cancelled before it ended on its own.
  */
-export type SubagentStatus = "running" | "finished" | "failed" | "stopped";
+export type SubagentStatus = SubagentView["status"];
 
 /**
  * A **sub-agent** the session's agent started, and where it stands — instead of its call,
- * its result and everything it said (A6 U14, decided by the operator).
+ * its result and everything it said (A6 U14), and since A7-S with what its card draws
+ * (E7): its task, timing, call count, last tool lines, what it is doing now, what it
+ * returned and why it failed (`SubagentView`, the contract).
  *
  * A harness's sub-agent tool (Claude Code's `Agent`, formerly `Task`; OpenCode's
  * `subagent`, formerly `task`) starts another agent with its own context, and that agent's
  * reasoning, tool calls and replies are not the calling agent's. Narrated as the caller's
  * rows they read as if the caller wrote them, and on Claude Code they also vanished on a
  * reload, since its transcript keeps them elsewhere. So a driver narrates a sub-agent's
- * own frames as nothing, and its call as this: what it is and how it stands. Each driver
- * produces one when the call is made (`running`) and one when it ends, both carrying the
- * same {@link callId} and the same description, live and in a replay, so a reader keeps the
- * newest state per call and draws **one entry** at the place of the first.
+ * own frames as nothing **of the caller's**, and as states of this instead: one when the
+ * call is made (`running`), one at each of its tool calls and results, and one when it
+ * ends, all carrying the same {@link callId}, live and in a replay, so a reader keeps the
+ * newest state per call and draws **one card** at the place of the first.
  *
- * Its own words never reach this: a finished foreground call's result is the sub-agent's
- * final report, and a background one's completion notice carries it too. Neither is
- * carried here, and a replay drops the notice rather than drawing it.
- *
- * V2(chat): a sub-agent's own transcript is not shown — only one entry per sub-agent.
- * Proper V2: replay its transcript (Claude Code keeps it in a "subagents/" folder beside the
- * session's transcript; OpenCode runs it as a child session) labelled as the sub-agent's.
+ * V2(chat): a sub-agent's own thread is not shown — its card carries its last
+ * `SUBAGENT_LINES_KEPT` tool lines and its result, not its whole transcript, and "Open its
+ * thread" is disabled. Proper V2: replay its transcript (Claude Code's
+ * `getSubagentMessages`, OpenCode's child session) as a thread of its own, labelled as the
+ * sub-agent's, and list sub-agents in Agent sessions (E7's note).
  */
-export interface SubagentState {
+export type SubagentState = {
   readonly _tag: "subagent";
-  /** The calling tool call's id: the sub-agent's identity for every state of it. */
-  readonly callId: string;
-  /** The calling tool as the harness named it (`Agent`, `subagent`). */
-  readonly tool: string;
-  /**
-   * Its type as the calling agent asked for it — Claude Code's `subagent_type`, OpenCode's
-   * `agent` — or `undefined` when the call named none. Agent text: shown as plain text.
-   */
-  readonly agentType: string | undefined;
-  /**
-   * The calling agent's short description of the task, or, when it gave none, the start of
-   * the prompt; one line, capped at {@link SUBAGENT_DESCRIPTION_MAX}. Agent text.
-   */
-  readonly description: string;
-  readonly status: SubagentStatus;
   /** The model that made the call, when the harness said. See `LiveItem.model`. */
   readonly model?: string | undefined;
-}
+} & SubagentView;
 
 /** The most characters a {@link SubagentState.description} carries. */
 export const SUBAGENT_DESCRIPTION_MAX = 200;
@@ -883,6 +870,97 @@ export const subagentDescription = (
   return line.length <= SUBAGENT_DESCRIPTION_MAX
     ? line
     : `${line.slice(0, SUBAGENT_DESCRIPTION_MAX - 1).trimEnd()}…`;
+};
+
+/**
+ * One line of agent text, collapsed and capped at `max` characters with an ellipsis when
+ * cut: a tool call's input or result, a task, an activity, as a card draws them (A7-S).
+ */
+export const oneLine = (text: string, max: number): string => {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length <= max ? line : `${line.slice(0, max - 1).trimEnd()}…`;
+};
+
+/** A text's first non-empty line, as {@link oneLine}; `""` when it has none. */
+export const firstLine = (text: string, max: number): string =>
+  oneLine(text.split("\n").find((line) => line.trim() !== "") ?? "", max);
+
+/** Text capped at `max` characters with an ellipsis when cut, line breaks kept. */
+export const capped = (text: string, max: number): string => {
+  const trimmed = text.trim();
+  return trimmed.length <= max
+    ? trimmed
+    : `${trimmed.slice(0, max - 1).trimEnd()}…`;
+};
+
+/**
+ * A tool call's input as one line for a sub-agent's card: the field a person reads it by —
+ * a shell's `command`, a file tool's path, a search's pattern or query, a fetch's url —
+ * else its other strings joined, else its JSON. Agent text.
+ */
+export const toolInputLine = (input: unknown, max: number): string => {
+  if (typeof input === "string") return oneLine(input, max);
+  if (input === null || typeof input !== "object") return "";
+  const fields = input as Record<string, unknown>;
+  for (const key of [
+    "command",
+    "file_path",
+    "filePath",
+    "path",
+    "pattern",
+    "query",
+    "url",
+    "description",
+  ]) {
+    const value = fields[key];
+    if (typeof value === "string" && value.trim() !== "") {
+      return oneLine(value, max);
+    }
+  }
+  const strings = Object.values(fields).filter(
+    (value): value is string => typeof value === "string" && value !== "",
+  );
+  if (strings.length > 0) return oneLine(strings.join(" "), max);
+  try {
+    return oneLine(JSON.stringify(input) ?? "", max);
+  } catch {
+    return "";
+  }
+};
+
+/**
+ * A replay's entries with each sub-agent's **last** state replaced by `now(callId)` (A7-S),
+ * when it answers one: what both drivers do once a sub-agent's own transcript has been read
+ * into its call. Earlier states are left as the transcript had them.
+ */
+export const newestSubagents = (
+  entries: readonly MessageEntry[],
+  now: (callId: string) => SubagentState | undefined,
+): MessageEntry[] => {
+  const last = new Map<string, readonly [number, number]>();
+  entries.forEach((entry, at) =>
+    entry.parts.forEach((part, position) => {
+      if (part._tag === "subagent") last.set(part.callId, [at, position]);
+    }),
+  );
+  if (last.size === 0) return [...entries];
+  const replaced = new Map<number, Map<number, SubagentState>>();
+  for (const [callId, [at, position]] of last) {
+    const state = now(callId);
+    if (state === undefined) continue;
+    const row = replaced.get(at) ?? new Map<number, SubagentState>();
+    row.set(position, state);
+    replaced.set(at, row);
+  }
+  return entries.map((entry, at) => {
+    const row = replaced.get(at);
+    return row === undefined
+      ? entry
+      : {
+          ...entry,
+          parts: entry.parts.map((part, position) => row.get(position) ?? part),
+        };
+  });
 };
 
 /** Which kind of block a streamed piece of text belongs to: a reply, or thinking. */
@@ -1582,6 +1660,39 @@ export class AgentHarness extends Context.Service<
     readonly interruptSession: (
       sessionId: string,
     ) => Effect.Effect<boolean | "background", HarnessFailure>;
+    /**
+     * Stops one running sub-agent the session's agent started, and nothing else (A7-S).
+     *
+     * `callId` is the calling tool call's (`SubagentState.callId`). Answers `stopped` when
+     * the harness took the stop, `not_running` when this process knows of no such sub-agent
+     * still running in the session, and `not_stoppable` when it runs inside the agent's turn
+     * and only the turn's Stop is offered for it (`SubagentView.stop` `with_turn`).
+     * Measured (A7-S Step 0):
+     *
+     * - **Claude Code**: `stopTask(<its task id>)` on a background sub-agent: its
+     *   `task_notification` (`stopped`) comes in ~5 ms, its tool call in flight is rejected,
+     *   and the CLI then opens a turn of its own to tell the agent.
+     * - **OpenCode**: `session.interrupt` of its child session: `interrupted: true` in
+     *   ~10 ms; a foreground call fails `Subagent cancelled (…)` and the parent's turn goes
+     *   on, a background one's `cancelled` notice wakes the parent.
+     */
+    readonly stopSubagent: (
+      sessionId: string,
+      callId: string,
+    ) => Effect.Effect<
+      "stopped" | "not_running" | "not_stoppable",
+      HarnessFailure
+    >;
+    /**
+     * Stops every running sub-agent of the session that {@link stopSubagent} could stop on
+     * its own, and answers their call ids (E7's Stop all, A7-S). The turn is not touched:
+     * Stop all asks this, then the session's own Stop. A harness whose turn Stop already
+     * stops them all answers `[]` with nothing done (Claude Code: `interrupt()` stops a
+     * background agent, measured in A6 F5).
+     */
+    readonly stopSubagents: (
+      sessionId: string,
+    ) => Effect.Effect<readonly string[], HarnessFailure>;
     /**
      * What a `queued` steer still waiting behind a turn does when that turn is interrupted,
      * as measured above: `runs` — the harness runs it at once, as a turn of its own (Claude

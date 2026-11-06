@@ -54,6 +54,7 @@ import {
   NARRATION_TRUNCATED_MARK,
   SESSION_NOT_FOUND_TAG,
   type HarnessNarration,
+  type SubagentState,
 } from "./agentHarness";
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import type { LiveInterrupt } from "./liveAgentSessions";
@@ -130,6 +131,8 @@ interface Script {
   readonly stored?: readonly string[];
   /** What `getSessionMessages` answers, oldest first as the SDK documents it. */
   readonly transcript?: readonly SessionMessage[];
+  /** Each sub-agent's own transcript, by its agent id (A7-S): what `getSubagentMessages` reads. */
+  readonly subagents?: Readonly<Record<string, readonly SessionMessage[]>>;
   /**
    * What `getSessionInfo` answers for a stored session, beyond its id. A function so a test
    * can make the read itself throw, as a busy or unreadable store does.
@@ -285,6 +288,9 @@ const scriptedSdk = (script: Script = {}) => {
             } satisfies SDKSessionInfo)
           : undefined,
       ),
+    subagentMessages: (_sessionId, agentId) =>
+      Promise.resolve(script.subagents?.[agentId] ?? []),
+    listSubagents: () => Promise.resolve(Object.keys(script.subagents ?? {})),
   };
   return { sdk, launched };
 };
@@ -2483,6 +2489,8 @@ const turnDrivenSdk = () => {
     },
     sessionMessages: () => Promise.resolve([...transcript]),
     sessionInfo: () => Promise.resolve(undefined),
+    subagentMessages: () => Promise.resolve([]),
+    listSubagents: () => Promise.resolve([]),
   };
 
   /**
@@ -3206,6 +3214,8 @@ describe("U6: a Send now that cuts a turn before it wrote anything", () => {
       },
       sessionMessages: liveClaudeCodeSdk.sessionMessages,
       sessionInfo: () => Promise.resolve(undefined),
+      subagentMessages: () => Promise.resolve([]),
+      listSubagents: () => Promise.resolve([]),
     };
     return sdk;
   };
@@ -3462,6 +3472,8 @@ describe("U6 review 3: a Stop after a Send now, and a carry only for a turn that
       },
       sessionMessages: liveClaudeCodeSdk.sessionMessages,
       sessionInfo: () => Promise.resolve(undefined),
+      subagentMessages: () => Promise.resolve([]),
+      listSubagents: () => Promise.resolve([]),
     };
     const pulled = (n: number): Promise<void> =>
       uuids.length >= n
@@ -5540,6 +5552,8 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
       },
       sessionMessages: () => Promise.resolve([]),
       sessionInfo: () => Promise.resolve(undefined),
+      subagentMessages: () => Promise.resolve([]),
+      listSubagents: () => Promise.resolve([]),
     };
     return { sdk, seen };
   };
@@ -5684,6 +5698,8 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
       },
       sessionMessages: () => Promise.resolve([]),
       sessionInfo: () => Promise.resolve(undefined),
+      subagentMessages: () => Promise.resolve([]),
+      listSubagents: () => Promise.resolve([]),
     };
     const failure = await Effect.runPromise(
       Effect.scoped(
@@ -7342,22 +7358,30 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
   const transcript = async () =>
     (await subagentFixture("messages.jsonl")) as SessionMessage[];
 
-  /** Each sub-agent state, as `<call> <status> <type> · <description>`. */
-  const states = (details: readonly { readonly _tag: string }[]) =>
-    details.flatMap((detail) =>
-      detail._tag === "subagent"
-        ? [
-            ((state: {
-              callId: string;
-              status: string;
-              agentType: string | undefined;
-              description: string;
-            }) =>
-              `${state.callId} ${state.status} ${String(state.agentType)} · ${state.description}`)(
-              detail as never,
-            ),
-          ]
-        : [],
+  /**
+   * Each sub-agent's states as `<call> <status> <type> · <description>`, one per change of
+   * status: since A7-S a running sub-agent is narrated again at each step it takes (its task
+   * id, its tool lines, its progress), which these lines leave out.
+   */
+  const states = (details: readonly { readonly _tag: string }[]) => {
+    const last = new Map<string, string>();
+    return details.flatMap((detail) => {
+      if (detail._tag !== "subagent") return [];
+      const state = detail as SubagentState;
+      const line = `${state.callId} ${state.status} ${String(state.agentType)} · ${state.description}`;
+      if (last.get(state.callId) === line) return [];
+      last.set(state.callId, line);
+      return [line];
+    });
+  };
+  /** Each sub-agent's newest state, by call id. */
+  const newest = (details: readonly { readonly _tag: string }[]) =>
+    new Map(
+      details.flatMap((detail) =>
+        detail._tag === "subagent"
+          ? [[(detail as SubagentState).callId, detail as SubagentState]]
+          : [],
+      ),
     );
 
   test("live: a sub-agent's own frames narrate nothing, and each call is one entry that runs, then finishes", async () => {
@@ -7384,13 +7408,30 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       `${BACKGROUND} running general-purpose · Say PING later`,
       `${BACKGROUND} finished general-purpose · Say PING later`,
     ]);
-    // Nothing a sub-agent said reaches narration: not its prompt, its thinking, `PONG` or
-    // `PING`, and not the hand-back report its call returned.
+    // Nothing a sub-agent said is a row of the caller's: not its prompt, its thinking,
+    // `PONG` or `PING`, and not the hand-back report its call returned.
     const words = JSON.stringify(
       details.filter((detail) => detail._tag !== "subagent"),
     );
     expect(words).not.toContain("Reply with exactly the word");
     expect(words).not.toContain("Subagent hand-back");
+    // Its card quotes what it returned, as it wrote it (A7-S, E7), and nothing of the
+    // hand-back's frame around it.
+    const ended = newest(details);
+    expect(ended.get(FOREGROUND)?.result).toBe("PONG");
+    expect(ended.get(BACKGROUND)?.result).toBe("PING");
+    expect(JSON.stringify([...ended.values()])).not.toContain(
+      "Subagent hand-back",
+    );
+    expect(ended.get(FOREGROUND)?.background).toBe(false);
+    expect(ended.get(BACKGROUND)?.background).toBe(true);
+    // It ended, so it says nothing is running and offers no Stop.
+    for (const state of ended.values()) {
+      expect(state.activity).toBeNull();
+      expect(state.stop).toBe("none");
+      expect(state.endedAt).not.toBeNull();
+      expect(state.startedAt).not.toBeNull();
+    }
     expect(
       details.flatMap((detail) =>
         detail._tag === "reply" || detail._tag === "thinking"
@@ -7415,10 +7456,12 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     ).toEqual([]);
     // The calling agent's model is the entry's, as on any call it made.
     expect(
-      details.flatMap((detail) =>
-        detail._tag === "subagent" ? [detail.model] : [],
+      new Set(
+        details.flatMap((detail) =>
+          detail._tag === "subagent" ? [detail.model] : [],
+        ),
       ),
-    ).toEqual(Array(4).fill("claude-haiku-4-5-20251001"));
+    ).toEqual(new Set(["claude-haiku-4-5-20251001"]));
   });
 
   test("live: a background sub-agent stays running past its turn's end, until its task's notification", async () => {
@@ -7448,14 +7491,28 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     });
     expect(ended).toBe(true);
     const turnEnd = live.map((entry) => entry.type).lastIndexOf("result");
-    const background = live.flatMap((entry, at) =>
-      entry.detail._tag === "subagent" && entry.detail.callId === BACKGROUND
-        ? [`${String(at > turnEnd)} ${entry.detail.status}`]
-        : [],
-    );
-    // Running when launched, nothing at the placeholder result, finished only after the
-    // turn's `result`, from the notification.
+    const background = [
+      ...new Set(
+        live.flatMap((entry, at) =>
+          entry.detail._tag === "subagent" && entry.detail.callId === BACKGROUND
+            ? [`${String(at > turnEnd)} ${entry.detail.status}`]
+            : [],
+        ),
+      ),
+    ];
+    // Running when launched (and again at its task's start and its placeholder, now with
+    // Stop), finished only after the turn's `result`, from the notification.
     expect(background).toEqual(["false running", "true finished"]);
+    // While it ran on past its turn, its card offered its own Stop (A7-S).
+    expect(
+      live.some(
+        (entry) =>
+          entry.detail._tag === "subagent" &&
+          entry.detail.callId === BACKGROUND &&
+          entry.detail.status === "running" &&
+          entry.detail.stop === "own",
+      ),
+    ).toBe(true);
     expect(live.at(-1)?.type).toBe("system");
   });
 
@@ -7483,7 +7540,7 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     }
   });
 
-  test("replay: the stored calls and the background one's notification are the same entries, and the notification's words are gone", async () => {
+  test("replay: the stored calls and the background one's notification are the same entries, and the notification's words are its card's", async () => {
     const entries = await withHarness(
       { transcript: await transcript() },
       (harness) => harness.messages(SESSION),
@@ -7494,6 +7551,11 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       `${BACKGROUND} running general-purpose · Say PING later`,
       `${BACKGROUND} finished general-purpose · Say PING later`,
     ]);
+    // The cards quote what each returned: the hand-back's report and the stored
+    // notification's `<result>` (A7-S).
+    const ended = newest(entries.flatMap((entry) => entry.parts));
+    expect(ended.get(FOREGROUND)?.result).toBe("PONG");
+    expect(ended.get(BACKGROUND)?.result).toBe("PING");
     const notice = entries.at(-1);
     expect(notice?.marker).toBe("task");
     expect(notice?.text).toBe("");
@@ -7534,14 +7596,33 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       users: "operator",
       fallbackAt: 0,
     }).items;
-    const shape = (item: LiveItem) =>
-      Object.fromEntries(
-        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
-      );
-    const agents = (items: readonly LiveItem[]) =>
-      items.filter((item) => item.kind === "subagent").map(shape);
+    /*
+     * What a reader keeps — the newest per call — is the same both ways, but for what only
+     * one side can know: the clock (live's is this process's, a replay's the transcript's),
+     * and whether this process holds the session to stop anything in (here it never does:
+     * both have ended).
+     */
+    const shape = (item: LiveItem) => ({
+      ...Object.fromEntries(
+        Object.entries(item).filter(
+          ([key]) => key !== "id" && key !== "at" && key !== "subagent",
+        ),
+      ),
+      subagent:
+        item.subagent === undefined
+          ? undefined
+          : { ...item.subagent, startedAt: 0, endedAt: 0 },
+    });
+    const agents = (items: readonly LiveItem[]) => [
+      ...new Map(
+        items
+          .filter((item) => item.kind === "subagent")
+          .map((item) => [item.callId, shape(item)] as const),
+      ).values(),
+    ];
     expect(agents(liveItems)).toEqual(agents(replayed));
-    expect(agents(liveItems)[0]).toEqual({
+    const first = liveItems.find((item) => item.kind === "subagent");
+    expect(first === undefined ? undefined : shape(first)).toEqual({
       _tag: "item",
       origin: "activity",
       sequence: null,
@@ -7559,6 +7640,24 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       callId: FOREGROUND,
       outcome: "running",
       model: "claude-haiku-4-5-20251001",
+      subagent: {
+        callId: FOREGROUND,
+        tool: "Agent",
+        agentType: "general-purpose",
+        description: "Say PONG",
+        task: expect.any(String),
+        background: false,
+        status: "running",
+        startedAt: 0,
+        endedAt: 0,
+        calls: null,
+        lines: [],
+        activity: null,
+        result: null,
+        failure: null,
+        // A foreground sub-agent is stopped with its turn (the operator's decision).
+        stop: "with_turn",
+      },
     });
     // And neither side draws the background notice as a `task` note.
     expect(replayed.some((item) => item.kind === "turn.other")).toBe(false);
@@ -7656,6 +7755,27 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       `${FOREGROUND} running general-purpose · Say PONG`,
       `${FOREGROUND} failed general-purpose · Say PONG`,
     ]);
+    // A failed card carries the reason and the CLI's own words (A7-S, E7).
+    expect(
+      newest(failed.flatMap((entry) => entry.parts)).get(FOREGROUND)?.failure,
+    ).toEqual({
+      reason: "The sub-agent call failed",
+      error: "Agent crashed: out of memory",
+    });
+    // A foreground sub-agent stopped on its own (`stopTask`, A7-S Step 0) is stopped too:
+    // its call's error is exactly the interrupt marker.
+    const alone = await withHarness(
+      {
+        transcript: rejectedForeground(
+          await transcript(),
+          "[Request interrupted by user for tool use]",
+        ),
+      },
+      (harness) => harness.messages(SESSION),
+    );
+    expect(
+      newest(alone.flatMap((entry) => entry.parts)).get(FOREGROUND)?.status,
+    ).toBe("stopped");
   });
 
   test("live: a foreground sub-agent's error after this session's own Stop is stopped, whatever it says", async () => {
@@ -8664,5 +8784,423 @@ describe("the question dock's Claude Code half: AskUserQuestion (A7-Q)", () => {
     expect(outcome.emptyPending).toEqual([]);
     expect(outcome.output).toEqual({});
     expect(outcome.pending).toEqual([]);
+  });
+});
+
+/* ── Sub-agent cards (A7-S) ──────────────────────────────────────────────────── */
+
+/**
+ * What a sub-agent's card carries on Claude Code, as A7-S Step 0 measured it (CLI 2.1.310,
+ * haiku): `task_started` names its task (and whether it runs in the background),
+ * `task_progress` comes at each of its tool calls with the CLI's phrase for it and its
+ * count, and its own frames are forwarded with `parent_tool_use_id` naming its call.
+ */
+describe("sub-agent cards: lines, activity, count and Stop (A7-S)", () => {
+  const ID = "77777777-0000-4000-8000-000000000001";
+  const FG = "toolu_fg_card";
+  const BG = "toolu_bg_card";
+  const frame = (record: Record<string, unknown>): SDKMessage =>
+    ({
+      session_id: ID,
+      uuid: crypto.randomUUID(),
+      ...record,
+    }) as unknown as SDKMessage;
+  const agentCall = (id: string, background: boolean, prompt: string) =>
+    frame({
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        role: "assistant",
+        model: "claude-haiku-4-5-20251001",
+        content: [
+          {
+            type: "tool_use",
+            id,
+            name: "Agent",
+            input: {
+              subagent_type: "general-purpose",
+              description: background ? "Sleep then read" : "Inspect notes",
+              run_in_background: background,
+              prompt,
+            },
+          },
+        ],
+      },
+    });
+  const taskStarted = (callId: string, taskId: string, background: boolean) =>
+    frame({
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: callId,
+      description: "x",
+      task_type: "local_agent",
+      is_backgrounded: background,
+    });
+  const progress = (
+    callId: string,
+    taskId: string,
+    said: string,
+    uses: number,
+  ) =>
+    frame({
+      type: "system",
+      subtype: "task_progress",
+      task_id: taskId,
+      tool_use_id: callId,
+      description: said,
+      usage: { total_tokens: 1, tool_uses: uses, duration_ms: 1 },
+      last_tool_name: "Bash",
+    });
+  const subCall = (callId: string, id: string, name: string, input: unknown) =>
+    frame({
+      type: "assistant",
+      parent_tool_use_id: callId,
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id, name, input }],
+      },
+    });
+  const subResult = (callId: string, id: string, text: string, error = false) =>
+    frame({
+      type: "user",
+      parent_tool_use_id: callId,
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: id,
+            content: text,
+            is_error: error,
+          },
+        ],
+      },
+    });
+
+  test("live: a running card's lines, activity and count come from the sub-agent's own frames and the CLI's progress", async () => {
+    const seen = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "conversation",
+          model: "claude-haiku-4-5",
+          directory: "/tmp/ws",
+          sessionId: ID,
+          multiTurn: true,
+        });
+        const narration = yield* Effect.forkChild(
+          Stream.runCollect(
+            harness
+              .sessionEvents(ID)
+              .pipe(
+                Stream.takeUntil(
+                  (entry) =>
+                    entry.detail._tag === "subagent" &&
+                    entry.detail.calls === 4,
+                ),
+              ),
+          ),
+        );
+        yield* harness.prompt(ID, "go");
+        yield* Effect.promise(() => driver.pulled(1));
+        driver.emit(agentCall(FG, false, "List the files.\nThen read one."));
+        driver.emit(taskStarted(FG, "a_fg", false));
+        driver.emit(progress(FG, "a_fg", "Running List files", 1));
+        driver.emit(
+          subCall(FG, "t1", "Bash", {
+            command: "ls",
+            description: "List files",
+          }),
+        );
+        driver.emit(subResult(FG, "t1", "notes.txt\nother.txt"));
+        driver.emit(subCall(FG, "t2", "Read", { file_path: "/w/notes.txt" }));
+        driver.emit(subResult(FG, "t2", "File does not exist.", true));
+        driver.emit(subCall(FG, "t3", "Bash", { command: "wc -l notes.txt" }));
+        driver.emit(progress(FG, "a_fg", "Running Count lines", 3));
+        driver.emit(subCall(FG, "t4", "Grep", { pattern: "beta" }));
+        return [...(yield* Fiber.join(narration))].flatMap((entry) =>
+          entry.detail._tag === "subagent" ? [entry.detail] : [],
+        );
+      }),
+    );
+    const last = seen.at(-1);
+    // Its last three tool calls, oldest first, each with its result's first line.
+    expect(last?.lines).toEqual([
+      {
+        tool: "Read",
+        input: "/w/notes.txt",
+        result: "File does not exist.",
+        failed: true,
+      },
+      { tool: "Bash", input: "wc -l notes.txt", result: null, failed: false },
+      { tool: "Grep", input: "beta", result: null, failed: false },
+    ]);
+    // The CLI's count, or ours once its frames run ahead of the CLI's progress.
+    expect(last?.calls).toBe(4);
+    expect(last?.activity).toBe("Running Count lines");
+    expect(last?.task).toBe("List the files.");
+    expect(last?.startedAt).not.toBeNull();
+    // A foreground one is stopped with its turn (the operator's decision, A7-S).
+    expect(last?.stop).toBe("with_turn");
+    // A progress frame that moves nothing is not said again.
+    const activities = seen.map((state) => state.activity);
+    expect(
+      activities.filter((each) => each === "Running List files").length,
+    ).toBeGreaterThan(0);
+  });
+
+  test("Stop: a background sub-agent is stopped by its task, a foreground one is not stoppable, an unknown one is not running", async () => {
+    const answers = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* harness.createSession({
+          title: "conversation",
+          model: "claude-haiku-4-5",
+          directory: "/tmp/ws",
+          sessionId: ID,
+          multiTurn: true,
+        });
+        const narration = yield* Effect.forkChild(
+          Stream.runCollect(
+            harness
+              .sessionEvents(ID)
+              .pipe(
+                Stream.takeUntil(
+                  (entry) =>
+                    entry.detail._tag === "subagent" &&
+                    entry.detail.callId === BG &&
+                    entry.detail.status === "stopped",
+                ),
+              ),
+          ),
+        );
+        yield* harness.prompt(ID, "go");
+        yield* Effect.promise(() => driver.pulled(1));
+        driver.emit(agentCall(FG, false, "Read it."));
+        driver.emit(taskStarted(FG, "a_fg", false));
+        driver.emit(agentCall(BG, true, "Sleep, then read."));
+        // Before its task is known it cannot be reached on its own.
+        yield* Effect.sleep("20 millis");
+        const early = yield* harness.stopSubagent(ID, BG);
+        driver.emit(taskStarted(BG, "a_bg", true));
+        yield* Effect.sleep("20 millis");
+        const fg = yield* harness.stopSubagent(ID, FG);
+        const bg = yield* harness.stopSubagent(ID, BG);
+        const unknown = yield* harness.stopSubagent(ID, "toolu_nobody");
+        const other = yield* harness.stopSubagent("not-a-session", BG);
+        // The CLI's answer to the stop, as measured.
+        driver.emit(
+          frame({
+            type: "system",
+            subtype: "task_notification",
+            task_id: "a_bg",
+            tool_use_id: BG,
+            status: "stopped",
+            output_file: "",
+            summary: "Sleep then read",
+          }),
+        );
+        const states = [...(yield* Fiber.join(narration))].flatMap((entry) =>
+          entry.detail._tag === "subagent" ? [entry.detail] : [],
+        );
+        // Stop all asks nothing of its own here: the turn's Stop reaches every one.
+        const all = yield* harness.stopSubagents(ID);
+        return {
+          early,
+          fg,
+          bg,
+          unknown,
+          other,
+          all,
+          stopped: [...driver.seen.stoppedTasks],
+          bgStops: states
+            .filter((state) => state.callId === BG)
+            .map((state) => `${state.status}:${state.stop}`),
+        };
+      }),
+    );
+    expect(answers).toEqual({
+      early: "not_running",
+      fg: "not_stoppable",
+      bg: "stopped",
+      unknown: "not_running",
+      other: "not_running",
+      all: [],
+      stopped: ["a_bg"],
+      bgStops: ["running:none", "running:own", "stopped:none"],
+    });
+  });
+
+  test("replay: a card's lines and count are read from the sub-agent's own transcript, by the agent id its result names", async () => {
+    const SESSION_ID = "00000000-0000-4000-8000-0000000000f9";
+    const FOREGROUND = "toolu_017TrDc21wUaAJ83MdQSfYyo";
+    const stored = (await subagentFixture(
+      "messages.jsonl",
+    )) as SessionMessage[];
+    const own = (
+      type: "assistant" | "user",
+      at: string,
+      content: unknown,
+    ): SessionMessage =>
+      ({
+        type,
+        uuid: crypto.randomUUID(),
+        session_id: SESSION_ID,
+        parent_tool_use_id: null,
+        timestamp: at,
+        message: { role: type, content },
+      }) as unknown as SessionMessage;
+    const entries = await withHarness(
+      {
+        transcript: stored,
+        subagents: {
+          ab8f05e651aeccea9: [
+            own(
+              "user",
+              "2026-11-04T10:00:00.000Z",
+              "Reply with exactly the word PONG.",
+            ),
+            own("assistant", "2026-11-04T10:00:01.000Z", [
+              {
+                type: "tool_use",
+                id: "s1",
+                name: "Bash",
+                input: { command: "echo PONG" },
+              },
+            ]),
+            own("user", "2026-11-04T10:00:02.000Z", [
+              { type: "tool_result", tool_use_id: "s1", content: "PONG\n" },
+            ]),
+            own("assistant", "2026-11-04T10:00:03.000Z", [
+              { type: "text", text: "PONG" },
+            ]),
+          ],
+        },
+      },
+      (harness) => harness.messages(SESSION_ID),
+    );
+    const states = entries
+      .flatMap((entry) => entry.parts)
+      .flatMap((part) =>
+        part._tag === "subagent" && part.callId === FOREGROUND ? [part] : [],
+      );
+    // Its earlier state is the transcript's; its last says what its own transcript adds.
+    expect(states.map((state) => state.status)).toEqual([
+      "running",
+      "finished",
+    ]);
+    expect(states.at(-1)).toMatchObject({
+      status: "finished",
+      result: "PONG",
+      // The hand-back's own count (0 in this run) is overtaken by the calls read.
+      calls: 1,
+      lines: [
+        { tool: "Bash", input: "echo PONG", result: "PONG", failed: false },
+      ],
+      stop: "none",
+    });
+  });
+
+  test("replay: a sub-agent whose result names no agent id is found by the prompt it was given", async () => {
+    const SESSION_ID = "00000000-0000-4000-8000-0000000000f9";
+    const FOREGROUND = "toolu_017TrDc21wUaAJ83MdQSfYyo";
+    // A Stop of the turn: the call's result is the CLI's rejection, with no agent id.
+    const stored = (
+      (await subagentFixture("messages.jsonl")) as SessionMessage[]
+    ).map((entry) => {
+      const content = (entry.message as { content?: unknown }).content;
+      const answers =
+        Array.isArray(content) &&
+        content.some(
+          (block) =>
+            (block as { tool_use_id?: unknown }).tool_use_id === FOREGROUND,
+        );
+      return answers
+        ? ({
+            ...entry,
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: FOREGROUND,
+                  content:
+                    "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+                  is_error: true,
+                },
+              ],
+            },
+          } as SessionMessage)
+        : entry;
+    });
+    const prompt =
+      stored.flatMap((entry) => {
+        const content = (entry.message as { content?: unknown }).content;
+        return Array.isArray(content)
+          ? content.flatMap((block) => {
+              const record = block as {
+                id?: unknown;
+                input?: { prompt?: unknown };
+              };
+              return record.id === FOREGROUND &&
+                typeof record.input?.prompt === "string"
+                ? [record.input.prompt]
+                : [];
+            })
+          : [];
+      })[0] ?? "";
+    const entries = await withHarness(
+      {
+        transcript: stored,
+        subagents: {
+          someoneelse: [
+            {
+              type: "user",
+              uuid: "u0",
+              session_id: SESSION_ID,
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Another prompt entirely." },
+            } as unknown as SessionMessage,
+          ],
+          aforeground: [
+            {
+              type: "user",
+              uuid: "u1",
+              session_id: SESSION_ID,
+              parent_tool_use_id: null,
+              message: { role: "user", content: prompt },
+            } as unknown as SessionMessage,
+            {
+              type: "assistant",
+              uuid: "u2",
+              session_id: SESSION_ID,
+              parent_tool_use_id: null,
+              message: {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "s9",
+                    name: "Bash",
+                    input: { command: "sleep 60" },
+                  },
+                ],
+              },
+            } as unknown as SessionMessage,
+          ],
+        },
+      },
+      (harness) => harness.messages(SESSION_ID),
+    );
+    const last = entries
+      .flatMap((entry) => entry.parts)
+      .findLast(
+        (part) => part._tag === "subagent" && part.callId === FOREGROUND,
+      ) as SubagentState | undefined;
+    expect(last?.status).toBe("stopped");
+    // Its call still open when it was stopped reads so, as it does live.
+    expect(last?.lines).toEqual([
+      { tool: "Bash", input: "sleep 60", result: "stopped", failed: true },
+    ]);
+    expect(last?.calls).toBe(1);
   });
 });

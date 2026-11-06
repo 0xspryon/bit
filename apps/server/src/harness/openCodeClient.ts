@@ -67,6 +67,12 @@ import {
   type QuestionField,
   type QuestionKind,
   type QuestionSettlement,
+  SUBAGENT_ERROR_MAX,
+  SUBAGENT_LINE_MAX,
+  SUBAGENT_LINES_KEPT,
+  SUBAGENT_RESULT_MAX,
+  type SubagentFailure,
+  type SubagentToolLine,
 } from "@bit/contracts";
 import { OpenCode } from "@opencode/client/effect";
 import type { Form } from "@opencode/schema/form";
@@ -102,8 +108,13 @@ import { installOpenCodeGate } from "../policy/install";
 import {
   AgentHarness,
   OPEN_PROMPT,
+  SUBAGENT_DESCRIPTION_MAX,
   TerminalOutcome,
+  capped,
+  firstLine,
+  newestSubagents,
   subagentDescription,
+  toolInputLine,
   truncateNarration,
   truncateReply,
   type BlockChannel,
@@ -679,6 +690,8 @@ export const openCodeNarration = (
   const sequence = record.durable?.seq;
   const data = record.data ?? {};
   const callId = typeof data["id"] === "string" ? data["id"] : undefined;
+  const eventAt =
+    typeof record.created === "number" ? record.created : Date.now();
   const step = data["assistantMessageID"];
   const stepModel = typeof step === "string" ? models.get(step) : undefined;
   const named = stepModel === undefined ? {} : { model: stepModel };
@@ -770,10 +783,11 @@ export const openCodeNarration = (
           names.get(callId),
           data["input"],
           stepModel,
+          eventAt,
         );
         if (subagent !== undefined) {
           subagents.calls.set(callId, subagent);
-          return openCodeSubagentState(callId, subagent, "running");
+          return openCodeSubagentState(callId, subagent);
         }
         return {
           _tag: "toolCall",
@@ -789,11 +803,16 @@ export const openCodeNarration = (
         names.delete(callId);
         const subagent = subagents.calls.get(callId);
         if (subagent !== undefined) {
-          return (
-            openCodeSubagentSettled(subagents, callId, subagent, {
+          return openCodeSubagentSettled(
+            subagents,
+            callId,
+            subagent,
+            {
               ok: true,
               metadata: data["metadata"],
-            }) ?? { _tag: "opaque" }
+              content: partsText(data["content"]),
+            },
+            eventAt,
           );
         }
         return {
@@ -811,11 +830,16 @@ export const openCodeNarration = (
         const error = (data["error"] ?? {}) as { message?: unknown };
         const subagent = subagents.calls.get(callId);
         if (subagent !== undefined) {
-          return (
-            openCodeSubagentSettled(subagents, callId, subagent, {
+          return openCodeSubagentSettled(
+            subagents,
+            callId,
+            subagent,
+            {
               ok: false,
               message: typeof error.message === "string" ? error.message : "",
-            }) ?? { _tag: "opaque" }
+              metadata: data["metadata"],
+            },
+            eventAt,
           );
         }
         const content = partsText(data["content"]);
@@ -878,10 +902,31 @@ export const openCodeNarration = (
                 : "withdrawn",
         };
       }
+      case "session.tool.progress": {
+        /*
+         * A running tool's metadata, replaced as it goes (A7-S). For a `subagent` call it is
+         * `{ sessionID, status: "running" }` the moment its child session exists (measured
+         * on 2.2.5), which is what lets the child's own events be read for its card and the
+         * child be interrupted on its own. Anything else stays `opaque`.
+         */
+        const subagent =
+          callId === undefined ? undefined : subagents.calls.get(callId);
+        const metadata = (data["metadata"] ?? {}) as { sessionID?: unknown };
+        return subagent !== undefined &&
+          callId !== undefined &&
+          adoptChild(subagents, callId, subagent, metadata.sessionID)
+          ? openCodeSubagentState(callId, subagent)
+          : { _tag: "opaque" };
+      }
       case "session.synthetic":
         // A background sub-agent's end; any other notice stays `opaque`, as it was.
         return (
-          openCodeSubagentNotice(subagents, data["metadata"]) ?? {
+          openCodeSubagentNotice(
+            subagents,
+            data["metadata"],
+            typeof data["text"] === "string" ? data["text"] : "",
+            eventAt,
+          ) ?? {
             _tag: "opaque",
           }
         );
@@ -1067,39 +1112,70 @@ const OPENCODE_SUBAGENT_TOOLS: ReadonlySet<string> = new Set([
   "task",
 ]);
 
-/** What one sub-agent call said about itself, kept for its later states. */
+/**
+ * One sub-agent call, as this stream or read has seen it so far (A6 U14; A7-S): what the
+ * call said about itself, its child session, and what the child's own events have said
+ * since. Mutable, and snapshotted as a {@link SubagentState} each time it changes.
+ */
 interface OpenCodeSubagentCall {
   readonly tool: string;
-  readonly agentType: string | undefined;
+  readonly agentType: string | null;
   readonly description: string;
+  readonly task: string;
   readonly model: string | undefined;
+  /** The call returned at once (`background: true`, or its result said `running`). */
+  background: boolean;
+  /** Its child session, from the parent's `session.tool.progress` or its result's metadata. */
+  child: string | undefined;
+  status: SubagentStatus;
+  startedAt: number | null;
+  endedAt: number | null;
+  /** The tool calls its child has made, counted from its events or messages. */
+  seen: number;
+  /** Its child's last {@link SUBAGENT_LINES_KEPT} tool calls, with their call ids. */
+  lines: { id: string; line: SubagentToolLine }[];
+  /** The child's tool names by call id, until the call settles (as `names` is for a session). */
+  readonly names: Map<string, string>;
+  /** Its child's newest thought's or sentence's first line, while it runs. */
+  activity: string | null;
+  /** Its child's newest reply: what it returns. */
+  lastText: string | null;
+  result: string | null;
+  failure: SubagentFailure | null;
 }
 
 /**
  * The sub-agents one stream or one read has seen (A6 U14): each call by its id, and each
- * background one's child session by its id, which is all OpenCode's completion notice
- * names. Created per stream and per read, like the tool-name map, and bounded by the
+ * child session by its id, which is all a child's events and OpenCode's completion notice
+ * name. Created per stream and per read, like the tool-name map, and bounded by the
  * sub-agent calls a session makes.
  */
 export interface OpenCodeSubagents {
   readonly calls: Map<string, OpenCodeSubagentCall>;
   readonly children: Map<string, string>;
+  /**
+   * For a read: whether this process holds the session, which is what says a running
+   * sub-agent can be stopped from here. A stream is always live.
+   */
+  readonly live?: boolean;
 }
 
-export const openCodeSubagents = (): OpenCodeSubagents => ({
+export const openCodeSubagents = (live?: boolean): OpenCodeSubagents => ({
   calls: new Map(),
   children: new Map(),
+  ...(live === undefined ? {} : { live }),
 });
 
 /**
  * A `subagent` call's input as the call it is (`tool/plugin/subagent.ts`: `agent`,
- * `description`, `prompt`; `subagent_type` from before 2.2), or `undefined` for any other
- * tool.
+ * `description`, `prompt`, `background`; `subagent_type` from before 2.2), or `undefined`
+ * for any other tool.
  */
 const openCodeSubagentCall = (
   tool: string | undefined,
   input: unknown,
   model: string | undefined,
+  at: number | null,
 ): OpenCodeSubagentCall | undefined => {
   if (tool === undefined || !OPENCODE_SUBAGENT_TOOLS.has(tool))
     return undefined;
@@ -1108,6 +1184,8 @@ const openCodeSubagentCall = (
     subagent_type?: unknown;
     description?: unknown;
     prompt?: unknown;
+    background?: unknown;
+    sessionID?: unknown;
   };
   const agent =
     typeof fields.agent === "string" && fields.agent.trim() !== ""
@@ -1118,72 +1196,178 @@ const openCodeSubagentCall = (
     agentType:
       typeof agent === "string" && agent.trim() !== ""
         ? subagentDescription(agent, undefined)
-        : undefined,
+        : null,
     description: subagentDescription(fields.description, fields.prompt),
+    task:
+      typeof fields.prompt === "string"
+        ? firstLine(fields.prompt, SUBAGENT_DESCRIPTION_MAX)
+        : "",
     model,
+    background: fields.background === true,
+    child: undefined,
+    status: "running",
+    startedAt: at,
+    endedAt: null,
+    seen: 0,
+    lines: [],
+    names: new Map(),
+    activity: null,
+    lastText: null,
+    result: null,
+    failure: null,
   };
 };
 
+/**
+ * The state of a sub-agent call as its card draws it. A running one whose child session is
+ * known can be stopped on its own (`session.interrupt` of the child, measured in A7-S Step 0
+ * for foreground and background alike), from a stream or a read of a session this process
+ * holds (`live`).
+ */
 const openCodeSubagentState = (
   callId: string,
   call: OpenCodeSubagentCall,
-  status: SubagentStatus,
+  live = true,
 ): SubagentState => ({
   _tag: "subagent",
   callId,
   tool: call.tool,
   agentType: call.agentType,
   description: call.description,
-  status,
+  task: call.task,
+  background: call.background,
+  status: call.status,
+  startedAt: call.startedAt,
+  endedAt: call.endedAt,
+  calls: call.seen > 0 || call.child !== undefined ? call.seen : null,
+  lines: call.lines.map((each) => each.line),
+  activity: call.status === "running" ? call.activity : null,
+  result: call.status === "finished" ? call.result : null,
+  failure: call.status === "failed" ? call.failure : null,
+  stop:
+    call.status === "running" && call.child !== undefined && live
+      ? "own"
+      : "none",
   ...(call.model === undefined ? {} : { model: call.model }),
 });
 
+/** Remembers a call's child session, under both maps. */
+const adoptChild = (
+  subagents: OpenCodeSubagents,
+  callId: string,
+  call: OpenCodeSubagentCall,
+  child: unknown,
+): boolean => {
+  if (typeof child !== "string" || call.child === child) return false;
+  call.child = child;
+  subagents.children.set(child, callId);
+  return true;
+};
+
+/** Ends a sub-agent: its status, when, and the activity it no longer has. */
+const endOpenCodeSubagent = (
+  call: OpenCodeSubagentCall,
+  status: SubagentStatus,
+  at: number | null,
+): void => {
+  call.status = status;
+  call.endedAt = at;
+  call.activity = null;
+  call.lines = call.lines.map((each) =>
+    each.line.result === null && status !== "finished"
+      ? { ...each, line: { ...each.line, result: "stopped", failed: true } }
+      : each,
+  );
+};
+
 /**
- * A settled `subagent` call as its state, from the tool's own result metadata
- * (`{ sessionID, status }`): `running` there is a **background** launch — the call returned
- * at once and the child session goes on — so nothing ends yet and the child is remembered
- * for the notice that will; anything else is `finished`. A failed call is `failed`, or
- * `stopped` when OpenCode says it was cancelled. The result's text — the sub-agent's own
- * reply — is never carried.
+ * What a sub-agent returned, out of the text OpenCode hands its parent: the `<subagent
+ * sessionID=… state=…>` wrapper (`tool/plugin/subagent.ts`, `subagent-completion.ts`) taken
+ * off, or the text as it stands.
+ */
+const subagentReturned = (text: string): string => {
+  const match = /^\s*<subagent\b[^>]*>\n?([\s\S]*?)\n?<\/subagent>\s*$/.exec(
+    text,
+  );
+  return (match?.[1] ?? text).trim();
+};
+
+/**
+ * A settled `subagent` call as its state, from the tool's own result (`{ sessionID, status }`
+ * metadata, content): `running` there is a **background** launch — the call returned at once
+ * and the child session goes on, so nothing ends yet and the child is remembered for what
+ * ends it; anything else is `finished`, quoting what it returned. A failed call is `failed`
+ * with the harness's error, or `stopped` when OpenCode says it was cancelled.
  */
 const openCodeSubagentSettled = (
   subagents: OpenCodeSubagents,
   callId: string,
   call: OpenCodeSubagentCall,
   settled:
-    | { readonly ok: true; readonly metadata: unknown }
-    | { readonly ok: false; readonly message: string },
-): SubagentState | undefined => {
-  if (!settled.ok) {
-    return openCodeSubagentState(
-      callId,
-      call,
-      settled.message.startsWith("Subagent cancelled") ? "stopped" : "failed",
-    );
-  }
+    | {
+        readonly ok: true;
+        readonly metadata: unknown;
+        readonly content: string;
+      }
+    | {
+        readonly ok: false;
+        readonly message: string;
+        readonly metadata: unknown;
+      },
+  at: number | null,
+  live = true,
+): SubagentState => {
   const metadata = (settled.metadata ?? {}) as {
     sessionID?: unknown;
     status?: unknown;
   };
-  if (metadata.status === "running") {
-    if (typeof metadata.sessionID === "string") {
-      subagents.children.set(metadata.sessionID, callId);
+  adoptChild(subagents, callId, call, metadata.sessionID);
+  if (!settled.ok) {
+    if (settled.message.startsWith("Subagent cancelled")) {
+      endOpenCodeSubagent(call, "stopped", at);
+    } else {
+      call.failure = {
+        reason: "The sub-agent call failed",
+        error: capped(
+          settled.message === "" ? "OpenCode gave no reason." : settled.message,
+          SUBAGENT_ERROR_MAX,
+        ),
+      };
+      endOpenCodeSubagent(call, "failed", at);
     }
-    return undefined;
+    return openCodeSubagentState(callId, call, live);
   }
-  return openCodeSubagentState(callId, call, "finished");
+  if (metadata.status === "running") {
+    call.background = true;
+    return openCodeSubagentState(callId, call, live);
+  }
+  const returned = subagentReturned(settled.content);
+  call.result = capped(
+    returned === "" ? (call.lastText ?? "") : returned,
+    SUBAGENT_RESULT_MAX,
+  );
+  endOpenCodeSubagent(call, "finished", at);
+  return openCodeSubagentState(callId, call, live);
 };
 
 /**
  * A background sub-agent's end, from the `synthetic` notice OpenCode adds to the parent
  * when its child session ends (`session/subagent-completion.ts`: metadata
- * `{ source: "subagent", childID, state }`, `state` `completed`, `error` or `cancelled`), or
- * `undefined` when the notice is not one, or names a child this stream or read did not see
- * launched.
+ * `{ source: "subagent", childID, state }`, `state` `completed`, `error` or `cancelled`, and
+ * the child's words in its text), or `undefined` when the notice is not one, or names a
+ * child this stream or read did not see launched.
+ *
+ * Read on a **replay**. Live, OpenCode 2.2.5 sends no `session.synthetic` for it (A7-S
+ * Step 0): the notice arrives inside `session.inbox.enqueued`, which this driver does not
+ * subscribe to, so the child's own `session.execution.*` is what ends it live
+ * ({@link openCodeChildNarration}).
  */
 const openCodeSubagentNotice = (
   subagents: OpenCodeSubagents,
   metadata: unknown,
+  text: string,
+  at: number | null,
+  live = true,
 ): SubagentState | undefined => {
   const fields = (metadata ?? {}) as {
     source?: unknown;
@@ -1204,9 +1388,241 @@ const openCodeSubagentNotice = (
         : fields.state === "cancelled"
           ? "stopped"
           : undefined;
-  return status === undefined
-    ? undefined
-    : openCodeSubagentState(callId, call, status);
+  if (status === undefined) return undefined;
+  const said = subagentReturned(text);
+  if (status === "finished") {
+    call.result = capped(call.lastText ?? said, SUBAGENT_RESULT_MAX);
+  } else if (status === "failed") {
+    call.failure = {
+      reason: "The sub-agent failed",
+      error: capped(said === "" ? "Subagent failed" : said, SUBAGENT_ERROR_MAX),
+    };
+  }
+  endOpenCodeSubagent(call, status, at);
+  return openCodeSubagentState(callId, call, live);
+};
+
+/**
+ * One event of a sub-agent's **child session**, read into its call (A7-S): a tool call adds
+ * a line, its success or failure closes it, a thought or a sentence is what it is doing now,
+ * and — for a background one, which no parent tool result ends — its execution's end is its
+ * end. Answers the new state when the card moved, else `undefined`, so an event that moves
+ * nothing takes no slot on the narration bus.
+ *
+ * Measured on 2.2.5 (A7-S Step 0): the child's `session.tool.*`, `session.text.ended`,
+ * `session.reasoning.ended` and `session.execution.{succeeded,failed,interrupted}` arrive on
+ * the same event stream as the parent's, under the child's `sessionID`.
+ */
+export const openCodeChildNarration = (
+  entry: unknown,
+  subagents: OpenCodeSubagents,
+): HarnessNarration | undefined => {
+  const record = (entry ?? {}) as {
+    type?: unknown;
+    created?: unknown;
+    data?: Record<string, unknown> | undefined;
+  };
+  const type = typeof record.type === "string" ? record.type : "unknown";
+  const data = record.data ?? {};
+  const child = data["sessionID"];
+  const callId =
+    typeof child === "string" ? subagents.children.get(child) : undefined;
+  const call = callId === undefined ? undefined : subagents.calls.get(callId);
+  if (call === undefined || callId === undefined || call.status !== "running") {
+    return undefined;
+  }
+  const at = typeof record.created === "number" ? record.created : Date.now();
+  const toolId = typeof data["id"] === "string" ? data["id"] : undefined;
+  const moved = ((): boolean => {
+    switch (type) {
+      case "session.tool.input.started":
+        if (toolId !== undefined && typeof data["name"] === "string") {
+          call.names.set(toolId, data["name"]);
+        }
+        return false;
+      case "session.tool.called": {
+        if (toolId === undefined) return false;
+        call.seen += 1;
+        call.lines = [
+          ...call.lines,
+          {
+            id: toolId,
+            line: {
+              tool: call.names.get(toolId) ?? "tool",
+              input: toolInputLine(data["input"], SUBAGENT_LINE_MAX),
+              result: null,
+              failed: false,
+            },
+          },
+        ].slice(-SUBAGENT_LINES_KEPT);
+        return true;
+      }
+      case "session.tool.success":
+      case "session.tool.failed": {
+        if (toolId === undefined) return false;
+        call.names.delete(toolId);
+        const failed = type === "session.tool.failed";
+        const error = (data["error"] ?? {}) as { message?: unknown };
+        const said = failed
+          ? typeof error.message === "string"
+            ? error.message
+            : "the tool failed"
+          : partsText(data["content"]);
+        const before = call.lines;
+        call.lines = call.lines.map((each) =>
+          each.id === toolId
+            ? {
+                ...each,
+                line: {
+                  ...each.line,
+                  result: firstLine(said, SUBAGENT_LINE_MAX),
+                  failed,
+                },
+              }
+            : each,
+        );
+        return call.lines.some((each, at) => each !== before[at]);
+      }
+      case "session.reasoning.ended":
+      case "session.text.ended": {
+        const text = data["text"];
+        if (typeof text !== "string" || text.trim() === "") return false;
+        if (type === "session.text.ended") call.lastText = text;
+        const activity = firstLine(text, SUBAGENT_LINE_MAX);
+        if (activity === call.activity) return false;
+        call.activity = activity;
+        return true;
+      }
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+      case "session.execution.interrupted": {
+        // A foreground call's end is its result on the parent, which comes next.
+        if (!call.background) return false;
+        if (type === "session.execution.succeeded") {
+          call.result = capped(call.lastText ?? "", SUBAGENT_RESULT_MAX);
+          endOpenCodeSubagent(call, "finished", at);
+        } else if (type === "session.execution.failed") {
+          const error = (data["error"] ?? {}) as { message?: unknown };
+          call.failure = {
+            reason: "The sub-agent failed",
+            error: capped(
+              typeof error.message === "string" && error.message !== ""
+                ? error.message
+                : "OpenCode gave no reason.",
+              SUBAGENT_ERROR_MAX,
+            ),
+          };
+          endOpenCodeSubagent(call, "failed", at);
+        } else {
+          endOpenCodeSubagent(call, "stopped", at);
+        }
+        return true;
+      }
+      default:
+        return false;
+    }
+  })();
+  return moved
+    ? {
+        type,
+        sequence: undefined,
+        at,
+        outcome: undefined,
+        detail: openCodeSubagentState(callId, call),
+      }
+    : undefined;
+};
+
+/**
+ * A child session's stored messages read into its call on a replay (A7-S): its tool calls
+ * counted and its last ones as lines, its newest reply, and when it started and last wrote.
+ */
+const readChildMessages = (
+  call: OpenCodeSubagentCall,
+  entries: readonly unknown[],
+): void => {
+  let seen = 0;
+  const lines: { id: string; line: SubagentToolLine }[] = [];
+  let lastText: string | null = null;
+  let first: number | null = null;
+  let last: number | null = null;
+  for (const entry of entries) {
+    const record = (entry ?? {}) as {
+      type?: unknown;
+      time?: { created?: unknown; completed?: unknown } | undefined;
+      content?: unknown;
+    };
+    const created = millisOf(record.time?.created);
+    const completed = millisOf(record.time?.completed);
+    if (created !== undefined) first ??= created;
+    if (completed !== undefined || created !== undefined) {
+      last = completed ?? created ?? last;
+    }
+    if (record.type !== "assistant" || !Array.isArray(record.content)) continue;
+    for (const part of record.content) {
+      const item = (part ?? {}) as {
+        type?: unknown;
+        id?: unknown;
+        name?: unknown;
+        text?: unknown;
+        state?: {
+          status?: unknown;
+          input?: unknown;
+          content?: unknown;
+          error?: { message?: unknown } | undefined;
+        };
+      };
+      if (
+        item.type === "text" &&
+        typeof item.text === "string" &&
+        item.text.trim() !== ""
+      ) {
+        lastText = item.text;
+      } else if (item.type === "tool" && typeof item.id === "string") {
+        seen += 1;
+        const state = item.state ?? {};
+        const failed = state.status === "error";
+        const result =
+          state.status === "completed"
+            ? firstLine(partsText(state.content), SUBAGENT_LINE_MAX)
+            : failed
+              ? firstLine(
+                  typeof state.error?.message === "string"
+                    ? state.error.message
+                    : "the tool failed",
+                  SUBAGENT_LINE_MAX,
+                )
+              : null;
+        lines.push({
+          id: item.id,
+          line: {
+            tool: typeof item.name === "string" ? item.name : "tool",
+            input: toolInputLine(state.input, SUBAGENT_LINE_MAX),
+            result,
+            failed,
+          },
+        });
+      }
+    }
+  }
+  call.seen = seen;
+  // A call still open when it ended reads as stopped, as `endSubagent` has it live.
+  call.lines = lines
+    .slice(-SUBAGENT_LINES_KEPT)
+    .map((each) =>
+      each.line.result === null &&
+      call.status !== "running" &&
+      call.status !== "finished"
+        ? { ...each, line: { ...each.line, result: "stopped", failed: true } }
+        : each,
+    );
+  if (lastText !== null) call.lastText = lastText;
+  if (call.startedAt === null) call.startedAt = first;
+  if (call.status !== "running" && call.endedAt === null) call.endedAt = last;
+  if (call.status === "finished" && (call.result ?? "") === "") {
+    call.result =
+      lastText === null ? null : capped(lastText, SUBAGENT_RESULT_MAX);
+  }
 };
 
 /** Whether a `synthetic` entry's metadata is a sub-agent's completion notice at all. */
@@ -1247,6 +1663,7 @@ const assistantContentParts = (
       text?: unknown;
       id?: unknown;
       name?: unknown;
+      time?: { created?: unknown; completed?: unknown } | undefined;
       state?: {
         status?: unknown;
         input?: unknown;
@@ -1281,25 +1698,58 @@ const assistantContentParts = (
     // A `streaming` call's input is still the JSON text being written; the others hold
     // the parsed object.
     // A sub-agent: its entry and its state, not its call and result (A6 U14).
-    const subagent = openCodeSubagentCall(tool, state.input, model);
+    const subagent = openCodeSubagentCall(
+      tool,
+      state.input,
+      model,
+      millisOf(record.time?.created) ?? null,
+    );
     if (subagent !== undefined) {
       subagents.calls.set(record.id, subagent);
-      const running = openCodeSubagentState(record.id, subagent, "running");
+      const live = subagents.live ?? false;
+      const running = openCodeSubagentState(record.id, subagent, live);
+      const ended = millisOf(record.time?.completed) ?? null;
       const settled =
         state.status === "completed"
-          ? openCodeSubagentSettled(subagents, record.id, subagent, {
-              ok: true,
-              metadata: state.metadata,
-            })
+          ? openCodeSubagentSettled(
+              subagents,
+              record.id,
+              subagent,
+              {
+                ok: true,
+                metadata: state.metadata,
+                content: partsText(state.content),
+              },
+              ended,
+              live,
+            )
           : state.status === "error"
-            ? openCodeSubagentSettled(subagents, record.id, subagent, {
-                ok: false,
-                message:
-                  typeof state.error?.message === "string"
-                    ? state.error.message
-                    : "",
-              })
-            : undefined;
+            ? openCodeSubagentSettled(
+                subagents,
+                record.id,
+                subagent,
+                {
+                  ok: false,
+                  message:
+                    typeof state.error?.message === "string"
+                      ? state.error.message
+                      : "",
+                  metadata: state.metadata,
+                },
+                ended,
+                live,
+              )
+            : (() => {
+                // Still running when stored: its child, if the progress named one.
+                adoptChild(
+                  subagents,
+                  record.id,
+                  subagent,
+                  (state.metadata as { sessionID?: unknown } | undefined)
+                    ?.sessionID,
+                );
+                return undefined;
+              })();
       return settled === undefined ? [running] : [running, settled];
     }
     const input =
@@ -1387,7 +1837,13 @@ const flatten = (
    * child this read did not see launched, for the same reason.
    */
   if (type === "synthetic" && isSubagentNotice(record.metadata)) {
-    const ended = openCodeSubagentNotice(subagents, record.metadata);
+    const ended = openCodeSubagentNotice(
+      subagents,
+      record.metadata,
+      typeof record.text === "string" ? record.text : "",
+      millisOf(record.time?.created) ?? null,
+      subagents.live ?? false,
+    );
     return {
       type,
       text: "",
@@ -2010,6 +2466,19 @@ export const openCodeHarness = (
       const contextLimits = new Map<string, SessionWindow>();
 
       /**
+       * Each watched session's sub-agents, as its event stream follows them (A7-S): what
+       * {@link stopSubagent} finds a sub-agent's child session in. Set when a stream is asked
+       * for, replaced by a later stream for the same session, and with a replay's read
+       * (`replayedSubagents`) as the fallback for a sub-agent started before the stream.
+       *
+       * V2(chat): never trimmed, like the other per-session maps here: one entry per session
+       * this process watched, each bounded by the sub-agent calls that session made.
+       */
+      const streamedSubagents = new Map<string, OpenCodeSubagents>();
+      /** The newest replay's read of each session's sub-agents, for the same use. */
+      const replayedSubagents = new Map<string, OpenCodeSubagents>();
+
+      /**
        * The latest {@link SessionRef} this process handed out for each session id.
        *
        * What `endSession` checks a ref against. A resume opens an id that may already have
@@ -2561,7 +3030,8 @@ export const openCodeHarness = (
       )(function* (sessionId, read) {
         const entries: MessageEntry[] = [];
         // One read's sub-agents, across its pages: a notice names its child, not its call.
-        const subagents = openCodeSubagents();
+        // Stoppable from here only for a session this process watches (A7-S).
+        const subagents = openCodeSubagents(streamedSubagents.has(sessionId));
         // One reader across the pages too: each folder's realpath is asked once.
         const readAttachments = attachmentReader({
           uploadsFolder: read?.uploadsFolder,
@@ -2577,12 +3047,16 @@ export const openCodeHarness = (
               ...(cursor === undefined ? { order: "asc" } : { cursor }),
             }),
           );
-          if (listed.data.length === 0) return entries;
+          if (listed.data.length === 0) {
+            return yield* withChildren(sessionId, entries, subagents);
+          }
           for (const entry of listed.data) {
             entries.push(flatten(entry, readAttachments, subagents));
           }
           const next = listed.cursor.next;
-          if (typeof next !== "string") return entries;
+          if (typeof next !== "string") {
+            return yield* withChildren(sessionId, entries, subagents);
+          }
           cursor = next;
         }
         return yield* new HarnessDecodeError({
@@ -2592,6 +3066,61 @@ export const openCodeHarness = (
           cause: undefined,
         });
       });
+
+      /**
+       * A replay's sub-agents filled in from their child sessions (A7-S): each child's
+       * messages read for its card's lines, count and words, and every state of a sub-agent
+       * drawn as what is known of it now — the session's stream's, for one still running
+       * when the page reloads. A child that cannot be read leaves its card as the parent's
+       * messages drew it.
+       */
+      const withChildren = (
+        sessionId: string,
+        entries: readonly MessageEntry[],
+        subagents: OpenCodeSubagents,
+      ): Effect.Effect<MessageEntry[]> =>
+        Effect.gen(function* () {
+          if (subagents.calls.size === 0) return [...entries];
+          replayedSubagents.set(sessionId, subagents);
+          const streamed = streamedSubagents.get(sessionId);
+          yield* Effect.forEach(
+            [...subagents.calls].filter(
+              ([callId, call]) =>
+                call.child !== undefined &&
+                streamed?.calls.get(callId)?.seen === undefined,
+            ),
+            ([, call]) =>
+              Effect.matchEffect(
+                bounded(
+                  "message.list",
+                  timeouts.control,
+                  api.message.list({
+                    sessionID: call.child as Session.ID,
+                    limit: MESSAGE_PAGE_SIZE,
+                    order: "asc",
+                  }),
+                ),
+                {
+                  onFailure: (failure) =>
+                    Effect.logWarning(
+                      "a sub-agent's child session could not be read; its card shows what the parent's messages hold",
+                      { sessionId, child: call.child, detail: failure.message },
+                    ),
+                  onSuccess: (listed) =>
+                    Effect.sync(() => readChildMessages(call, listed.data)),
+                },
+              ),
+            { concurrency: 4, discard: true },
+          );
+          const live = subagents.live ?? false;
+          return newestSubagents(entries, (callId) => {
+            const call =
+              streamed?.calls.get(callId) ?? subagents.calls.get(callId);
+            return call === undefined
+              ? undefined
+              : openCodeSubagentState(callId, call, live);
+          });
+        });
 
       /**
        * How full one session's window is (A6 U9). See `AgentHarness.contextUsage`.
@@ -2654,6 +3183,61 @@ export const openCodeHarness = (
           );
           return result.interrupted;
         });
+
+      /**
+       * Interrupts one sub-agent's child session (A7-S). Measured on 2.2.5 (Step 0):
+       * `interrupted: true` in ~10 ms; a foreground call then fails `Subagent cancelled
+       * (sessionID: …)` and the parent's turn goes on, a background one's `cancelled` notice
+       * wakes the parent. So the agent is told by the harness, as on Claude Code.
+       */
+      const stopSubagent: AgentHarness["Service"]["stopSubagent"] = Effect.fn(
+        "openCodeHarness.stopSubagent",
+      )(function* (sessionId, callId) {
+        const call =
+          streamedSubagents.get(sessionId)?.calls.get(callId) ??
+          replayedSubagents.get(sessionId)?.calls.get(callId);
+        if (
+          call === undefined ||
+          call.status !== "running" ||
+          call.child === undefined
+        ) {
+          return "not_running" as const;
+        }
+        const result = yield* bounded(
+          "session.interrupt",
+          timeouts.control,
+          api.session.interrupt({ sessionID: call.child as Session.ID }),
+        );
+        return result.interrupted
+          ? ("stopped" as const)
+          : ("not_running" as const);
+      });
+
+      /**
+       * Interrupts every running sub-agent's child session (E7's Stop all), before the
+       * parent's own Stop. The parent's interrupt reaches a foreground child too (the tool's
+       * `onInterrupt` interrupts it), but **not a background one**, which runs as an
+       * execution of its own; so each is asked here. A child that will not answer fails the
+       * whole: Stop all says so rather than claim everything stopped.
+       */
+      const stopSubagents: AgentHarness["Service"]["stopSubagents"] = Effect.fn(
+        "openCodeHarness.stopSubagents",
+      )(function* (sessionId) {
+        const known =
+          streamedSubagents.get(sessionId) ?? replayedSubagents.get(sessionId);
+        const running = [...(known?.calls ?? new Map())].filter(
+          ([, call]) => call.status === "running" && call.child !== undefined,
+        );
+        const stopped = yield* Effect.forEach(
+          running,
+          ([callId]) =>
+            Effect.map(stopSubagent(sessionId, callId), (answer) =>
+              answer === "stopped" ? [callId] : [],
+            ),
+          { concurrency: "unbounded" },
+        );
+        return stopped.flat();
+      });
 
       /**
        * The forms this process answered or dismissed, by id, so the event that follows
@@ -2919,8 +3503,13 @@ export const openCodeHarness = (
         const names = new Map<string, string>();
         /** Each open step's model, for the same stream. See {@link openCodeNarration}. */
         const models = new Map<string, string>();
-        /** The sub-agents this stream saw started. See {@link openCodeNarration}. */
+        /**
+         * The sub-agents this stream saw started. See {@link openCodeNarration}. Also what
+         * {@link stopSubagent} finds a sub-agent's child session in, and what says which
+         * other sessions' events are this one's children's ({@link openCodeChildNarration}).
+         */
         const subagents = openCodeSubagents();
+        streamedSubagents.set(sessionId, subagents);
         /**
          * The question ids this stream has narrated as waiting and not yet as settled: what
          * a re-list after a break is compared with (A7-Q review 2).
@@ -3004,26 +3593,37 @@ export const openCodeHarness = (
                   ),
           ),
           Stream.filterMap(
-            Filter.make((item: Resubscribed) =>
-              item._tag === "connection"
-                ? Result.succeed(connectionNarration(item, Date.now()))
-                : sessionOf(item.event) === sessionId
-                  ? Result.succeed(
-                      // Read per event rather than once per stream: `switchModel` can
-                      // move a live session onto a model with another window, and a
-                      // stream opened before the switch would otherwise draw every later
-                      // call against the old model's limit. One map lookup per event.
-                      openCodeNarration(
-                        item.event,
-                        names,
-                        contextLimits.get(sessionId),
-                        models,
-                        subagents,
-                        settledHere,
-                      ),
-                    )
-                  : Result.fail(item),
-            ),
+            Filter.make((item: Resubscribed) => {
+              if (item._tag === "connection") {
+                return Result.succeed(connectionNarration(item, Date.now()));
+              }
+              const of = sessionOf(item.event);
+              if (of !== sessionId) {
+                // A child session of a sub-agent this stream saw started (A7-S): read into
+                // its card, and nothing else of it narrated.
+                const child =
+                  of !== undefined && subagents.children.has(of)
+                    ? openCodeChildNarration(item.event, subagents)
+                    : undefined;
+                return child === undefined
+                  ? Result.fail(item)
+                  : Result.succeed(child);
+              }
+              return Result.succeed(
+                // Read per event rather than once per stream: `switchModel` can
+                // move a live session onto a model with another window, and a
+                // stream opened before the switch would otherwise draw every later
+                // call against the old model's limit. One map lookup per event.
+                openCodeNarration(
+                  item.event,
+                  names,
+                  contextLimits.get(sessionId),
+                  models,
+                  subagents,
+                  settledHere,
+                ),
+              );
+            }),
           ),
           // A connection's first event (`server.connected`) is not a session's, so it was
           // filtered out above; a `restored` or the stream's first entry stands for it.
@@ -3070,6 +3670,8 @@ export const openCodeHarness = (
         sessionTitle,
         messages,
         interruptSession,
+        stopSubagent,
+        stopSubagents,
         queuedOnInterrupt: "held",
         holding,
         pendingQuestions,
