@@ -214,6 +214,11 @@ describe("the five answers, each with its own sentence", () => {
     expect(view.source).toBe("forgotten");
     expect(view.note).toContain("could not be asked");
     expect(view.note).toContain("about reaching the harness");
+    // And why the dock it may have shown is gone (A7-Q review 1).
+    expect(view.question).toBeNull();
+    expect(view.note).toContain(
+      "Nor could it be asked whether the importer is waiting on a question, so none is offered here",
+    );
     /*
      * **The prose being unavailable does not make the conversation dead.** This is the
      * reason `source` and `continuation` are two fields: a read that timed out says nothing

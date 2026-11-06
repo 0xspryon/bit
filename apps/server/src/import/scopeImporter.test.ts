@@ -4689,6 +4689,97 @@ describe("a question the importer's agent waits on (A7-Q)", () => {
     await runtime.dispose();
   });
 
+  test("a row naming another target is not this target's question, though its store holds it", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    // A second target whose file holds a row for this import, naming the first target: only
+    // the row's own `targetId` tells the two apart, since the session is held by import id.
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const fleet = yield* FleetStore;
+        const stores = yield* TargetStores;
+        yield* fleet.register({
+          targetId: "other-corp",
+          name: "Other Corp",
+          scopeNote: "",
+          workspacePath: join(base, "other-work"),
+        });
+        yield* fleet.migrateTarget("other-corp");
+        yield* withTargetStore(stores, "other-corp", (store) =>
+          store.recordImportSession({
+            importId,
+            targetId: TARGET,
+            harnessSessionId: "ses_import",
+            harnessInstanceId: null,
+            model: "m",
+            agentId: "importer",
+          }),
+        );
+      }).pipe(Effect.orDie),
+    );
+    const asOther = (answers?: Record<string, readonly string[]>) =>
+      runtime.runPromise(
+        Effect.result(
+          Effect.flatMap(ScopeImporter, (importer) =>
+            answers === undefined
+              ? importer.dismissQuestion({
+                  targetId: "other-corp",
+                  importId,
+                  questionId: "toolu_q1",
+                })
+              : importer.answerQuestion({
+                  targetId: "other-corp",
+                  importId,
+                  questionId: "toolu_q1",
+                  answers,
+                }),
+          ),
+        ),
+      );
+    expect(await asOther({ "Which hosts?": ["api"] })).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "ScopeImportNotFound", reason: "unknown_import" },
+    });
+    expect(await asOther()).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "ScopeImportNotFound", reason: "unknown_import" },
+    });
+    expect(built.script.questions.calls).toEqual([]);
+    await runtime.dispose();
+  });
+
+  test("a harness that does not answer is said in a dismissal's own words, not an answer's", async () => {
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    built.script.questions.fail = new HarnessTransportError({
+      operation: "form.cancel",
+      status: undefined,
+      tag: "TimeoutError",
+      detail: "connection refused",
+      cause: undefined,
+    });
+    const dismissed = await questionCall(runtime, importId, "toolu_q1");
+    expect(dismissed).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionRefused", reason: "harness_unreachable" },
+    });
+    const detail =
+      dismissed._tag === "Failure" && "detail" in dismissed.failure
+        ? dismissed.failure.detail
+        : "";
+    expect(detail).toContain("whether the agent was told you declined");
+    expect(detail).not.toContain("answers are kept");
+    const answered = await questionCall(runtime, importId, "toolu_q1", {
+      "Which hosts?": ["api"],
+    });
+    const answerDetail =
+      answered._tag === "Failure" && "detail" in answered.failure
+        ? answered.failure.detail
+        : "";
+    expect(answerDetail).toContain("Your answers are kept");
+    await runtime.dispose();
+  });
+
   test("a replay offers what the harness is waiting on as live, and nothing once it is answered", async () => {
     const { built, runtime, importId } = await liveOne();
     built.script.questions.ask("ses_import", QUESTION);

@@ -307,6 +307,17 @@ describe("a narrated question on the live stream and the sessions list", () => {
     expect(store.waiting(subject)).toBeUndefined();
     record({ _tag: "question", question });
     expect(store.waiting(subject)?.questionId).toBe("toolu_9");
+    // A break alone keeps it: the stream may be back in a moment.
+    record({ _tag: "connection", state: "reconnecting", reason: "socket" });
+    expect(store.waiting(subject)?.questionId).toBe("toolu_9");
+    // Lost: the harness cannot be answered through, so it no longer counts in Needs you
+    // (an OpenCode process killed for good never says `restored`)…
+    record({ _tag: "connection", state: "lost", reason: "socket" });
+    expect(store.waiting(subject)).toBeUndefined();
+    // …and if it does come back, the driver's re-listing brings a still-real one back.
+    record({ _tag: "connection", state: "restored", reason: "" });
+    record({ _tag: "question", question });
+    expect(store.waiting(subject)?.questionId).toBe("toolu_9");
     // A question is not the agent at work: it does not start a turn on the summary.
     expect(store.get(subject)?.running).toBe(false);
   });

@@ -593,7 +593,11 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       note:
         (deleted
           ? `${displayName} no longer holds session ${sessionId}. Harnesses keep their own transcripts for a while and then delete them, so this is the normal answer for a session left for a while. What it wrote is not affected: its entries are on the Scope tab and its assets in the Estate.`
-          : `${displayName} could not be asked about session ${sessionId} — ${failure.message} This is about reaching the harness, not about the conversation.`) +
+          : // A7-Q review 1: nor can it be asked what its agent waits on, and a question
+            // offered from what this process last heard would be answered into a harness
+            // that is not there (an OpenCode killed for good is not restarted). So none is
+            // offered, and the note says why rather than leaving the dock silently gone.
+            `${displayName} could not be asked about session ${sessionId} — ${failure.message} This is about reaching the harness, not about the conversation. Nor could it be asked whether the importer is waiting on a question, so none is offered here; one still waiting is offered again once the harness answers.`) +
         standingNote,
     });
   }

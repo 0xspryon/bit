@@ -37,7 +37,7 @@ import {
   type SessionTitle,
 } from "./agentHarness";
 import type { MessageAttachment } from "./attachments";
-import { QuestionNotPending } from "./errors";
+import { type HarnessTransportError, QuestionNotPending } from "./errors";
 import {
   DriverKind,
   defaultInstanceIdForDriver,
@@ -201,6 +201,8 @@ export type ScriptedQuestionCall =
 export const scriptedQuestions = (): {
   readonly ask: (sessionId: string, question: HarnessQuestion) => void;
   readonly calls: readonly ScriptedQuestionCall[];
+  /** When set, an answer and a dismissal fail with it, as an unreachable harness does. */
+  fail: HarnessTransportError | undefined;
   readonly members: Pick<
     StubHarness,
     "pendingQuestions" | "answerQuestion" | "dismissQuestion"
@@ -222,28 +224,39 @@ export const scriptedQuestions = (): {
     );
     return Effect.void;
   };
-  return {
+  const scripted: ReturnType<typeof scriptedQuestions> = {
     ask: (sessionId, question) => {
       pending.set(sessionId, [...(pending.get(sessionId) ?? []), question]);
     },
     calls,
+    fail: undefined,
     members: {
       pendingQuestions: (sessionId) =>
         Effect.sync(() => [...(pending.get(sessionId) ?? [])]),
       answerQuestion: (sessionId, questionId, answers) =>
-        Effect.tap(take(sessionId, questionId), () =>
-          Effect.sync(() => {
-            calls.push({ _tag: "answered", sessionId, questionId, answers });
-          }),
-        ),
+        scripted.fail !== undefined
+          ? Effect.fail(scripted.fail)
+          : Effect.tap(take(sessionId, questionId), () =>
+              Effect.sync(() => {
+                calls.push({
+                  _tag: "answered",
+                  sessionId,
+                  questionId,
+                  answers,
+                });
+              }),
+            ),
       dismissQuestion: (sessionId, questionId) =>
-        Effect.tap(take(sessionId, questionId), () =>
-          Effect.sync(() => {
-            calls.push({ _tag: "dismissed", sessionId, questionId });
-          }),
-        ),
+        scripted.fail !== undefined
+          ? Effect.fail(scripted.fail)
+          : Effect.tap(take(sessionId, questionId), () =>
+              Effect.sync(() => {
+                calls.push({ _tag: "dismissed", sessionId, questionId });
+              }),
+            ),
     },
   };
+  return scripted;
 };
 
 /**

@@ -2680,11 +2680,14 @@ export class ScopeImporter extends Context.Service<
        * row read against the target, then followed to the newest run and any successor, as
        * a Stop is. `undefined` for the session when this process holds none.
        */
-      const questionSession = Effect.fnUntraced(function* (input: {
-        readonly targetId: string;
-        readonly importId: string;
-        readonly questionId: string;
-      }) {
+      const questionSession = Effect.fnUntraced(function* (
+        input: {
+          readonly targetId: string;
+          readonly importId: string;
+          readonly questionId: string;
+        },
+        how: "answer" | "dismiss",
+      ) {
         const row = yield* withTargetStore(stores, input.targetId, (store) =>
           store.importSession(input.importId),
         ).pipe(
@@ -2693,7 +2696,7 @@ export class ScopeImporter extends Context.Service<
               new QuestionRefused({
                 questionId: input.questionId,
                 reason: "harness_unreachable",
-                detail: `import ${input.importId}'s record could not be read (${failure.message}), so the question was not answered.`,
+                detail: `import ${input.importId}'s record could not be read (${failure.message}), so the question was not ${how === "answer" ? "answered" : "dismissed"}.`,
               }),
           ),
         );
@@ -2723,7 +2726,7 @@ export class ScopeImporter extends Context.Service<
 
       /** A harness's refusal of an answer or dismissal, as the route's. */
       const questionRefusal =
-        (questionId: string) =>
+        (questionId: string, how: "answer" | "dismiss") =>
         (failure: HarnessFailure | QuestionNotPending): QuestionRefused =>
           failure._tag === "QuestionNotPending"
             ? failure.reason === "settled"
@@ -2736,18 +2739,21 @@ export class ScopeImporter extends Context.Service<
             : new QuestionRefused({
                 questionId,
                 reason: "harness_unreachable",
-                detail: `the harness did not answer (${failure.message}), so whether it took this is not known. Your answers are kept; try again.`,
+                detail:
+                  how === "answer"
+                    ? `the harness did not answer (${failure.message}), so whether it took this is not known. Your answers are kept; try again.`
+                    : `the harness did not answer (${failure.message}), so whether the agent was told you declined is not known.`,
               });
 
       const answerQuestion: ScopeImporter["Service"]["answerQuestion"] =
         Effect.fn("ScopeImporter.answerQuestion")(function* (input) {
-          const { held } = yield* questionSession(input);
+          const { held } = yield* questionSession(input, "answer");
           if (held === undefined) {
             return yield* notWaiting(input.questionId);
           }
           const asked = yield* held.harness
             .pendingQuestions(held.sessionId)
-            .pipe(Effect.mapError(questionRefusal(input.questionId)));
+            .pipe(Effect.mapError(questionRefusal(input.questionId, "answer")));
           const question = asked.find(
             (candidate) => candidate.questionId === input.questionId,
           );
@@ -2767,13 +2773,16 @@ export class ScopeImporter extends Context.Service<
           }
           yield* held.harness
             .answerQuestion(held.sessionId, input.questionId, input.answers)
-            .pipe(Effect.mapError(questionRefusal(input.questionId)));
+            .pipe(Effect.mapError(questionRefusal(input.questionId, "answer")));
           return { questionId: input.questionId, settled: "answered" as const };
         });
 
       const dismissQuestion: ScopeImporter["Service"]["dismissQuestion"] =
         Effect.fn("ScopeImporter.dismissQuestion")(function* (input) {
-          const { harnessSessionId, held } = yield* questionSession(input);
+          const { harnessSessionId, held } = yield* questionSession(
+            input,
+            "dismiss",
+          );
           // Read back from a transcript: nothing native to cancel, so it is put away.
           if (input.questionId.startsWith(transcriptQuestionId(""))) {
             const set = putAway.get(harnessSessionId) ?? new Set<string>();
@@ -2789,7 +2798,9 @@ export class ScopeImporter extends Context.Service<
           }
           yield* held.harness
             .dismissQuestion(held.sessionId, input.questionId)
-            .pipe(Effect.mapError(questionRefusal(input.questionId)));
+            .pipe(
+              Effect.mapError(questionRefusal(input.questionId, "dismiss")),
+            );
           return {
             questionId: input.questionId,
             settled: "dismissed" as const,
