@@ -3717,7 +3717,7 @@ export const openCodeHarness = (
        */
       const emptyAndInterrupt = (
         sessionID: Session.ID,
-        listed: readonly { readonly id: string }[] | undefined,
+        listed: readonly { readonly id: SessionMessage.ID }[] | undefined,
       ) =>
         Effect.gen(function* () {
           const waiting =
