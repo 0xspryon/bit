@@ -40,10 +40,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import {
-  BIT_ENVIRONMENT,
-  agentEnvironment,
-} from "./harness/agentEnvironment";
+import { BIT_ENVIRONMENT, agentEnvironment } from "./harness/agentEnvironment";
 import { HARNESS_ENVIRONMENT_ALLOWLIST } from "./harness/openCodeServer";
 
 /** `apps/server/src` → the repository root. */
