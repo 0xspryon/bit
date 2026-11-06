@@ -1434,11 +1434,11 @@ export const buildConversationChat = (
                   : latest
                     ? {
                         _tag: "pending",
-                        note: "Sent. The importer has not answered yet.",
+                        note: `Sent. The ${input.agent} has not answered yet.`,
                       }
                     : {
                         _tag: "none",
-                        note: "The importer wrote nothing in reply to this message.",
+                        note: `The ${input.agent} wrote nothing in reply to this message.`,
                       },
       rows: rowsFor(items, working, placed.pairing),
     });

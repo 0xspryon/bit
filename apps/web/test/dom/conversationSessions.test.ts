@@ -405,6 +405,30 @@ describe("the generic chat state through a goal-shaped owner", () => {
     );
   });
 
+  test("a turn's notes name the owner's agent, not the importer", async () => {
+    const probe = world();
+    probe.state.begin([], probe.server);
+    probe.state.draft = "Start on the login flow";
+    probe.state.send();
+    await settle();
+    probe.answerNext({
+      periodId: "gper_1",
+      sessionId: "ses_1",
+      conversation: "continued",
+      messageId: "msg_2",
+    });
+    probe.state.draft = "And the admin pages";
+    probe.state.send();
+    await settle();
+    const notes = probe.state.groups.map((group) =>
+      "note" in group.prose ? group.prose.note : "",
+    );
+    expect(notes).toEqual([
+      "The goal agent wrote nothing in reply to this message.",
+      "Sent. The goal agent has not answered yet.",
+    ]);
+  });
+
   test("a message that resumed a let-go period forgets both periods' lost notices", async () => {
     const probe = world();
     probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
