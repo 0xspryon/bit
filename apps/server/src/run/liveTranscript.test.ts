@@ -47,6 +47,7 @@ import {
 } from "effect";
 
 import {
+  ENDED_STOP_NOTE,
   liveTranscript,
   projectDecision,
   projectEvent,
@@ -2458,6 +2459,44 @@ describe("projecting a replay", () => {
     body !== undefined &&
     body.length === NARRATION_FIELD_MAX + NARRATION_TRUNCATED_MARK.length &&
     body.endsWith(NARRATION_TRUNCATED_MARK);
+
+  test("A7-S review 2: a stop the harness recorded in the last turn of a session the operator ended is that end's: said neutrally, once; an earlier turn's, or any when the operator did not end it, is the harness's error", () => {
+    const entries = [
+      entry({ text: "first" }),
+      entry({ type: "assistant", error: "Step interrupted", aborted: true }),
+      entry({ text: "second" }),
+      entry({ type: "assistant", text: "", parts: [] }),
+      entry({ type: "assistant", error: "Step interrupted", aborted: true }),
+      entry({ type: "idle", error: "Step interrupted", aborted: true }),
+      // A real failure in the same turn is still the harness's.
+      entry({ type: "assistant", error: "429 from the provider" }),
+    ];
+    const lines = (endedByOperator: boolean) =>
+      projectReplay({
+        entries,
+        subject: { _tag: "import", importId: "imp_1" },
+        harnessSessionId: "ses_1",
+        users: "operator",
+        fallbackAt: 0,
+        endedByOperator,
+      }).items.map((item) =>
+        [item.kind, item.headline, item.body, item.outcome].join(" | "),
+      );
+    expect(lines(true)).toEqual([
+      "turn.operator | You | first | ",
+      "turn.other | error | Step interrupted | failed",
+      "turn.operator | You | second | ",
+      `turn.other | interrupted | ${ENDED_STOP_NOTE} | `,
+      "turn.other | error | 429 from the provider | failed",
+    ]);
+    expect(lines(false)).toEqual([
+      "turn.operator | You | first | ",
+      "turn.other | error | Step interrupted | failed",
+      "turn.operator | You | second | ",
+      "turn.other | error | Step interrupted | failed",
+      "turn.other | error | 429 from the provider | failed",
+    ]);
+  });
 
   test("every body a stored entry supplies is capped as a live part's is, and says so", () => {
     const items = replay([

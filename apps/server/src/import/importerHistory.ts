@@ -649,6 +649,7 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
     harnessSessionId: sessionId,
     users: "operator",
     fallbackAt: at,
+    endedByOperator: ended,
   });
   if (items.length === 0) {
     return standing(

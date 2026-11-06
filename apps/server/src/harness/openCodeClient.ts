@@ -2002,6 +2002,9 @@ const flatten = (
       typeof record.error?.message === "string"
         ? record.error.message
         : undefined,
+    ...((record.error as { type?: unknown } | undefined)?.type === "aborted"
+      ? { aborted: true as const }
+      : {}),
     parts:
       type === "assistant"
         ? assistantContentParts(
@@ -3610,10 +3613,11 @@ export const openCodeHarness = (
        *
        * V2(chat): the notice cannot be held back, so it wakes the parent for a turn the
        * parent's interrupt then stops. Measured live (A7-S fix round 1, 2.2.5, GLM 5.3
-       * Flash): aborted 20 ms after it began, with no output, but stored, so the ended
-       * chat's replay closes on "The harness stopped this turn with an error: Step
-       * interrupted". V2 could read an aborted turn after the operator's end as part of the
-       * end, or ask OpenCode for a way to cancel a background job without notifying.
+       * Flash): aborted 20 ms after it began, with no output, but stored as an aborted
+       * step. The importer's replay reads that step, in the last turn of an import the
+       * operator ended, as the end's stop (`projectReplay`'s `endedByOperator`, A7-S review
+       * 2), not as the harness's error; the turn itself is still in OpenCode's store. V2
+       * could ask OpenCode for a way to cancel a background job without notifying.
        */
       const endSession: AgentHarness["Service"]["endSession"] = Effect.fn(
         "openCodeHarness.endSession",

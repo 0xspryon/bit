@@ -3375,6 +3375,30 @@ describe("a session's stored messages, as the live stream's parts (A6 F10)", () 
     );
   };
 
+  test("A7-S review 2: a step OpenCode stored as aborted says so, beside its sentence; a failed one does not", async () => {
+    const entries = await read((stored) =>
+      stored.map((each, at) =>
+        at === 3
+          ? {
+              ...(each as object),
+              error: { type: "aborted", message: "Step interrupted" },
+            }
+          : at === 7
+            ? {
+                ...(each as object),
+                error: { type: "provider", message: "429 from the provider" },
+              }
+            : each,
+      ),
+    );
+    expect(entries[3]).toMatchObject({
+      error: "Step interrupted",
+      aborted: true,
+    });
+    expect(entries[7]?.error).toBe("429 from the provider");
+    expect(entries[7]?.aborted).toBeUndefined();
+  });
+
   test("an assistant message's content becomes the parts the stream narrates, with its model and time", async () => {
     const entries = await read();
     expect(

@@ -394,6 +394,13 @@ export interface MessageEntry {
   readonly text: string;
   readonly error: string | undefined;
   /**
+   * {@link error} is the harness saying the entry was **cut off by a stop**, not that
+   * anything failed (A7-S review 2): OpenCode stores an interrupted step as
+   * `error: {type: "aborted", message: "Step interrupted"}`. Absent on every other entry.
+   * What lets a replay read the stop that ending a session made as part of that end.
+   */
+  readonly aborted?: true;
+  /**
    * The entry's blocks, in order, as the live stream narrates them (A6 F10). Empty for a
    * `user` entry that is only words — those are {@link text} — and for an entry with no
    * blocks a renderer could show.

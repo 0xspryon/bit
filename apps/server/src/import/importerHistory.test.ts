@@ -423,6 +423,42 @@ describe("an import the operator ended", () => {
     expect(view.continuation).toBe("refused");
   });
 
+  test("A7-S review 2: its last turn's stop, which the end made, reads as the end's and not as a harness error; a server's end leaves it the harness's", async () => {
+    const messages = [
+      entry({ type: "user", text: "start two background sub-agents" }),
+      entry({
+        type: "assistant",
+        text: "",
+        error: "Step interrupted",
+        aborted: true,
+      }),
+    ];
+    const ended = await read({
+      recorded: recorded({ endedReason: "operator" }),
+      messages,
+    });
+    expect(ended.items.map((item) => `${item.headline}: ${item.body}`)).toEqual(
+      [
+        "You: start two background sub-agents",
+        "interrupted: Stopped when you ended this session.",
+      ],
+    );
+    expect(ended.items.some((item) => item.outcome === "failed")).toBe(false);
+    const shutdown = await read({
+      recorded: recorded({ endedReason: "shutdown" }),
+      messages,
+      continuation: {
+        _tag: "resumable",
+        directory: importDirectory(TARGET, IMPORT),
+        detail: "still held",
+      },
+    });
+    expect(shutdown.items.at(-1)).toMatchObject({
+      headline: "error",
+      outcome: "failed",
+    });
+  });
+
   test("an end the *server* recorded is not refused: a message to it opens a way on", async () => {
     for (const reason of ["shutdown", "refused", "open_failed"] as const) {
       const view = await read({

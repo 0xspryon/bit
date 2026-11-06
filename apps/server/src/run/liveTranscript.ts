@@ -950,12 +950,25 @@ export interface ReplayProjection {
  * a message it never marked finished keeps its start and says so (`endUnknown`). `model` is each assistant entry's own, which is what a
  * turn's footer names rather than the session's current model.
  */
+/**
+ * What the stop a session's end made reads as, in the turn it cut (A7-S review 2): the
+ * harness records it as an interrupted step — OpenCode's "Step interrupted" — which is the
+ * operator's own doing, so it is said as that, not as an error.
+ */
+export const ENDED_STOP_NOTE = "Stopped when you ended this session.";
+
 export const projectReplay = (input: {
   readonly entries: readonly MessageEntry[];
   readonly subject: NarrationSubject;
   readonly harnessSessionId: string;
   readonly users: ReplayUserEntries;
   readonly fallbackAt: number;
+  /**
+   * The operator ended the session (A7-S review 2): a stop the harness recorded in its last
+   * turn ({@link MessageEntry.aborted}) is that end's, drawn as the turn's interrupt marker
+   * with {@link ENDED_STOP_NOTE}, not as an error the harness stopped the turn with.
+   */
+  readonly endedByOperator?: boolean;
 }): ReplayProjection => {
   const items: LiveItem[] = [];
   let blank = 0;
@@ -981,12 +994,25 @@ export const projectReplay = (input: {
   /** The errors drawn since the last `user` entry: a turn's, for the `idle` rule above. */
   let turnErrors = new Set<string>();
   /**
+   * Where the last turn starts — the newest message anybody sent — for the end's stop
+   * ({@link input.endedByOperator}); -1 when the operator did not end the session.
+   */
+  let lastTurn = -1;
+  if (input.endedByOperator === true) {
+    input.entries.forEach((entry, at) => {
+      if (entry.type === "user" && entry.marker === undefined) lastTurn = at;
+    });
+  }
+  let endStopDrawn = false;
+  let index = -1;
+  /**
    * The operator message the entry before this one was, by the ids it names, if it was one:
    * for the `turn.carried` rule above. Any other entry in between — a reply, a tool result,
    * the CLI's interrupt marker, a harness note — clears it.
    */
   let lastOperator: readonly string[] | undefined;
   for (const entry of input.entries) {
+    index += 1;
     const before = items.length;
     const previousOperator = lastOperator;
     lastOperator = undefined;
@@ -1076,7 +1102,16 @@ export const projectReplay = (input: {
         ...(entry.model === undefined ? {} : { model: entry.model }),
       });
     }
-    if (entry.error !== undefined) {
+    if (
+      entry.error !== undefined &&
+      entry.aborted === true &&
+      input.endedByOperator === true &&
+      index > lastTurn
+    ) {
+      // The stop the operator's end made, once, however many entries record it.
+      if (!endStopDrawn) note(at, "interrupted", ENDED_STOP_NOTE, false);
+      endStopDrawn = true;
+    } else if (entry.error !== undefined) {
       const said = entry.error.trim();
       if (!(entry.type === "idle" && turnErrors.has(said))) {
         note(at, "error", entry.error, true);
