@@ -4850,7 +4850,9 @@ describe("a question the importer's agent waits on (A7-Q)", () => {
       if (built.script.questions.listReads() >= count) return;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    throw new Error(`the harness was listed ${String(built.script.questions.listReads())} times, not ${String(count)}`);
+    throw new Error(
+      `the harness was listed ${String(built.script.questions.listReads())} times, not ${String(count)}`,
+    );
   };
 
   test("a dismissal the harness did not answer is asked after; still waiting once it is back, it is offered again", async () => {

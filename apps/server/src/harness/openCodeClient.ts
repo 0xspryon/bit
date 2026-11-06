@@ -2969,19 +2969,17 @@ export const openCodeHarness = (
             );
             const gone = [...waitingHere]
               .filter((id) => !now.has(id))
-              .map(
-                (questionId): HarnessNarration => ({
-                  type: "form.relisted",
-                  sequence: undefined,
-                  at: Date.now(),
-                  outcome: undefined,
-                  detail: {
-                    _tag: "questionSettled",
-                    questionId,
-                    settled: "withdrawn",
-                  },
-                }),
-              );
+              .map((questionId): HarnessNarration => ({
+                type: "form.relisted",
+                sequence: undefined,
+                at: Date.now(),
+                outcome: undefined,
+                detail: {
+                  _tag: "questionSettled",
+                  questionId,
+                  settled: "withdrawn",
+                },
+              }));
             return Effect.succeed([...gone, ...listed.success.map(asked)]);
           },
         );

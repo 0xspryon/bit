@@ -372,17 +372,15 @@ describe("the subscription the driver makes", () => {
       Effect.scoped(
         Effect.provide(
           Effect.flatMap(AgentHarness, (harness) =>
-            harness
-              .sessionEvents("ses_1")
-              .pipe(
-                Stream.takeUntil(
-                  (entry) =>
-                    entry.detail._tag === "reply" &&
-                    entry.detail.text === "after",
-                ),
-                Stream.runCollect,
-                Effect.timeout("10 seconds"),
+            harness.sessionEvents("ses_1").pipe(
+              Stream.takeUntil(
+                (entry) =>
+                  entry.detail._tag === "reply" &&
+                  entry.detail.text === "after",
               ),
+              Stream.runCollect,
+              Effect.timeout("10 seconds"),
+            ),
           ),
           layer,
         ),
