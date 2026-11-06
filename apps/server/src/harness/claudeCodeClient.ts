@@ -80,11 +80,10 @@
  *   `.claude/settings.local.json` is where the gate lives and a future default of `[]`
  *   would silently un-gate every run.
  * - `forwardSubagentText: true` — without it a subagent's text and thinking never reach the
- *   stream (`--forward-subagent-text`, Claude Code 2.1.211+). Since A6 U14 `narrate` drops
- *   every subagent frame and narrates its call as one entry instead, so nothing reads them
- *   today; kept on because they are what a V2 live view of a subagent would read (see
- *   `SubagentState`), and turning it off is a change to the CLI's own stream that this
- *   slice has not measured.
+ *   stream (`--forward-subagent-text`, Claude Code 2.1.211+). `narrate` narrates none of a
+ *   subagent's frames as the caller's rows (A6 U14); since A7-S they are read into its card
+ *   instead (`subagentFrame`: its tool lines and its last words, which a finished card
+ *   quotes), and they are what a V2 view of its own thread would read (`SubagentState`).
  */
 import { spawn as spawnChild, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
