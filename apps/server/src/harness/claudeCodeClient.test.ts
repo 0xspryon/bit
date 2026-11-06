@@ -7622,43 +7622,45 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     ];
     expect(agents(liveItems)).toEqual(agents(replayed));
     const first = liveItems.find((item) => item.kind === "subagent");
-    expect(first === undefined ? undefined : shape(first)).toEqual({
-      _tag: "item",
-      origin: "activity",
-      sequence: null,
-      attemptId: null,
-      roundId: null,
-      goalId: null,
-      importId: "imp_1",
-      kind: "subagent",
-      headline: "general-purpose",
-      body: "Say PONG",
-      tool: "Agent",
-      toolName: "Agent",
-      input: null,
-      output: null,
-      callId: FOREGROUND,
-      outcome: "running",
-      model: "claude-haiku-4-5-20251001",
-      subagent: {
-        callId: FOREGROUND,
+    expect(first === undefined ? undefined : (shape(first) as unknown)).toEqual(
+      {
+        _tag: "item",
+        origin: "activity",
+        sequence: null,
+        attemptId: null,
+        roundId: null,
+        goalId: null,
+        importId: "imp_1",
+        kind: "subagent",
+        headline: "general-purpose",
+        body: "Say PONG",
         tool: "Agent",
-        agentType: "general-purpose",
-        description: "Say PONG",
-        task: expect.any(String),
-        background: false,
-        status: "running",
-        startedAt: 0,
-        endedAt: 0,
-        calls: null,
-        lines: [],
-        activity: null,
-        result: null,
-        failure: null,
-        // A foreground sub-agent is stopped with its turn (the operator's decision).
-        stop: "with_turn",
+        toolName: "Agent",
+        input: null,
+        output: null,
+        callId: FOREGROUND,
+        outcome: "running",
+        model: "claude-haiku-4-5-20251001",
+        subagent: {
+          callId: FOREGROUND,
+          tool: "Agent",
+          agentType: "general-purpose",
+          description: "Say PONG",
+          task: expect.any(String),
+          background: false,
+          status: "running",
+          startedAt: 0,
+          endedAt: 0,
+          calls: null,
+          lines: [],
+          activity: null,
+          result: null,
+          failure: null,
+          // A foreground sub-agent is stopped with its turn (the operator's decision).
+          stop: "with_turn",
+        },
       },
-    });
+    );
     // And neither side draws the background notice as a `task` note.
     expect(replayed.some((item) => item.kind === "turn.other")).toBe(false);
   });
@@ -9260,9 +9262,8 @@ describe("sub-agent cards: lines, activity, count and Stop (A7-S)", () => {
     );
     const last = entries
       .flatMap((entry) => entry.parts)
-      .findLast(
-        (part) => part._tag === "subagent" && part.callId === FOREGROUND,
-      ) as SubagentState | undefined;
+      .filter((part) => part._tag === "subagent" && part.callId === FOREGROUND)
+      .at(-1) as SubagentState | undefined;
     expect(last?.status).toBe("stopped");
     // Its call still open when it was stopped reads so, as it does live.
     expect(last?.lines).toEqual([

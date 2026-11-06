@@ -3753,7 +3753,7 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
       child("session.step.ended", { tokens: { input: 1, output: 1 } }),
     ].map((each) => openCodeChildNarration(each, subagents));
     expect(read.at(-1)).toBeUndefined();
-    const last = read.findLast((each) => each !== undefined)
+    const last = read.filter((each) => each !== undefined).at(-1)
       ?.detail as SubagentState;
     expect(last.activity).toBe("Let me list the files first.");
     expect(last.calls).toBe(2);
