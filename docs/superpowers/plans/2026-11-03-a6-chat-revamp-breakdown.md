@@ -451,6 +451,102 @@ replaces U14's "omit content".** A7's E7/E8.
 - **E8:** a header chip ("N sub-agents · running · failed") opens a 400px reflowing panel
   grouped Running / Failed / Finished, and selecting a row scrolls to its card.
 
+**Step 0, measured (2026-11-06; CLI 2.1.310 / SDK 0.3.310 on `claude-haiku-4-5`, OpenCode
+2.2.5 on `zai-coding-plan/glm-5.3-flash`; probes `apps/server/src/spike/subagentProbe.ts`
+and `openCodeSubagentProbe.ts`).**
+
+- **Claude Code, live.** An `Agent` call is a task (`task_type: local_agent`, `task_id` = the
+  sub-agent's `agentId`): `task_started` (`is_backgrounded`, `tool_use_id`, `prompt`) comes
+  ~40 ms after the call. **`task_progress` comes at each of the sub-agent's tool calls** with
+  the CLI's phrase for it (`description`: "Running List files in current directory",
+  "Reading notes.txt" — a tool's own description, or the CLI's), `usage.tool_uses`,
+  `duration_ms` and `last_tool_name`; `summary` only with `agentProgressSummaries` (not
+  set). The sub-agent's own `tool_use`/`tool_result`/`text` frames are forwarded with
+  `parent_tool_use_id` (`forwardSubagentText`), but none of its `stream_event`s. The end is
+  `task_updated` (`status`) then `task_notification` (`completed`/`failed`/`stopped`,
+  `summary` = its final text when completed, its description otherwise, `usage`); a
+  foreground call's `tool_result` follows ~5 ms later: `[Subagent hand-back] …The report
+follows:` the report indented two spaces, then `agentId: <id>` and a `<usage>` block. A
+  background call's result is the `Async agent launched … agentId: <id>` placeholder, and the
+  CLI opens a turn of its own when it ends. A sub-agent's own Bash over ~3 s becomes a
+  `local_bash` task with `owned_by_subagent` and `parent_task_id`.
+- **Claude Code, replay.** `getSessionMessages` holds the call, the hand-back or placeholder,
+  and a background one's stored `<task-notification>` (`<task-id>`, `<status>` — `killed` for
+  stopped —, `<result>`, `<usage><tool_uses>`). `listSubagents` / `getSubagentMessages` read
+  `<session>/subagents/agent-<id>.jsonl` (with timestamps); `agent-<id>.meta.json` names the
+  `toolUseId` but the SDK does not expose it, so the join is the `agentId:` in the call's
+  result or the notification's `<task-id>`, else the sub-agent's first prompt.
+- **Claude Code, Stop.** `stopTask(<task id>)` on a **background** sub-agent: `stopped` in
+  ~5 ms, its call in flight rejected, and the CLI opens a turn to tell the model.
+  `interrupt()` stops a background agent with no turn after it (as F5 measured).
+  **`stopTask` on a foreground sub-agent also stops it alone**: its `Agent` call returns an
+  error result reading `[Request interrupted by user for tool use]` and the parent's turn
+  goes on and replies. (The decision below still hides its Stop: see the `V2(chat):` note at
+  `subagentStop`.)
+- **Claude Code, failure.** A sub-agent whose tools fail still _finishes_ (it reports the
+  error). A failed `Agent` call is one the CLI refuses: `Agent type 'x' not found…`
+  (`is_error`, no task, no transcript).
+- **OpenCode.** The child session's events come on the **same unfiltered event stream**
+  under the child's `sessionID` (bit's per-session filter dropped them). The parent's
+  `session.tool.progress` carries `{ sessionID: <child>, status: "running" }` ~30 ms after
+  the call (it was not among the subscribed types). The child's `session.tool.*`,
+  `reasoning/text.ended` and `execution.*` arrive as for any session. A foreground call ends
+  with the parent's `session.tool.success` (`<subagent sessionID=… state="completed">…`) or
+  `failed` (`Subagent cancelled (sessionID: …)`, `Unknown agent: x`). **A background child's
+  end is not a live `session.synthetic`**: the notice arrives inside
+  `session.inbox.enqueued` (not subscribed: it can carry files), so U14's live "finished" for
+  an OpenCode background sub-agent never fired; the child's own `session.execution.*` does.
+  The replay has the `synthetic` message with its metadata and text.
+  `GET /api/session?parentID=` lists children; `GET /api/session/<child>/message` reads one.
+- **OpenCode, Stop.** `POST /api/session/<child>/interrupt` answers `interrupted: true` in
+  ~10 ms for foreground and background alike: a foreground call fails `Subagent cancelled`
+  and the parent's turn goes on; a background child's `cancelled` notice wakes the parent.
+  The parent's own interrupt reaches a foreground child (the tool's `onInterrupt`), not a
+  background one.
+
+**What a running card shows, and why.** Claude Code: the last three tool lines from the
+forwarded frames (each with its result's first line), the CLI's `task_progress` phrase as the
+current activity, the CLI's count (or ours when the frames run ahead of it), and its time
+from the call. OpenCode: the child's last three tool lines and count from its own events, and
+its newest thought's or sentence's first line as the activity (GLM reasons visibly; OpenCode
+has no phrase of its own). Both are the harness's words; nothing is computed about results.
+
+**Done (2026-11-06), importer chat, both harnesses.** The contract is
+`packages/contracts/src/subagent.ts` (`SubagentView`: call id, tool, type, description, task,
+background, status, start/end, calls, last `SUBAGENT_LINES_KEPT` tool lines, activity,
+result, failure reason + raw error, `stop` = `own` | `with_turn` | `none`), carried on
+`LiveItem.subagent`, live and replayed. Routes `POST …/importer-sessions/:importId/subagents/
+:callId/stop` (`SubagentStopped` | `SubagentStopRefused`) and `…/subagents/stop` (Stop all:
+the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harness methods
+`stopSubagent` / `stopSubagents`. The web draws E7's card (`SubagentCard`) through the shell's
+`subagent` hook, E8's chip (`SubagentChip`, title bar) and 400px panel (`SubagentPanel`,
+`aside`), Stop all, a card's own Stop, and the 560px rail rule.
+
+- **Decision: Stop all is the shell's `ChatSession.stopAll`, drawn in Stop's place**, not
+  the adapter leaving out `stop` and drawing a second pill in `controls`: one pill keeps
+  Stop's elapsed clock and stopping state, and Stop all is offered while sub-agents run even
+  with no turn (an OpenCode background child is no harness "background work"). `controls`
+  stays empty.
+- **Stop matrix.** Claude Code background: own (`stopTask`). Claude Code foreground:
+  hidden, with the reason ("runs inside the importer's turn, and Stop all stops the turn with
+  it") — the operator's decision, kept although `stopTask` was measured to stop it alone.
+  OpenCode foreground and background: own (child interrupt), once the child is known. Stop
+  all: OpenCode interrupts each running child, then the turn's Stop (which cancels inbox
+  notices first); Claude Code asks nothing extra (the turn's `interrupt()` stops background
+  agents with no turn after it, where `stopTask` each would open one).
+- **E3/E6 leftovers of A7-Q, done here:** a run of question-tool calls reads "Asked N
+  questions · waiting on you" (waiting while a call has no result), and the session chip
+  carries a warning dot while the session waits on the operator.
+- **Live (both harnesses, 1440×900 and 1024×768, keyboard included):** running, finished,
+  failed and stopped cards live and after a reload; chip counts; the panel's groups; a row
+  (Enter) scrolls to and focuses its card; a card's Stop ~0.2 s on both; Stop all ~0.2 s on
+  both with no turn left running; at 1024 the rail gives way (column 792 → 624) and comes
+  back on close. Shots in `/run/media/hbt/work/a7s-shots/`.
+- Not done: the goal, planner and worker chats (a `V2(chat):` note in `ImporterChat.svelte`;
+  their servers already narrate the view, but have no per-sub-agent Stop route); the quote is
+  plain text, not Markdown (note at the card); a sub-agent's own thread (note at the card and
+  at `SubagentState`).
+
 **F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
 refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
 `apps/plugins/claudeCodeGate.ts`, which does not exist (`bun src/main.ts` works). Fix the
