@@ -1365,6 +1365,26 @@ rule/message multiset as `main` (findings moved with their files).
   - After one of three Esc dismissals, focus was on a button rather than the box. The other
     two put it in the box. The focus-return code is unchanged by these fixes.
 
+#### Review 2 fixes (2026-11-06)
+
+Review 2 passed with three small findings; each guard was checked by mutation, then the file
+restored from a copy. **The end's revoke:** probe tests hold the harness's `endSession`, and
+the registration of an open still in flight, and read the credential while the end is still
+under way; a third ends a period whose open failed while its turn runs (no revoke, the
+operator's end). `revokePeriod` → `void 0` fails the first two. `main`'s importer had the same
+gap: its stop tests looked only after the stop returned, when the scope had revoked anyway,
+and the importer suite still passes under that mutation; the one core `end` is now guarded
+for both. **One reader of the question:** `state.question` is now the docked question, so an
+owner that cannot dismiss holds no `not_resumable` (or unsendable `message`) question there,
+and a dot reading it agrees with the dock. Picked over a second `dockedQuestion` field so
+nothing can read the raw one by mistake. The rule needs "can a message go", so the box's
+`blocked` is the state's `messageBlocked`, and the importer's "no model" fact goes to the
+state's constructor beside the live feed. The importer can dismiss, so its dot, dock and box
+read as on `main`. **Dismiss without the ability:** a state test finds no call at all, not
+even `stop`. Gates (`--force`, memory-capped): typecheck 3/3; test: server 2032, web unit
+754, web DOM 637, all passing; build 3/3; lint clean; format:check only
+`sprint-roadmap.html`.
+
 ## Order
 
 Slices run **one at a time** on branch `a6-chat-revamp`, each committed by its implementer.
