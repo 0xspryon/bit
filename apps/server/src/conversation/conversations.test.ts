@@ -44,6 +44,7 @@ import type {
   HarnessQuestion,
 } from "../harness/agentHarness";
 import type { LiveSessionCloseReason } from "../harness/liveAgentSessions";
+import { HarnessTransportError } from "../harness/errors";
 import { HarnessResolver } from "../harness/resolver";
 import {
   scriptedQuestions,
@@ -112,6 +113,24 @@ interface WorldOptions {
   readonly gateTurns?: boolean;
   /** An open's harness session is created only once the test lets it (`letOpen`). */
   readonly gateOpens?: boolean;
+  /**
+   * An open's MCP registration — after its credential is minted — lands only once the test
+   * lets it (`letRegister`), signalling `registering` on the way in.
+   */
+  readonly gateRegistrations?: boolean;
+  /** Every MCP registration fails, so every open fails after its credential was minted. */
+  readonly failRegistrations?: boolean;
+  /**
+   * A harness session is ended (`endSession`) only once the test lets it (`letEnd`),
+   * signalling `ending` on the way in: the close is held after the revoke and before the
+   * session's scope goes.
+   */
+  readonly gateEnds?: boolean;
+  /**
+   * A failed open's `failed` hook runs only once the test lets it (`letFail`), signalling
+   * `failing`: the turn is still running with no session and no open in flight.
+   */
+  readonly gateFailed?: boolean;
 }
 
 /**
@@ -156,6 +175,12 @@ const world = (options: WorldOptions = {}) =>
      */
     let idle = Deferred.makeUnsafe<void>();
     const opens = Deferred.makeUnsafe<void>();
+    const registering = Deferred.makeUnsafe<void>();
+    const registrations = Deferred.makeUnsafe<void>();
+    const ending = Deferred.makeUnsafe<void>();
+    const ends = Deferred.makeUnsafe<void>();
+    const failing = Deferred.makeUnsafe<void>();
+    const fails = Deferred.makeUnsafe<void>();
     const goIdle = Effect.suspend(() => Deferred.succeed(idle, undefined));
     const harness = stubHarness({
       ...questions.members,
@@ -182,6 +207,38 @@ const world = (options: WorldOptions = {}) =>
               }),
           }
         : {}),
+      ...(options.gateRegistrations === true
+        ? {
+            registerMcpServer: () =>
+              Effect.andThen(
+                Deferred.succeed(registering, undefined),
+                Deferred.await(registrations),
+              ),
+          }
+        : {}),
+      ...(options.failRegistrations === true
+        ? {
+            registerMcpServer: () =>
+              Effect.fail(
+                new HarnessTransportError({
+                  operation: "mcp.add",
+                  status: undefined,
+                  tag: undefined,
+                  detail: "no answer",
+                  cause: undefined,
+                }),
+              ),
+          }
+        : {}),
+      ...(options.gateEnds === true
+        ? {
+            endSession: () =>
+              Effect.andThen(
+                Deferred.succeed(ending, undefined),
+                Deferred.await(ends),
+              ),
+          }
+        : {}),
       prompt: (_sessionId, text, delivery) =>
         Effect.sync(() => {
           if (Deferred.isDoneUnsafe(idle)) idle = Deferred.makeUnsafe<void>();
@@ -197,6 +254,21 @@ const world = (options: WorldOptions = {}) =>
     const rows = new Map<string, ProbeRow>();
     /** Each period's credential, as the probe minted it. */
     const issued = new Map<string, IssuedCredential>();
+    /** Every period `revokePeriod` was asked to revoke, in order. */
+    const revokes: string[] = [];
+    /**
+     * What each period's credential resolved to at the instant its operator's end was
+     * recorded: after the end's revoke, before anything is interrupted or closed.
+     */
+    const atOperatorEnd = new Map<string, unknown>();
+    /** What a period's credential resolves to now; `undefined` once refused. */
+    const authorityOf = (id: string) =>
+      Effect.suspend(() => {
+        const credential = issued.get(id);
+        return credential === undefined
+          ? Effect.die(`no credential was issued for ${id}`)
+          : credentials.resolve(Redacted.value(credential.token));
+      });
     const ended: { id: string; reason: LiveSessionCloseReason }[] = [];
     let minted = 0;
     const reopened: string[] = [];
@@ -260,7 +332,13 @@ const world = (options: WorldOptions = {}) =>
           openingPrompt: () => `open: ${input.text}`,
           meta: { opener: input.text },
         },
-        failed: () => Effect.void,
+        failed: () =>
+          options.gateFailed === true
+            ? Effect.andThen(
+                Deferred.succeed(failing, undefined),
+                Deferred.await(fails),
+              )
+            : Effect.void,
       });
       const entry = yield* Deferred.await(opening);
       return { entry, core };
@@ -292,6 +370,7 @@ const world = (options: WorldOptions = {}) =>
         // By the period's own token: `revokeGoal` would take every period of the owner.
         revokePeriod: (period) =>
           Effect.gen(function* () {
+            revokes.push(period.periodId);
             const credential = issued.get(period.periodId);
             if (credential === undefined) return 0;
             const live = yield* credentials.resolve(
@@ -324,7 +403,10 @@ const world = (options: WorldOptions = {}) =>
             return row?.targetId === targetId ? row : undefined;
           }),
         markEnded: (_targetId, id, reason) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
+            if (reason === "operator" && issued.has(id)) {
+              atOperatorEnd.set(id, yield* authorityOf(id));
+            }
             ended.push({ id, reason });
             const row = rows.get(id);
             if (row !== undefined && row.endedReason === null) {
@@ -423,6 +505,15 @@ const world = (options: WorldOptions = {}) =>
       interrupts,
       goIdle,
       letOpen: Deferred.succeed(opens, undefined),
+      registering: Deferred.await(registering),
+      letRegister: Deferred.succeed(registrations, undefined),
+      ending: Deferred.await(ending),
+      letEnd: Deferred.succeed(ends, undefined),
+      failing: Deferred.await(failing),
+      letFail: Deferred.succeed(fails, undefined),
+      revokes,
+      atOperatorEnd,
+      authorityOf,
       confirming,
       rows,
       ended,
@@ -641,6 +732,121 @@ describe("the conversation core through a non-importer owner", () => {
     expect(result.first).toBeUndefined();
     expect(result.second).toMatchObject({ _tag: "goal", goalId: OWNER });
     expect(result.live).toBe(true);
+  });
+
+  /*
+   * The end's own revoke (review 2 of slice 2). A closing session's scope revokes too, so a
+   * test that looks once the end has returned cannot tell the two apart: these look while
+   * the end is still under way, before anything the end interrupts or closes has gone.
+   */
+  test("an end refuses the period's credential before its session is closed", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const { entry } = yield* probe.open("first");
+          const before = yield* probe.authorityOf(entry.id);
+          const ending = yield* Effect.forkChild(
+            probe.core.end(TARGET, entry.id),
+          );
+          // The close is held at the harness's `endSession`: the session's scope, and its
+          // revoke, are still to come.
+          yield* probe.ending;
+          const whileClosing = yield* probe.authorityOf(entry.id);
+          yield* probe.letEnd;
+          return {
+            before,
+            whileClosing,
+            atEnd: probe.atOperatorEnd.get(entry.id),
+            revokes: [...probe.revokes],
+            ended: yield* Fiber.join(ending),
+          };
+        }),
+      { gateEnds: true },
+    );
+    expect(result.before).toMatchObject({ _tag: "goal", goalId: OWNER });
+    expect(result.atEnd).toBeUndefined();
+    expect(result.whileClosing).toBeUndefined();
+    expect(result.revokes[0]).toBe("prb_1");
+    expect(result.ended).toBe(true);
+  });
+
+  test("an end while the open is still in flight refuses the credential that open minted", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const opening = yield* Effect.forkChild(
+            Effect.result(probe.open("first")),
+          );
+          // Minted, and not yet registered: no session is published, the open is in flight.
+          yield* probe.registering;
+          const before = yield* probe.authorityOf("prb_1");
+          const ending = yield* Effect.forkChild(
+            probe.core.end(TARGET, "prb_1"),
+          );
+          // The end's interrupt waits on the open, which the registry runs uninterruptibly
+          // and which is held at its registration: the end has recorded itself and is
+          // still under way.
+          for (let i = 0; i < 100 && probe.ended.length === 0; i += 1) {
+            yield* Effect.sleep("2 millis");
+          }
+          const whileOpening = yield* probe.authorityOf("prb_1");
+          const stillEnding = ending.pollUnsafe() === undefined;
+          yield* probe.letRegister;
+          const ended = yield* Fiber.join(ending);
+          const opened = yield* Fiber.join(opening);
+          return {
+            before,
+            whileOpening,
+            stillEnding,
+            ended,
+            atEnd: probe.atOperatorEnd.get("prb_1"),
+            revokes: [...probe.revokes],
+            reasons: probe.ended.map((each) => each.reason),
+            opened: opened._tag,
+          };
+        }),
+      { gateRegistrations: true },
+    );
+    expect(result.before).toMatchObject({ _tag: "goal", goalId: OWNER });
+    // Refused by the end itself, named by the open in flight, before the open was cut.
+    expect(result.atEnd).toBeUndefined();
+    expect(result.stillEnding).toBe(true);
+    expect(result.whileOpening).toBeUndefined();
+    expect(result.revokes[0]).toBe("prb_1");
+    expect(result.ended).toBe(true);
+    expect(result.reasons[0]).toBe("operator");
+    expect(result.opened).toBe("Failure");
+  });
+
+  test("an end after a failed open, its turn still running, revokes nothing and is the operator's", async () => {
+    const result = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const opened = yield* Effect.result(probe.open("first"));
+          // The open failed and its scope took the credential; the turn is held in the
+          // binding's `failed`: no session, no open in flight, a turn still running.
+          yield* probe.failing;
+          const ended = yield* probe.core.end(TARGET, "prb_1");
+          return {
+            opened: opened._tag,
+            ended,
+            authority: yield* probe.authorityOf("prb_1"),
+            revokes: [...probe.revokes],
+            reasons: probe.ended.map((each) => each.reason),
+            again: yield* probe.core.end(TARGET, "prb_1"),
+          };
+        }),
+      { failRegistrations: true, gateFailed: true },
+    );
+    expect(result.opened).toBe("Failure");
+    expect(result.ended).toBe(true);
+    expect(result.authority).toBeUndefined();
+    // Nothing named the period, so nothing was asked to revoke.
+    expect(result.revokes).toEqual([]);
+    // The operator's end is the first recorded; the interrupted turn wrote no `open_failed`.
+    expect(result.reasons).toEqual(["operator"]);
+    // With the turn gone too, there is nothing left to end.
+    expect(result.again).toBe(false);
   });
 
   test("Stop, Stop all and activity answer for the period holding the session", async () => {
