@@ -73,8 +73,9 @@ export const UPLOADS_FOLDER = "uploads";
 
 /**
  * The uploads folder of a session working in `directory`: the one folder {@link storeUploads}
- * writes to, and the one a driver's header names as the only place an attachment is ever in
- * (`harness/attachments.ts`, U13 review 4). One definition, so the two cannot disagree.
+ * writes to, and the one a replay reads an attachment line as a chip for — a line naming a
+ * file anywhere else stays words (`attachmentReader`, `harness/attachments.ts`). One
+ * definition, so the two cannot disagree.
  */
 export const uploadsFolderIn = (directory: string): string =>
   join(directory, UPLOADS_FOLDER);

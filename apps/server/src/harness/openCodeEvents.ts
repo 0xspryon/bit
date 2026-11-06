@@ -136,8 +136,14 @@ export type Resubscribed =
       readonly reason: string;
     };
 
-/** Failed connections in a row before the stream is said to be `lost`: ~30 s of backoff. */
-export const RESUBSCRIBE_LOST_AFTER = 6;
+/**
+ * Failed connections in a row before the stream is said to be `lost`: ~30 s of backoff.
+ *
+ * The waits before the second to the seventh attempt are 0.5, 1, 2, 4, 8 and 16 s
+ * ({@link resubscribeDelay}), so the seventh failure comes about 31.5 s after the first,
+ * plus however long each attempt took to fail. Six said `lost` at 15.5 s (U13 review 6).
+ */
+export const RESUBSCRIBE_LOST_AFTER = 7;
 
 /** 0.5 s, doubling, at most 30 s. */
 export const resubscribeDelay = (failures: number): Duration.Duration =>
@@ -159,6 +165,11 @@ export const resubscribeDelay = (failures: number): Duration.Duration =>
  * - **Backpressure is kept**: a bounded buffer that suspends, as the connection's own
  *   stream would.
  */
+// V2(chat): no stall timer. OpenCode sends a heartbeat on the stream every 15 s, but a
+// connection that stays open and goes quiet — a hung server, a proxy holding the socket — is
+// neither an end nor a failure here, so it is never `reconnecting` and the chat shows no
+// notice while narration has stopped. V2 should treat ~2 missed heartbeats as a break:
+// close the connection and make it again, which narrates it as one (U13 review 6).
 export const resubscribing = <E>(
   connect: () => Stream.Stream<unknown, E>,
   options: {

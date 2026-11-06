@@ -398,7 +398,7 @@ describe("steers stored as one entry", () => {
     });
   });
 
-  test("one reader serves a whole transcript, oldest first", () => {
+  test("one reader reads every entry of a transcript, each on its own", () => {
     const read = attachmentReader(stored);
     expect(read(steer("first", [file("a.png", "image", "image/png")]))).toEqual(
       { text: "first", attachments: [png("a.png")] },
