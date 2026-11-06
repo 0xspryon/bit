@@ -4,7 +4,12 @@
    * worker chat would hand it, with each capability switched on or off by a prop. Every
    * call the shell makes into the adapter is pushed onto `calls`, which the test holds.
    */
-  import type { LiveItem } from "@bit/contracts";
+  import type {
+    LiveItem,
+    PendingQuestion,
+    QuestionAnswerability,
+    QuestionField,
+  } from "@bit/contracts";
 
   import { rowsFor, type ChatGroup } from "../../../src/lib/chat";
   import type {
@@ -32,6 +37,9 @@
     since = undefined,
     elapsedLead = undefined,
     items = [],
+    fields = undefined,
+    answerability = "live",
+    canMessage = true,
   }: {
     calls: string[];
     closed?: string | undefined;
@@ -47,6 +55,11 @@
     since?: number | undefined;
     elapsedLead?: string | undefined;
     items?: readonly LiveItem[];
+    /** The questions asked; two by default (a choose-one and a choose-any). */
+    fields?: readonly QuestionField[] | undefined;
+    answerability?: QuestionAnswerability;
+    /** Whether the chat takes the answers as a message (`sendAsMessage`). */
+    canMessage?: boolean;
   } = $props();
 
   // The page's title bar chips, as `+page.svelte` provides them, drawn in a stand-in bar.
@@ -57,6 +70,9 @@
   let draft = $state("");
   // svelte-ignore state_referenced_locally
   let waiting = $state(asking);
+  let shown = $state(true);
+  let busy = $state(false);
+  let refused = $state<string | undefined>(undefined);
   // Read once: a fixture's capabilities are fixed for its life, as a chat's role is.
   // svelte-ignore state_referenced_locally
   const files = attachable ? new ComposerFiles() : undefined;
@@ -66,7 +82,16 @@
     readonly stopping?: boolean;
     /** A question is asked (`true`), or answered on the server (`false`). */
     readonly asking?: boolean;
+    /** The chat is on screen (`false`: unmounted, beside a bar that stays). */
+    readonly shown?: boolean;
+    /** An answer is with the server. */
+    readonly busy?: boolean;
+    /** The server refused the last answer, with this sentence. */
+    readonly refused?: string | undefined;
   }): void => {
+    if (next.shown !== undefined) shown = next.shown;
+    if (next.busy !== undefined) busy = next.busy;
+    if ("refused" in next) refused = next.refused;
     if (next.working !== undefined) working = next.working;
     if (next.stopping !== undefined) stopping = next.stopping;
     if (next.asking !== undefined) waiting = next.asking;
@@ -77,10 +102,79 @@
     files?.add(picked);
   };
 
+  const TWO: readonly [QuestionField, ...QuestionField[]] = [
+    {
+      key: "Which host first?",
+      header: "Host",
+      question: "Which host first?",
+      kind: "one",
+      options: [
+        { label: "api.acme.com", description: "The API" },
+        { label: "www.acme.com", description: null },
+      ],
+      custom: true,
+      required: false,
+    },
+    {
+      key: "Which depths?",
+      header: "Depth",
+      question: "Which depths?",
+      kind: "any",
+      options: [
+        { label: "One", description: null },
+        { label: "Two", description: null },
+        { label: "All", description: null },
+      ],
+      custom: true,
+      required: false,
+    },
+  ];
+  // svelte-ignore state_referenced_locally
+  const asked: readonly [QuestionField, ...QuestionField[]] =
+    fields !== undefined && fields.length > 0
+      ? (fields as readonly [QuestionField, ...QuestionField[]])
+      : TWO;
+  // svelte-ignore state_referenced_locally
+  const pending: PendingQuestion = {
+    questionId: "toolu_fake",
+    // One per mount: the dock keeps drafts by session and questions, across mounts.
+    harnessSessionId: `ses_fake_${crypto.randomUUID()}`,
+    fields: asked,
+    askedAt: null,
+    answerability,
+    attemptId: null,
+    roundId: null,
+    goalId: null,
+    importId: "imp_fake",
+  };
+  // svelte-ignore state_referenced_locally
+  const message = canMessage
+    ? (text: string) => {
+        calls.push(`message:${text}`);
+        waiting = false;
+      }
+    : undefined;
   const question: ChatQuestion = {
+    pending,
+    asker: "The agent",
+    get busy() {
+      return busy;
+    },
+    answer: (answers) => {
+      calls.push(`answer:${JSON.stringify(answers)}`);
+    },
+    sendAsMessage: message,
     dismiss: () => {
       calls.push("dismiss");
       waiting = false;
+    },
+    get refusal() {
+      return refused === undefined
+        ? undefined
+        : { title: "Answers not sent", sentence: refused };
+    },
+    dismissRefusal: () => {
+      refused = undefined;
     },
   };
 
@@ -203,13 +297,15 @@
 {/snippet}
 
 <header class="fake-bar"><TitleBarChipSlot /></header>
-<ChatShell
-  {session}
-  id="fake"
-  {footnote}
-  dock={dock ? ask : undefined}
-  controls={stopAll ? stopEvery : undefined}
-  aside={panel ? subagents : undefined}
-  subagent={cards ? card : undefined}
-  chip={cards ? chip : undefined}
-/>
+{#if shown}
+  <ChatShell
+    {session}
+    id="fake"
+    {footnote}
+    dock={dock ? ask : undefined}
+    controls={stopAll ? stopEvery : undefined}
+    aside={panel ? subagents : undefined}
+    subagent={cards ? card : undefined}
+    chip={cards ? chip : undefined}
+  />
+{/if}

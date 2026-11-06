@@ -4587,7 +4587,11 @@ describe("a question the importer's agent waits on (A7-Q)", () => {
       Effect.result(
         Effect.flatMap(ScopeImporter, (importer) =>
           answers === undefined
-            ? importer.dismissQuestion({ targetId: TARGET, importId, questionId })
+            ? importer.dismissQuestion({
+                targetId: TARGET,
+                importId,
+                questionId,
+              })
             : importer.answerQuestion({
                 targetId: TARGET,
                 importId,

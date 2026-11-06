@@ -53,7 +53,9 @@ if (withHook) {
       `const event = JSON.parse(raw);`,
       `await Bun.write(${JSON.stringify(hookLog)}, ((await Bun.file(${JSON.stringify(hookLog)}).text().catch(() => "")) + JSON.stringify({ at: Date.now(), tool: event.tool_name, permission_mode: event.permission_mode }) + "\\n"));`,
       ...(process.argv.includes("--gate=deny")
-        ? [`process.stderr.write("Denied by bit policy: probe deny"); process.exit(2);`]
+        ? [
+            `process.stderr.write("Denied by bit policy: probe deny"); process.exit(2);`,
+          ]
         : []),
       `process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "allowed by bit policy (probe)" } }));`,
       `process.exit(0);`,
@@ -206,7 +208,9 @@ const main = async () => {
       ...(leg === "hook-allow-only" || leg === "sdk-hook-only"
         ? {}
         : { canUseTool }),
-      ...(leg.startsWith("sdk-hook") ? { hooks: { PreToolUse: [answerHook] } } : {}),
+      ...(leg.startsWith("sdk-hook")
+        ? { hooks: { PreToolUse: [answerHook] } }
+        : {}),
     },
   });
   if (leg === "interrupt" || leg === "sdk-hook-interrupt") {
@@ -223,8 +227,8 @@ const main = async () => {
   for await (const message of q as AsyncIterable<SDKMessage>) {
     const m = message as Record<string, unknown> & { type: string };
     if (m.type === "assistant" || m.type === "user") {
-      const content = (m as unknown as { message: { content: unknown } }).message
-        .content;
+      const content = (m as unknown as { message: { content: unknown } })
+        .message.content;
       log(m.type, JSON.stringify(content).slice(0, 700));
     } else if (m.type === "result") {
       log(

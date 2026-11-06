@@ -65,7 +65,9 @@ describe("a question tool's input", () => {
 
   test("nothing to ask is no question: no list, an empty one, or questions without text", () => {
     expect(questionFieldsOfInput("claude-code", {})).toBeUndefined();
-    expect(questionFieldsOfInput("claude-code", { questions: [] })).toBeUndefined();
+    expect(
+      questionFieldsOfInput("claude-code", { questions: [] }),
+    ).toBeUndefined();
     expect(
       questionFieldsOfInput("opencode", { questions: [{ question: " " }] }),
     ).toBeUndefined();
@@ -111,8 +113,11 @@ describe("the question a transcript ends on (the `message` fallback's source)", 
       callId,
       input: JSON.stringify(ASK),
     });
-  const result = (outcome: "ok" | "failed", output: string, callId = "toolu_1") =>
-    item({ kind: "tool.result", callId, outcome, output });
+  const result = (
+    outcome: "ok" | "failed",
+    output: string,
+    callId = "toolu_1",
+  ) => item({ kind: "tool.result", callId, outcome, output });
   const operator = () => item({ kind: "turn.operator", body: "hello" });
 
   test("a call with no result (a restart took the CLI) is unanswered", () => {
@@ -125,7 +130,10 @@ describe("the question a transcript ends on (the `message` fallback's source)", 
     expect(
       unansweredQuestion([
         call(),
-        result("failed", "The user doesn't want to proceed with this tool use."),
+        result(
+          "failed",
+          "The user doesn't want to proceed with this tool use.",
+        ),
       ])?.callId,
     ).toBe("toolu_1");
     expect(
@@ -140,16 +148,19 @@ describe("the question a transcript ends on (the `message` fallback's source)", 
     expect(
       unansweredQuestion([
         call(),
-        result("ok", 'Your questions have been answered: "Which colour?"="Red"'),
+        result(
+          "ok",
+          'Your questions have been answered: "Which colour?"="Red"',
+        ),
       ]),
     ).toBeUndefined();
   });
 
   test("an operator message after it moves the conversation past it; OpenCode's tool is read too, others are not", () => {
     expect(unansweredQuestion([call(), operator()])).toBeUndefined();
-    expect(unansweredQuestion([call("question", "call_1")])?.fields[0].key).toBe(
-      "q0",
-    );
+    expect(
+      unansweredQuestion([call("question", "call_1")])?.fields[0].key,
+    ).toBe("q0");
     expect(unansweredQuestion([call("Bash")])).toBeUndefined();
   });
 
@@ -182,13 +193,15 @@ describe("answers, checked once for the dock and the server", () => {
   });
 
   test("each way an answer can not fit is a sentence", () => {
-    expect(questionAnswersProblem(fields, { nope: ["x"] })).toContain("no question");
+    expect(questionAnswersProblem(fields, { nope: ["x"] })).toContain(
+      "no question",
+    );
     expect(
       questionAnswersProblem(fields, { "Which colour?": ["Red", "Blue"] }),
     ).toContain("takes one answer");
-    expect(questionAnswersProblem(fields, { "Which colour?": [" "] })).toContain(
-      "empty",
-    );
+    expect(
+      questionAnswersProblem(fields, { "Which colour?": [" "] }),
+    ).toContain("empty");
     expect(questionAnswersProblem([required], {})).toContain("needs an answer");
     expect(questionAnswersProblem([closed], { c: ["Green"] })).toContain(
       "only the answers it offers",
@@ -223,12 +236,20 @@ describe("a narrated question on the live stream and the sessions list", () => {
     askedAt: 5,
     callId: "toolu_9",
   };
-  const narration = (detail: Parameters<typeof projectNarration>[0]["entry"]["detail"]) => ({
+  const narration = (
+    detail: Parameters<typeof projectNarration>[0]["entry"]["detail"],
+  ) => ({
     id: 1,
     targetId: "t",
     subject: { _tag: "import" as const, importId: "imp_1" },
     harnessSessionId: "ses_1",
-    entry: { type: "x", sequence: undefined, at: 9, outcome: undefined, detail },
+    entry: {
+      type: "x",
+      sequence: undefined,
+      at: 9,
+      outcome: undefined,
+      detail,
+    },
   });
 
   test("asked is a `question` frame carrying the question as live; settled carries how; both decode", () => {
@@ -265,12 +286,17 @@ describe("a narrated question on the live stream and the sessions list", () => {
   test("the activity store says who waits until the question is settled or the session closed", () => {
     const store = new SessionActivities();
     const subject = { _tag: "import" as const, importId: "imp_1" };
-    const record = (detail: Parameters<typeof projectNarration>[0]["entry"]["detail"]) =>
-      store.record(subject, narration(detail).entry);
+    const record = (
+      detail: Parameters<typeof projectNarration>[0]["entry"]["detail"],
+    ) => store.record(subject, narration(detail).entry);
     record({ _tag: "question", question });
     expect(store.waiting(subject)?.questionId).toBe("toolu_9");
     expect(waitingWords(question)).toBe("3 questions — Colour");
-    record({ _tag: "questionSettled", questionId: "toolu_9", settled: "answered" });
+    record({
+      _tag: "questionSettled",
+      questionId: "toolu_9",
+      settled: "answered",
+    });
     expect(store.waiting(subject)).toBeUndefined();
     record({ _tag: "question", question });
     record({ _tag: "connection", state: "closed", reason: "" });

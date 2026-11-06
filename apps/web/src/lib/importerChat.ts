@@ -78,6 +78,7 @@ import {
   type ImporterSessionView,
   type LiveItem,
   type ModelOptionSelection,
+  type PendingQuestion,
 } from "@bit/contracts";
 
 import {
@@ -177,6 +178,11 @@ export interface ImporterHistory {
    * reads `refused` alone as an end.
    */
   readonly standing?: ImporterStanding;
+  /**
+   * The question the session's agent is waiting on (A7-Q): the replay's, then moved by the
+   * live `question` frames. `null` for none; absent where the server has not said.
+   */
+  readonly question?: PendingQuestion | null;
 }
 
 /** What the next message will do: the server's answer, with a refusal only on `refused`. */
@@ -207,6 +213,7 @@ export const historyOf = (view: ImporterConversationView): ImporterHistory => ({
   note: view.note,
   truncated: view.truncated,
   items: view.items,
+  question: view.question,
   standing:
     view.continuation === "refused"
       ? { continuation: "refused", refusal: view.refusal }

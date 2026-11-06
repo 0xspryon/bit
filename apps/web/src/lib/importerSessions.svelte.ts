@@ -69,8 +69,11 @@ import type {
   ImporterTurnAccepted,
   LiveConnection,
   LiveItem,
+  LiveQuestion,
   LiveUsage,
   ModelOptionSelection,
+  PendingQuestion,
+  QuestionAnswers,
   SteerUrgency,
 } from "@bit/contracts";
 import {
@@ -259,6 +262,17 @@ export interface ImporterActivity {
  * Absent in the state picker's scenarios, which never touch a server and answer with the
  * stand-in reply instead.
  */
+/** What the server did with an answer or a dismissal (A7-Q). */
+export type ImporterQuestionAnswer =
+  | { readonly _tag: "settled" }
+  | {
+      readonly _tag: "refused";
+      /** `QuestionRefused.reason`, or `other` for any other refusal. */
+      readonly reason: "settled" | "invalid" | "harness_unreachable" | "other";
+      readonly detail: string;
+    }
+  | { readonly _tag: "unanswered" };
+
 export interface ImporterServer {
   /**
    * Opens a conversation whose first turn is `text`, as the agent `agentId` — or as the
@@ -286,6 +300,20 @@ export interface ImporterServer {
    * harness is interrupted and the session stays open for the next message.
    */
   readonly stop: (importId: string) => Promise<ImporterStopAnswer>;
+  /**
+   * Answers, or dismisses, the question one import's agent is waiting on (A7-Q), by the
+   * harness's id for it. `settled` when the server passed it on; `refused` with the
+   * server's reason and sentence; `unanswered` when no server answered.
+   */
+  readonly answerQuestion: (
+    importId: string,
+    questionId: string,
+    answers: QuestionAnswers,
+  ) => Promise<ImporterQuestionAnswer>;
+  readonly dismissQuestion: (
+    importId: string,
+    questionId: string,
+  ) => Promise<ImporterQuestionAnswer>;
   /**
    * Moves one import's session onto another model of its pinned harness, or other options
    * of its model (A6 F4). Never another harness: that is a new session.
@@ -595,6 +623,13 @@ export class ImporterSessions {
    * none. Not {@link notice}: that line is about the draft beneath it, and a Stop is not.
    */
   stopFailure = $state<ErrorNotice | undefined>(undefined);
+  /** True while an answer or a dismissal of the session's question is with the server (A7-Q). */
+  questionBusy = $state(false);
+  /**
+   * An answer or a dismissal the server refused or did not answer, for the error dialog
+   * (A7-Q); `undefined` when there is none.
+   */
+  questionRefusal = $state<ErrorNotice | undefined>(undefined);
   /**
    * The agents a conversation can run as, for the composer's agent chip: the server's
    * registry when the page is a real target's, the mock one in the state picker's
@@ -787,6 +822,8 @@ export class ImporterSessions {
     this.#movedTo.clear();
     this.becameId = undefined;
     this.stopFailure = undefined;
+    this.questionBusy = false;
+    this.questionRefusal = undefined;
     this.pickerOpen = false;
     this.#sent = 0;
     this.#opening = undefined;
@@ -1008,6 +1045,8 @@ export class ImporterSessions {
     this.#movedTo.clear();
     this.becameId = undefined;
     this.stopFailure = undefined;
+    this.questionBusy = false;
+    this.questionRefusal = undefined;
     this.draft = "";
     this.files.clear();
     this.pickerOpen = false;
@@ -1406,9 +1445,21 @@ export class ImporterSessions {
    */
   noteConnection(frame: LiveConnection): void {
     const importId = frame.importId;
-    if (frame.state !== "restored" || importId === null) return;
+    if (importId === null) return;
     const session = this.sessions.find((each) => each.importId === importId);
     if (session === undefined) return;
+    if (frame.state === "closed") {
+      /*
+       * The server let the session go (A7-Q, from the chat shell's review 2): an end from
+       * another tab or over the API, a shutdown. The list is read again, so the session
+       * reads as ended or dormant and the composer says what the next message will do; and
+       * so is the replay, so a question it was waiting on reads as no longer answerable here.
+       */
+      void this.#server?.reread();
+      void this.#rereadHistory(session.id);
+      return;
+    }
+    if (frame.state !== "restored") return;
     this.#readMidTurn.add(importId);
     if (this.sending) return;
     void this.#rereadHistory(session.id);
@@ -1634,6 +1685,8 @@ export class ImporterSessions {
     session: ImporterSession,
     text: string,
     urgency: SteerUrgency,
+    /** `files: false` sends none of the composer's files (the question dock's message). */
+    options: { readonly files: boolean } = { files: true },
   ): Promise<void> {
     if (this.sending) return;
     this.sending = true;
@@ -1653,7 +1706,7 @@ export class ImporterSessions {
     const after = server.highWater();
     // The files go in the same request; the ones sent are taken out of the composer only
     // once the server has them, so a refusal leaves them attached beside the words.
-    const sending = this.files.items;
+    const sending = options.files ? this.files.items : [];
     const files = sending.map((item) => item.file);
     // The agent the chip picked goes with an opening message only: a later one is to a
     // conversation already pinned to its agent, which the server reads off the row.
@@ -2575,6 +2628,134 @@ export class ImporterSessions {
   /** Closes the error dialog a refused Stop opened. */
   dismissStopFailure(): void {
     this.stopFailure = undefined;
+  }
+
+  /* ── The question dock (A7-Q) ─────────────────────────────────────────────── */
+
+  /**
+   * The question the session on screen is waiting on, or `undefined`: the replay's answer
+   * (`ImporterConversationView.question`), moved by the live `question` frames since.
+   */
+  question = $derived<PendingQuestion | undefined>(
+    this.current?.history.question ?? undefined,
+  );
+
+  /**
+   * A live `question` frame (A7-Q): a question asked is put on its session; one answered or
+   * dismissed is taken off. One **withdrawn** — a Stop, the session let go, the harness
+   * forgetting it — is taken off and the replay read again, which offers it back as a
+   * message where a message would carry the session on (`answerability: "message"`).
+   */
+  noteQuestion(frame: LiveQuestion): void {
+    const importId = frame.importId;
+    if (importId === null) return;
+    const session = this.sessions.find((each) => each.importId === importId);
+    if (session === undefined) return;
+    if (frame.question !== null) {
+      const asked = frame.question;
+      this.#replace(session.id, (before) => ({
+        ...before,
+        history: { ...before.history, question: asked },
+      }));
+      return;
+    }
+    if (session.history.question?.questionId !== frame.questionId) return;
+    this.#replace(session.id, (before) => ({
+      ...before,
+      history: { ...before.history, question: null },
+    }));
+    if (frame.settled === "withdrawn") void this.#rereadHistory(session.id);
+  }
+
+  /**
+   * Sends the operator's answers to the question on screen (A7-Q). Taken off at once when
+   * the server passed them on; a refusal is said in the dialog, and one saying the agent no
+   * longer waits reads the replay again, so the dock offers the answers as a message.
+   */
+  async answerQuestion(answers: QuestionAnswers): Promise<void> {
+    await this.#settleQuestion("answer", answers);
+  }
+
+  /**
+   * Dismisses the question on screen (A7-Q): the agent is told the operator declined. A
+   * question that is no longer waiting natively (`message`, `not_resumable`) is only put
+   * away, so the replay stops offering it.
+   */
+  async dismissQuestion(): Promise<void> {
+    await this.#settleQuestion("dismiss", undefined);
+  }
+
+  async #settleQuestion(
+    how: "answer" | "dismiss",
+    answers: QuestionAnswers | undefined,
+  ): Promise<void> {
+    const server = this.#server;
+    const session = this.current;
+    const question = this.question;
+    const importId = session?.importId;
+    if (
+      server === undefined ||
+      session === undefined ||
+      question === undefined ||
+      importId === undefined ||
+      this.questionBusy
+    ) {
+      return;
+    }
+    this.questionBusy = true;
+    const answer =
+      how === "answer"
+        ? await server.answerQuestion(
+            importId,
+            question.questionId,
+            answers ?? {},
+          )
+        : await server.dismissQuestion(importId, question.questionId);
+    this.questionBusy = false;
+    if (this.#server !== server) return;
+    if (answer._tag === "settled") {
+      this.#replace(session.id, (before) =>
+        before.history.question?.questionId === question.questionId
+          ? { ...before, history: { ...before.history, question: null } }
+          : before,
+      );
+      return;
+    }
+    this.questionRefusal = {
+      title: how === "answer" ? "Answers not sent" : "Questions not dismissed",
+      sentence:
+        answer._tag === "refused"
+          ? answer.detail
+          : "No server answered at this address, so whether it was passed on is not known. Your answers are kept; try again once the server is back.",
+    };
+    // No longer waiting: the replay says what can be done instead.
+    if (answer._tag === "refused" && answer.reason === "settled") {
+      void this.#rereadHistory(session.id);
+    }
+  }
+
+  /**
+   * Sends the answers as an ordinary message (A7-Q's `message` fallback): the question is
+   * no longer waiting natively, but the session can be carried on. Posted like a message
+   * from the box, without the box's draft or files, which stay where they are.
+   */
+  sendAnswersAsMessage(text: string): void {
+    const session = this.current;
+    const server = this.#server;
+    if (session === undefined || server === undefined) return;
+    const question = this.question;
+    // Put away first, so the dock gives the box back as the message goes.
+    if (question !== undefined) {
+      this.#replace(session.id, (before) => ({
+        ...before,
+        history: { ...before.history, question: null },
+      }));
+    }
+    void this.#post(server, session, text, "queued", { files: false });
+  }
+
+  dismissQuestionRefusal(): void {
+    this.questionRefusal = undefined;
   }
 }
 

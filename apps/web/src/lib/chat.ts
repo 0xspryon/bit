@@ -1937,7 +1937,7 @@ export const usageScope = (
 export const connectionNote = (
   frame: Pick<LiveConnection, "state"> | undefined,
 ): string =>
-  frame === undefined || frame.state === "restored"
+  frame === undefined || frame.state === "restored" || frame.state === "closed"
     ? ""
     : frame.state === "reconnecting"
       ? "The harness's live narration was cut off; reconnecting. What it says meanwhile is read back from its transcript once the connection is up again."

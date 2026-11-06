@@ -20,7 +20,12 @@
  *
  * Plain TypeScript, so the rules here are tested without a browser; the shell arranges.
  */
-import type { MessageAttachmentView, SteerUrgency } from "@bit/contracts";
+import type {
+  MessageAttachmentView,
+  PendingQuestion,
+  QuestionAnswers,
+  SteerUrgency,
+} from "@bit/contracts";
 
 import type { AttachmentLoader } from "./attachmentFiles";
 import { durationLabel, turnEndedAt, turnModels, type ChatGroup } from "./chat";
@@ -218,23 +223,40 @@ export interface ClosedChatComposer {
 }
 
 /**
- * A question the agent is waiting on (A7-Q, E3/E4), as far as the shell needs to know of it.
+ * A question the agent is waiting on (A7-Q, E3/E4): what the dock draws and what it does.
  *
  * **Present is "the dock holds the composer's slot".** While it is set, the shell draws the
- * chat's `dock` snippet *in place of* the box — open or closed — in the same column, at the
- * same width, with Stop and the elapsed clock where they were (E3: "the composer's slot
- * becomes the question dock … nothing above it moves"). The adapter takes it away to give
- * the composer back: when the question is answered (the server says it no longer waits), and
- * when the operator dismisses the dock, which the shell asks for on Esc through
- * {@link dismiss}. A dismissed question still waits on the server; replying in the chat
- * instead is E3's "Esc reply in chat instead".
+ * question dock *in place of* the box — open or closed — in the same column, at the same
+ * width, with Stop and the elapsed clock where they were (E3: "the composer's slot becomes
+ * the question dock … nothing above it moves"). The adapter takes it away to give the
+ * composer back: when the question is answered or dismissed, or the agent stops waiting.
+ *
+ * Generic on purpose: the shell's own dock (`QuestionDock`) is drawn for any chat whose
+ * adapter sets this, so the goal, planner and worker chats get it by supplying a question.
  */
 export interface ChatQuestion {
+  /** The question, as the server says it, with whether it can still be answered. */
+  readonly pending: PendingQuestion;
+  /** Who asks, as a sentence's subject: "The importer". */
+  readonly asker: string;
+  /** True while an answer or a dismissal is with the server: the dock's controls wait. */
+  readonly busy: boolean;
+  /** Sends the answers (`live`). The adapter says a refusal through {@link refusal}. */
+  readonly answer: (answers: QuestionAnswers) => void;
   /**
-   * Gives the composer back without answering: Esc in the dock, or the dock's own control.
-   * The adapter clears {@link ChatSession.question}; the shell then puts focus in the box.
+   * Sends the answers as an ordinary message (`message`): absent where this chat takes no
+   * message, and then a question no longer waiting can only be dismissed.
+   */
+  readonly sendAsMessage?: ((text: string) => void) | undefined;
+  /**
+   * Dismisses the question: Esc in the dock, or its own control. `live`: the agent is told
+   * the operator declined. Otherwise the question is put away. The shell then puts focus in
+   * the box.
    */
   readonly dismiss: () => void;
+  /** An answer or a dismissal the server refused, for the F2 dialog. */
+  readonly refusal?: ErrorNotice | undefined;
+  readonly dismissRefusal?: (() => void) | undefined;
 }
 
 /**

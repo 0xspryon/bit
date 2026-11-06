@@ -4066,7 +4066,12 @@ describe("the question dock's OpenCode half: forms (A7-Q)", () => {
         ],
         custom: true,
       },
-      { key: "q2", type: "string", description: "Anything else?", required: true },
+      {
+        key: "q2",
+        type: "string",
+        description: "Anything else?",
+        required: true,
+      },
     ],
   });
   /** An MCP elicitation's form: not a question this build draws. */
@@ -4110,7 +4115,10 @@ describe("the question dock's OpenCode half: forms (A7-Q)", () => {
       names,
     );
     expect(other.detail._tag).toBe("opaque");
-    const settled = (type: string, here: ReadonlyMap<string, never> | Map<string, "dismissed">) =>
+    const settled = (
+      type: string,
+      here: ReadonlyMap<string, never> | Map<string, "dismissed">,
+    ) =>
       openCodeNarration(
         { type, data: { id: "frm_1", sessionID: "ses_1", answer: {} } },
         names,
@@ -4140,15 +4148,13 @@ describe("the question dock's OpenCode half: forms (A7-Q)", () => {
     const { layer, recorded } = clientWith(stub);
     return Effect.runPromise(
       Effect.scoped(
-        Effect.provide(
-          Effect.result(Effect.flatMap(AgentHarness, use)),
-          layer,
-        ),
+        Effect.provide(Effect.result(Effect.flatMap(AgentHarness, use)), layer),
       ),
     ).then((answer) => ({ answer, recorded }));
   };
   const listing = (url: string, init: RequestInit | undefined) =>
-    url.endsWith("/api/session/ses_1/form") && (init?.method ?? "GET") === "GET";
+    url.endsWith("/api/session/ses_1/form") &&
+    (init?.method ?? "GET") === "GET";
 
   test("pending questions are the session's question forms, read from the server; a session it does not have waits on nothing", async () => {
     const { answer } = await asking(

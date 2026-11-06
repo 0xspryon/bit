@@ -159,9 +159,7 @@ export const unansweredQuestion = (
     const callId = item.callId;
     const result = items
       .slice(index + 1)
-      .find(
-        (later) => later.kind === "tool.result" && later.callId === callId,
-      );
+      .find((later) => later.kind === "tool.result" && later.callId === callId);
     if (result !== undefined) {
       if (result.outcome !== "failed") return undefined;
       if ((result.output ?? "").includes(QUESTION_DISMISSED_MESSAGE)) {
@@ -216,8 +214,7 @@ export const transcriptQuestionId = (callId: string): string =>
 export const waitingWords = (question: HarnessQuestion): string => {
   const [first] = question.fields;
   const count = question.fields.length;
-  const lead =
-    count === 1 ? "a question" : `${String(count)} questions`;
+  const lead = count === 1 ? "a question" : `${String(count)} questions`;
   const about = first.header ?? first.question;
   const words = `${lead} — ${about}`;
   return words.length > 160 ? `${words.slice(0, 159)}…` : words;

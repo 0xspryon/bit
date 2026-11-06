@@ -3098,9 +3098,17 @@ describe("the server's connection to the importer's narration (U13 review 5)", (
     expect(text()).toContain("could not be reconnected");
 
     // One that resumed it opened a new stream, which never broke and so never says
-    // `restored`: the note about the old one goes.
-    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
-      ok(importerTurnAccepted({ targetId, importId, conversation: "resumed" }));
+    // `restored`: the note about the old one goes. A resume answers with a **new** import
+    // id (one id per authority period), so it is the id the message was sent to that is
+    // forgotten, not only the answer's (chat shell review 2).
+    fake.onSendImporterMessage = (_baseUrl, targetId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId: "imp_resumed",
+          conversation: "resumed",
+        }),
+      );
     await say("Carry on");
     expect(app.liveConnection["import:imp_newest"]).toBeUndefined();
     expect(text()).not.toContain("could not be reconnected");

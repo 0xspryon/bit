@@ -16,15 +16,15 @@
    *   and caption. A model switch is a picker over the app's harnesses, so it stays the
    *   chat's (see the plan note for what the other roles need).
    * - `below` — under the composer: the importer's starters.
-   * - `dock` — **A7-Q's question dock** (E3/E4), drawn **in the composer's slot** while the
-   *   session has a `question`: the box — open, blocked or closed — is not drawn, and the
+   * - `dock` — replaces the shell's own **question dock** (`QuestionDock`, A7-Q's E3/E4),
+   *   which is drawn **in the composer's slot** for any chat whose session has a `question`: the box — open, blocked or closed — is not drawn, and the
    *   dock is, in the same column at the same width, with Stop and the elapsed clock where
    *   they were and the sentences above the box kept. E3: "the composer's slot becomes the
    *   question dock — same width, same border, nothing above it moves; Esc gives the
    *   composer back". Esc in the dock asks the adapter to dismiss the question
    *   (`ChatQuestion.dismiss`); once the adapter takes `question` away — dismissed, or
    *   answered — the box is drawn again and, if focus went with the dock, gets it back.
-   *   Empty until A7-Q.
+   *   Focus that was in the box's column when the dock arrived goes into the dock.
    * - `controls` — beside Stop: **E7's "Stop all"** for a session's sub-agents. Drawn
    *   whether or not Stop is; the chat decides when its control applies. Empty until A7-S.
    * - `chip` — **E8's sub-agents chip**, which is not drawn in the chat at all: it is
@@ -71,6 +71,7 @@
   import ChatComposer from "./ChatComposer.svelte";
   import CopyButton from "./CopyButton.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
+  import QuestionDock from "./QuestionDock.svelte";
   import MarkedText from "./MarkedText.svelte";
   import StreamCursor from "./StreamCursor.svelte";
 
@@ -130,8 +131,11 @@
   let source = $derived(session.composer);
   /** The box the operator writes in, when there is one: not closed, not absent. */
   let open = $derived(openComposer(session));
-  /** The question holding the composer's slot (A7-Q), when there is a dock to draw it in. */
-  let question = $derived(dock === undefined ? undefined : session.question);
+  /**
+   * The question holding the composer's slot (A7-Q). The shell's own dock draws it unless
+   * the chat passes a `dock` of its own.
+   */
+  let question = $derived(session.question);
   let turn = $derived(session.turn);
   let working = $derived(turn.working);
 
@@ -177,6 +181,9 @@
    * operator has put elsewhere meanwhile is left where it is.
    */
   let wasDocked = false;
+  /** The dock's region, for focus going in, and the control a refusal dialog returns to. */
+  let dockRegion = $state<HTMLElement | undefined>(undefined);
+  let dockFocus = $state<HTMLElement | null>(null);
   $effect(() => {
     const docked = question !== undefined;
     if (wasDocked && !docked) {
@@ -184,6 +191,36 @@
         const at = document.activeElement;
         if (at === null || at === document.body) composerView?.focus();
       });
+    }
+    /*
+     * The dock takes a focused box's place (A7-Q, from the chat shell's review): focus that
+     * was in the composer's column — the box, its `+`, Send — went to `<body>` with it, so
+     * it goes into the dock, on the first question's first control. Focus elsewhere is left.
+     */
+    if (!wasDocked && docked) {
+      const before = document.activeElement;
+      const fromBox =
+        before !== null &&
+        (before === document.body ||
+          (before instanceof HTMLElement && before.closest(".stack") !== null));
+      if (fromBox) {
+        void tick().then(() => {
+          const at = document.activeElement;
+          if (
+            at !== null &&
+            at !== document.body &&
+            !dockRegion?.contains(at)
+          ) {
+            return;
+          }
+          // The current question's first control, else the dock's first button.
+          (
+            dockRegion?.querySelector<HTMLElement>(
+              ".current input:not(:disabled), .current textarea:not(:disabled)",
+            ) ?? dockRegion?.querySelector<HTMLElement>("button:not(:disabled)")
+          )?.focus();
+        });
+      }
     }
     wasDocked = docked;
   });
@@ -407,14 +444,26 @@
               {notice.text}
             </p>
           {/each}
-          {#if question !== undefined && dock !== undefined}
+          {#if question !== undefined}
             <!--
             A7-Q's question dock (E3/E4), in the box's slot: the box is not drawn while the
             agent waits on a question, open or closed alike — a planner or a worker can ask
             one too. Esc gives the composer back (`ondockkeydown`).
           -->
-            <div class="dock" role="presentation" onkeydown={ondockkeydown}>
-              {@render dock(question)}
+            <div
+              class="dock"
+              role="presentation"
+              bind:this={dockRegion}
+              onkeydown={ondockkeydown}
+              onfocusin={(event) => (dockFocus = event.target as HTMLElement)}
+            >
+              {#if dock !== undefined}
+                {@render dock(question)}
+              {:else}
+                {#key question.pending.questionId}
+                  <QuestionDock {question} />
+                {/key}
+              {/if}
             </div>
           {:else if session.composer !== undefined}
             <ChatComposer
@@ -449,6 +498,15 @@
     {...open.files.refusal}
     opener={attachButton ?? composerView?.input() ?? null}
     ondismiss={() => open?.files?.dismiss()}
+  />
+{/if}
+
+{#if question?.refusal !== undefined}
+  <!-- An answer or a dismissal the server refused (A7-Q). -->
+  <ErrorDialog
+    {...question.refusal}
+    opener={dockFocus?.isConnected === true ? dockFocus : null}
+    ondismiss={() => question?.dismissRefusal?.()}
   />
 {/if}
 

@@ -335,25 +335,25 @@ and bit's own routes).**
   gate's reason after the answer hook returns. So the gate and the mode are unchanged; the
   `canUseTool` registered answers `deny` to anything and is never asked. A 70 s wait was fine
   (the hook's timeout is a day).
-- **Claude Code.** *Waiting*: the call parks in the hook; bit lists it from its own map, so a
-  reload reads it back `live`. *Answer*: the tool result is "Your questions have been answered:
-  …" and the model used the answers. *Dismiss* (hook `deny` with bit's sentence): the model read
-  it as the tool's error and replied "You declined to answer." *Stop*: `interrupt()` aborts the
+- **Claude Code.** _Waiting_: the call parks in the hook; bit lists it from its own map, so a
+  reload reads it back `live`. _Answer_: the tool result is "Your questions have been answered:
+  …" and the model used the answers. _Dismiss_ (hook `deny` with bit's sentence): the model read
+  it as the tool's error and replied "You declined to answer." _Stop_: `interrupt()` aborts the
   hook's signal within ~20 ms; the transcript stores "The user doesn't want to proceed with this
   tool use…" and the interrupt marker; the turn ends `aborted_tools`. The request is gone and the
-  session continues: **`message`**. *bit restart*: the CLI dies with bit; the call is replayed as
+  session continues: **`message`**. _bit restart_: the CLI dies with bit; the call is replayed as
   "[Tool call interrupted …]", and bit's startup continuation ("[bit] This server restarted …")
   resumes the session, so the question is moved past (offered as `message` only when no
   continuation ran). A session the operator ended, or one a harness forgot: **`not_resumable`**.
-- **OpenCode.** *Waiting*: `form.created` arrives on the filtered stream, `session.form.list`
-  reads it back `live`. *Answer*: `session.form.reply`; result "User has answered your
-  questions: …". *Dismiss*: `session.form.cancel` **with a message** makes the tool fail with
+- **OpenCode.** _Waiting_: `form.created` arrives on the filtered stream, `session.form.list`
+  reads it back `live`. _Answer_: `session.form.reply`; result "User has answered your
+  questions: …". _Dismiss_: `session.form.cancel` **with a message** makes the tool fail with
   that message and the model carries on ("You declined…"); without a message the tool dies and
-  ends the step. *Stop*: the form is cancelled, the tool fails "Tool execution interrupted",
+  ends the step. _Stop_: the form is cancelled, the tool fails "Tool execution interrupted",
   "Step interrupted"; a later reply to it is `FormNotFoundError`/settled: **`message`**, and the
-  answers sent as an ordinary message were used by the model. *OpenCode shut down* (bit
+  answers sent as an ordinary message were used by the model. _OpenCode shut down_ (bit
   restarting its own `opencode serve`): the form is cancelled, "Interaction cancelled because the
-  location shut down". *OpenCode killed* (SIGKILL): bit's form list fails ("harness
+  location shut down". _OpenCode killed_ (SIGKILL): bit's form list fails ("harness
   unreachable"), and the restarted server stores the call as "Tool execution interrupted:
   question". Either way the request is gone: **`message`**; after bit's restart continuation GLM
   re-asked the question by itself, under the new import, `live` again.

@@ -11,7 +11,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { flushSync, mount, unmount } from "svelte";
 
-import type { LiveItem } from "@bit/contracts";
+import type {
+  LiveItem,
+  QuestionAnswerability,
+  QuestionField,
+} from "@bit/contracts";
 
 import { click, settle } from "./dom";
 
@@ -37,6 +41,9 @@ interface Options {
   readonly since?: number;
   readonly elapsedLead?: string;
   readonly items?: readonly LiveItem[];
+  readonly fields?: readonly QuestionField[];
+  readonly answerability?: QuestionAnswerability;
+  readonly canMessage?: boolean;
 }
 
 /** The fake chat, mounted; `calls` is what the shell asked the adapter to do. */
@@ -57,6 +64,9 @@ const shell = async (options: Options = {}) => {
     readonly working?: boolean;
     readonly stopping?: boolean;
     readonly asking?: boolean;
+    readonly shown?: boolean;
+    readonly busy?: boolean;
+    readonly refused?: string | undefined;
   }): Promise<void> => {
     chat.set(next);
     await settle();
@@ -312,10 +322,14 @@ describe("A7-Q's question dock takes the composer's slot (E3)", () => {
     );
   });
 
-  test("a question with no dock to draw it in leaves the box, and a chat with no dock has no region", async () => {
+  test("a chat that passes no dock of its own gets the shell's question dock, and one asking nothing has no region", async () => {
     const asked = await shell({ asking: true });
-    expect(box(asked.root)).not.toBeNull();
-    expect(asked.root.querySelector(".dock")).toBeNull();
+    expect(box(asked.root)).toBeNull();
+    expect(
+      asked.root.querySelector(".stack > .dock > section.question-dock"),
+    ).not.toBeNull();
+    const quiet = await shell({});
+    expect(quiet.root.querySelector(".dock")).toBeNull();
   });
 });
 
@@ -339,18 +353,18 @@ describe("the hosting points for A7-S (E7, E8)", () => {
     expect(root.querySelector(".chat-shell .fake-chip")).toBeNull();
   });
 
-  test("a chip leaves the title bar with its chat", async () => {
-    const holder = document.body.appendChild(document.createElement("div"));
-    const chat = mount(FakeChatShell, {
-      target: holder,
-      props: { calls: [], cards: true },
-    });
-    flushSync();
-    await settle();
-    expect(holder.querySelector(".fake-bar .fake-chip")).not.toBeNull();
-    await unmount(chat);
-    holder.remove();
-    expect(document.querySelector(".fake-chip")).toBeNull();
+  test("a chip leaves the title bar with its chat, while the bar stays", async () => {
+    // The chat in an `{#if}` beside a bar that stays mounted (chat shell review 2): a chip
+    // that `place` never took back would stay in the bar after the chat went.
+    const { root, set } = await shell({ cards: true });
+    const bar = root.querySelector(".fake-bar");
+    expect(bar?.querySelector(".fake-chip")).not.toBeNull();
+    await set({ shown: false });
+    expect(root.querySelector(".chat-shell")).toBeNull();
+    expect(root.querySelector(".fake-bar") === bar).toBe(true);
+    expect(bar?.querySelector(".fake-chip")).toBeNull();
+    await set({ shown: true });
+    expect(root.querySelector(".fake-bar .fake-chip")).not.toBeNull();
   });
 
   test("without the hook a sub-agent is U14's entry, and the bar holds nothing", async () => {

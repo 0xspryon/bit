@@ -53,6 +53,7 @@ import {
   type IntentDraft,
   type LiveFrame,
   type ModelOptionSelection,
+  type QuestionAnswers,
   type ScopeEntryDraft,
   type ScopeImportDraft,
   type ScopeLabelDraft,
@@ -301,6 +302,8 @@ export const REFUSAL_TAGS = new Set([
   // the session: a sentence the error modal prints. As transport trouble it would say "No
   // server answered" about a stop the server tried and could not confirm.
   "ConversationStopRefused",
+  // A7-Q: a question no longer waiting, answers that do not fit, a harness that did not answer.
+  "QuestionRefused",
 ]);
 
 /**
@@ -1105,6 +1108,41 @@ export const server = {
     run(
       Effect.flatMap(client(baseUrl), (api) =>
         api.fleet.stopImporterTurn({ params: { targetId, importId } }),
+      ),
+    ),
+
+  /**
+   * Answers the question one import's agent is waiting on (A7-Q), by the harness's id for
+   * it, with the answers by field key. A question no longer waiting is `QuestionRefused`.
+   */
+  answerImporterQuestion: (
+    baseUrl: string,
+    targetId: string,
+    importId: string,
+    questionId: string,
+    answers: QuestionAnswers,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.answerImporterQuestion({
+          params: { targetId, importId, questionId },
+          payload: { answers },
+        }),
+      ),
+    ),
+
+  /** Dismisses the question one import's agent is waiting on (A7-Q): the agent is told. */
+  dismissImporterQuestion: (
+    baseUrl: string,
+    targetId: string,
+    importId: string,
+    questionId: string,
+  ) =>
+    run(
+      Effect.flatMap(client(baseUrl), (api) =>
+        api.fleet.dismissImporterQuestion({
+          params: { targetId, importId, questionId },
+        }),
       ),
     ),
 

@@ -102,6 +102,7 @@ import {
   type ImporterScenario,
   type ImporterSent,
   type ImporterActivity,
+  type ImporterQuestionAnswer,
   type ImporterServer,
 } from "./importerSessions.svelte";
 import {
@@ -2840,12 +2841,19 @@ export class App {
   #importerServer(targetId: string): ImporterServer {
     const answer = (
       call: Awaited<ReturnType<ServerClient["sendImporterMessage"]>>,
+      /** The import the message was addressed to, for a follow-up; absent for an opening. */
+      addressed?: string,
     ): ImporterSent => {
       // A message opens a session, or reopens one this server had let go (A7 U8b review).
       this.#agentSessionsMoved(targetId);
       if (call._tag === "Ok") {
         // Opened or resumed: a new narration stream, which has not broken (U13 review 6).
+        // The notice standing is the one about the import the message was sent to: a resume
+        // or a reopen answers with a **new** import id (one id per authority period), so
+        // forgetting only the answer's id left the old one's "could not be reconnected"
+        // over the thread (chat shell review 2).
         if (call.value.conversation !== "continued") {
+          if (addressed !== undefined) this.#forgetConnection(addressed);
           this.#forgetConnection(call.value.importId);
         }
         return { _tag: "accepted", turn: call.value };
@@ -2866,6 +2874,24 @@ export class App {
         };
       }
       // Not a refusal: the server may have taken it before the answer was lost (U8 review 4).
+      return { _tag: "unanswered" };
+    };
+    /** An answer or a dismissal's call, as the importer's state reads it (A7-Q). */
+    const questionAnswer = (
+      call: Awaited<ReturnType<ServerClient["answerImporterQuestion"]>>,
+      fallback: string,
+    ): ImporterQuestionAnswer => {
+      this.#agentSessionsMoved(targetId);
+      if (call._tag === "Ok") return { _tag: "settled" };
+      if (call._tag === "Refused") {
+        if (call.error._tag === "Unauthenticated") this.signOut("expired");
+        return {
+          _tag: "refused",
+          reason:
+            call.error._tag === "QuestionRefused" ? call.error.reason : "other",
+          detail: this.#refusalText(call.error, fallback),
+        };
+      }
       return { _tag: "unanswered" };
     };
     return {
@@ -2909,6 +2935,27 @@ export class App {
           ? { ...sent, modelOptions: importOptions ?? [] }
           : sent;
       },
+      answerQuestion: async (importId, questionId, answers) =>
+        questionAnswer(
+          await this.client.answerImporterQuestion(
+            this.serverUrl,
+            targetId,
+            importId,
+            questionId,
+            answers,
+          ),
+          "The answers were not sent.",
+        ),
+      dismissQuestion: async (importId, questionId) =>
+        questionAnswer(
+          await this.client.dismissImporterQuestion(
+            this.serverUrl,
+            targetId,
+            importId,
+            questionId,
+          ),
+          "The questions were not dismissed.",
+        ),
       /**
        * Moves one import onto another model of its harness (A6 F4). An expired session signs
        * out; any other refusal, or no server answering, is a sentence for the error dialog.
@@ -2948,6 +2995,7 @@ export class App {
             urgency,
             files,
           ),
+          importId,
         ),
       /**
        * Stops one import's turn and keeps the conversation (A6 F5). An expired session signs
@@ -5991,6 +6039,20 @@ export class App {
        */
       const scope = usageScope(frame);
       if (scope === undefined) return;
+      if (frame.state === "closed") {
+        // The server let the session go (A7-Q, chat shell review 2): nothing is retrying, so
+        // a notice about its connection is over, and the list's liveness has moved.
+        if (scope in this.liveConnection) {
+          this.liveConnection = Object.fromEntries(
+            Object.entries(this.liveConnection).filter(
+              ([key]) => key !== scope,
+            ),
+          );
+        }
+        this.importer.noteConnection(frame);
+        this.#agentSessionsMoved(targetId);
+        return;
+      }
       this.liveConnection = { ...this.liveConnection, [scope]: frame };
       this.importer.noteConnection(frame);
       if (
@@ -6004,8 +6066,10 @@ export class App {
       return;
     }
     if (frame._tag === "question") {
-      // An agent asked the operator something, or stopped waiting (A7-Q): Needs you and the
-      // rail's count move now, not at the next quiet moment.
+      // An agent asked the operator something, or stopped waiting (A7-Q): its chat docks or
+      // gives the box back, and Needs you and the rail's count move now, not at the next
+      // quiet moment.
+      this.importer.noteQuestion(frame);
       this.#agentSessionsMoved(targetId);
       return;
     }

@@ -139,7 +139,8 @@ export interface AgentSessionSources {
    * (A7-Q): from the narration bus's questions (`RunNarrations.waiting`), never a harness
    * call. Absent: nobody waits.
    */
-  readonly waiting?: ((subject: NarrationSubject) => string | undefined) | undefined;
+  readonly waiting?:
+    ((subject: NarrationSubject) => string | undefined) | undefined;
 }
 
 /** A row before it is placed on a page: everything but its group and its title. */

@@ -4688,9 +4688,11 @@ export const claudeCodeHarness = (
       const pendingQuestions: AgentHarness["Service"]["pendingQuestions"] = (
         sessionId,
       ) =>
-        Effect.sync(() => [
-          ...(sessions.get(sessionId)?.questions.values() ?? []),
-        ].map((held) => held.question));
+        Effect.sync(() =>
+          [...(sessions.get(sessionId)?.questions.values() ?? [])].map(
+            (held) => held.question,
+          ),
+        );
 
       const answerQuestion: AgentHarness["Service"]["answerQuestion"] = (
         sessionId,
@@ -4844,7 +4846,8 @@ const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
   timeout: QUESTION_HOOK_TIMEOUT_SECONDS,
   hooks: [
     (hookInput, toolUseId, { signal }) => {
-      if (hookInput.hook_event_name !== "PreToolUse") return Promise.resolve({});
+      if (hookInput.hook_event_name !== "PreToolUse")
+        return Promise.resolve({});
       const input = hookInput.tool_input;
       const id = toolUseId ?? hookInput.tool_use_id;
       const fields = questionFieldsOfInput("claude-code", input);

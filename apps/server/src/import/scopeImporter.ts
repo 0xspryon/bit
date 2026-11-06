@@ -932,20 +932,20 @@ export class ScopeImporter extends Context.Service<
          */
         const closed = Effect.suspend(() =>
           narrations.publish({
-          targetId: input.targetId,
-          subject: { _tag: "import", importId: input.importId },
-          harnessSessionId: input.sessionId,
-          entry: {
-            type: "bit.connection.closed",
-            sequence: undefined,
-            at: Date.now(),
-            outcome: undefined,
-            detail: {
-              _tag: "connection",
-              state: "closed",
-              reason: "this server stopped holding the session",
+            targetId: input.targetId,
+            subject: { _tag: "import", importId: input.importId },
+            harnessSessionId: input.sessionId,
+            entry: {
+              type: "bit.connection.closed",
+              sequence: undefined,
+              at: Date.now(),
+              outcome: undefined,
+              detail: {
+                _tag: "connection",
+                state: "closed",
+                reason: "this server stopped holding the session",
+              },
             },
-          },
           }),
         );
         const outcome = yield* Effect.result(
@@ -2790,7 +2790,10 @@ export class ScopeImporter extends Context.Service<
           yield* held.harness
             .dismissQuestion(held.sessionId, input.questionId)
             .pipe(Effect.mapError(questionRefusal(input.questionId)));
-          return { questionId: input.questionId, settled: "dismissed" as const };
+          return {
+            questionId: input.questionId,
+            settled: "dismissed" as const,
+          };
         });
 
       const stopTurn: ScopeImporter["Service"]["stopTurn"] = Effect.fn(

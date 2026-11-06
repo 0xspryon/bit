@@ -82,6 +82,7 @@
   import type {
     ChatSession,
     ChatWords,
+    ChatQuestion,
     ComposerNotice,
     OpenChatComposer,
   } from "../chatShell";
@@ -368,6 +369,27 @@
     },
     dismissStopFailure: () => importer.dismissStopFailure(),
     composer,
+    /*
+     * The question the importer waits on (A7-Q): the shell docks it in the box's place. Its
+     * answers go as a message when the native request is gone, unless no message can be sent
+     * to this session (ended, stranded, refused), when the dock reads only.
+     */
+    get question(): ChatQuestion | undefined {
+      const pending = importer.question;
+      if (pending === undefined) return undefined;
+      return {
+        pending,
+        asker: `The ${agentLabel.toLowerCase()}`,
+        busy: importer.questionBusy || importer.sending,
+        answer: (answers) => void importer.answerQuestion(answers),
+        sendAsMessage: blocked
+          ? undefined
+          : (text) => importer.sendAnswersAsMessage(text),
+        dismiss: () => void importer.dismissQuestion(),
+        refusal: importer.questionRefusal,
+        dismissRefusal: () => importer.dismissQuestionRefusal(),
+      };
+    },
     words: WORDS,
     get footer() {
       return { agent: agentLabel, model: session?.model ?? "" };

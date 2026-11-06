@@ -344,6 +344,7 @@ export const importerConversationView = (
     ],
     // Nothing queued in the live session by default (A6 U4 review).
     queued: [],
+    question: null,
     truncated: false,
     omittedBlank: 0,
     at: AT,
@@ -1385,6 +1386,26 @@ export class FakeServer implements ServerClient {
       detail: "Stopped the turn running in this session.",
     });
 
+  /** An answer the harness took (A7-Q). */
+  onAnswerImporterQuestion: (
+    ...args: Parameters<ServerClient["answerImporterQuestion"]>
+  ) => Answer<"answerImporterQuestion"> = (
+    _baseUrl,
+    _targetId,
+    _importId,
+    questionId,
+  ) => ok({ questionId, settled: "answered" });
+
+  /** A dismissal the harness took (A7-Q). */
+  onDismissImporterQuestion: (
+    ...args: Parameters<ServerClient["dismissImporterQuestion"]>
+  ) => Answer<"dismissImporterQuestion"> = (
+    _baseUrl,
+    _targetId,
+    _importId,
+    questionId,
+  ) => ok({ questionId, settled: "dismissed" });
+
   onStopGoalTurn: (
     ...args: Parameters<ServerClient["stopGoalTurn"]>
   ) => Answer<"stopGoalTurn"> = (_baseUrl, _targetId, goalId) =>
@@ -1607,6 +1628,20 @@ export class FakeServer implements ServerClient {
   ) =>
     this.record("switchImporterModel", args, () =>
       this.onSwitchImporterModel(...args),
+    );
+
+  answerImporterQuestion = (
+    ...args: Parameters<ServerClient["answerImporterQuestion"]>
+  ) =>
+    this.record("answerImporterQuestion", args, () =>
+      this.onAnswerImporterQuestion(...args),
+    );
+
+  dismissImporterQuestion = (
+    ...args: Parameters<ServerClient["dismissImporterQuestion"]>
+  ) =>
+    this.record("dismissImporterQuestion", args, () =>
+      this.onDismissImporterQuestion(...args),
     );
 
   stopGoalTurn = (...args: Parameters<ServerClient["stopGoalTurn"]>) =>

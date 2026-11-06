@@ -1010,7 +1010,9 @@ export const openCodeFormAnswer = (
     question.fields.flatMap((field): [string, string | string[]][] => {
       const given = answers[field.key] ?? [];
       if (given.length === 0) return [];
-      return [[field.key, field.kind === "any" ? [...given] : (given[0] ?? "")]];
+      return [
+        [field.key, field.kind === "any" ? [...given] : (given[0] ?? "")],
+      ];
     }),
   );
 

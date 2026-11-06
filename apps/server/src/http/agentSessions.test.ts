@@ -137,7 +137,9 @@ describe("an importer session", () => {
           { ...importer, held: false, latestImportId: "imp_gone" },
         ],
         waiting: (subject) => {
-          asked.push(subject._tag === "import" ? subject.importId : subject._tag);
+          asked.push(
+            subject._tag === "import" ? subject.importId : subject._tag,
+          );
           return "2 questions — Hosts";
         },
       }),
