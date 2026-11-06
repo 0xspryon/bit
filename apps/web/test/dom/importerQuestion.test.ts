@@ -294,6 +294,116 @@ describe("the importer's question dock (A7-Q)", () => {
     expect(fake.countOf("importerMessages")).toBe(asked + 1);
   });
 
+  test("a dismissal the harness could not be told of still puts the dock away, and says the agent was not told", async () => {
+    const fake = new FakeServer();
+    await continueWith(fake, QUESTION());
+    fake.onDismissImporterQuestion = (
+      _baseUrl,
+      _targetId,
+      _importId,
+      questionId,
+    ) =>
+      refused(
+        new QuestionRefused({
+          questionId,
+          reason: "harness_unreachable",
+          detail:
+            "the harness did not answer (connection refused), so whether the agent was told you declined is not known.",
+        }),
+      );
+    expect(dock()).not.toBeNull();
+    click(button("Dismiss these questions"));
+    await settle();
+    expect(fake.countOf("dismissImporterQuestion")).toBe(1);
+    // The box is back: the dock no longer holds it hostage to a harness that is down.
+    expect(dock()).toBeNull();
+    expect(document.querySelector(".importer .stack textarea")).not.toBeNull();
+    // Said above the box, as an alert: the dock's own dialog went with the dock.
+    expect(document.querySelector("[role=alertdialog]")).toBeNull();
+    const said = document.querySelector(".importer .stack > .notice.refusal");
+    expect(said?.getAttribute("role")).toBe("alert");
+    expect(said?.textContent).toContain(
+      "Questions put away, but the agent was not told: the harness did not answer (connection refused)",
+    );
+  });
+
+  test("an answer the harness could not take keeps the dock and the answers", async () => {
+    const fake = new FakeServer();
+    await continueWith(fake, QUESTION());
+    fake.onAnswerImporterQuestion = (
+      _baseUrl,
+      _targetId,
+      _importId,
+      questionId,
+    ) =>
+      refused(
+        new QuestionRefused({
+          questionId,
+          reason: "harness_unreachable",
+          detail:
+            "the harness did not answer (x). Your answers are kept; try again.",
+        }),
+      );
+    click(radios()[0]!);
+    await settle();
+    click(button("Send 1 answer"));
+    await settle();
+    expect(fake.countOf("answerImporterQuestion")).toBe(1);
+    expect(dock()).not.toBeNull();
+    expect(radios()[0]?.checked).toBe(true);
+    expect(document.querySelector("[role=alertdialog]")?.textContent).toContain(
+      "Answers not sent",
+    );
+  });
+
+  test("a lost connection reads the rail's count again: the server no longer counts its question", async () => {
+    const fake = new FakeServer();
+    const app = await continueWith(fake);
+    fake.watch.send(liveOpened());
+    fake.onAgentSessions = () =>
+      ok(
+        agentSessionsPage([], {
+          counts: { active: 1, ended: 0, all: 1, needsYou: 1 },
+        }),
+      );
+    fake.watch.send(frame({ question: QUESTION() }));
+    await settle();
+    expect(app.agentSessionCounts?.needsYou).toBe(1);
+    fake.onAgentSessions = () =>
+      ok(
+        agentSessionsPage([], {
+          counts: { active: 1, ended: 0, all: 1, needsYou: 0 },
+        }),
+      );
+    const reconnecting = fake.countOf("agentSessions");
+    fake.watch.send({
+      _tag: "connection",
+      state: "reconnecting",
+      detail: "socket",
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: "imp_newest",
+      at: Date.now(),
+    });
+    await settle();
+    // A break alone is not a reason: the stream may be back in a moment.
+    expect(fake.countOf("agentSessions")).toBe(reconnecting);
+    fake.watch.send({
+      _tag: "connection",
+      state: "lost",
+      detail: "socket",
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: "imp_newest",
+      at: Date.now(),
+    });
+    await settle();
+    expect(fake.countOf("agentSessions")).toBe(reconnecting + 1);
+    expect(app.agentSessionCounts?.needsYou).toBe(0);
+  });
+
   test("a closed session's frame clears a connection notice and reads the list and the replay again", async () => {
     const fake = new FakeServer();
     const app = await continueWith(fake);

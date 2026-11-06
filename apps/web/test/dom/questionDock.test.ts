@@ -107,6 +107,20 @@ describe("the dock in the composer's slot", () => {
     expect(document.activeElement === options(root)[0]).toBe(true);
   });
 
+  test("a question arriving is said in a live region, in the chat's own words, and goes with it", async () => {
+    const { root, set } = await asking({ asking: false });
+    const region = () => [
+      ...root.querySelectorAll(".stack > p.visually-hidden[role=status]"),
+    ];
+    // There before the question, so a reader hears the words change.
+    expect(region().length).toBe(1);
+    expect(text(region()[0] ?? null)).toBe("");
+    await set({ asking: true });
+    expect(text(region()[0] ?? null)).toBe("The agent asks 2");
+    await set({ asking: false });
+    expect(text(region()[0] ?? null)).toBe("");
+  });
+
   test("the header counts, the bar has one segment a question, and the region is named", async () => {
     const { root } = await asking();
     const region = dock(root);
@@ -295,6 +309,50 @@ describe("Jump to…, and Esc", () => {
     expect(document.activeElement === root.querySelector("textarea")).toBe(
       true,
     );
+  });
+
+  test("Esc in a written answer only leaves it, focus on the dock; a second Esc dismisses", async () => {
+    // The own-words row of a choose-one, then a your-words textarea: both kinds of box.
+    for (const kind of ["one", "text"] as const) {
+      const { root, calls } = await asking({
+        fields: [
+          kind === "one"
+            ? field({ key: "Which" })
+            : field({ key: "Notify whom", kind: "text", options: [] }),
+        ],
+      });
+      const box = root.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+        kind === "one" ? ".current input.own" : ".current textarea",
+      );
+      if (box === null) throw new Error("no answer box");
+      box.focus();
+      await write(box, "security@acme.test");
+      const first = press("Escape");
+      await settle();
+      // Declining cannot be undone: the words are not thrown away by one key.
+      expect(first.defaultPrevented).toBe(true);
+      expect(calls.join(",")).toBe("");
+      expect(root.querySelector(".stack > .dock")).not.toBeNull();
+      expect(document.activeElement === dock(root)).toBe(true);
+      expect(box.value).toBe("security@acme.test");
+      press("Escape");
+      await settle();
+      expect(calls.join(",")).toBe("dismiss");
+      for (const each of cleanups) each();
+      cleanups = [];
+    }
+  });
+
+  test("Esc in an empty answer box dismisses at once, as anywhere else in the dock", async () => {
+    const { root, calls } = await asking({
+      fields: [field({ key: "Notify whom", kind: "text", options: [] })],
+    });
+    const box = root.querySelector<HTMLTextAreaElement>(".current textarea");
+    box?.focus();
+    await write(box!, "   ");
+    press("Escape");
+    await settle();
+    expect(calls.join(",")).toBe("dismiss");
   });
 
   test("the header's dismiss says what it does, and does it", async () => {

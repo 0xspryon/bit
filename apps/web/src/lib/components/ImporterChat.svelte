@@ -290,6 +290,10 @@
     sendQueuedTitle:
       "Send to the importer, queued: it reads this once it reaches a break in the work it is doing",
     countTitle: "Characters in this message, of the most the importer takes",
+    questionsAsked: (count) =>
+      count === 1
+        ? "The importer asks a question"
+        : `The importer asks ${String(count)} questions`,
   };
 
   /**

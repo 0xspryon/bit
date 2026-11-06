@@ -6055,6 +6055,9 @@ export class App {
       }
       this.liveConnection = { ...this.liveConnection, [scope]: frame };
       this.importer.noteConnection(frame);
+      // A lost harness no longer counts a question in Needs you (A7-Q review 1: the
+      // server's waiting set lets it go), so the rail's count is read again now.
+      if (frame.state === "lost") this.#agentSessionsMoved(targetId);
       if (
         frame.state === "restored" &&
         frame.goalId !== null &&

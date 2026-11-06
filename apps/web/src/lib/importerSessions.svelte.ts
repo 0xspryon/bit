@@ -2713,12 +2713,33 @@ export class ImporterSessions {
         : await server.dismissQuestion(importId, question.questionId);
     this.questionBusy = false;
     if (this.#server !== server) return;
-    if (answer._tag === "settled") {
+    const putAway = (): void =>
       this.#replace(session.id, (before) =>
         before.history.question?.questionId === question.questionId
           ? { ...before, history: { ...before.history, question: null } }
           : before,
       );
+    if (answer._tag === "settled") {
+      putAway();
+      return;
+    }
+    /*
+     * A dismissal the harness could not be told of (A7-Q review 1): the operator has
+     * declined, and a dock they cannot put away while the harness is down would hold the
+     * box hostage to it. So it is put away here, and the line above the box that comes back
+     * says the agent may not have heard — a line rather than the dialog, which is the
+     * dock's and goes with it; cleared, as any of those lines, by the next message or
+     * another session. Should the harness come back still waiting, its re-listing offers
+     * the question again (`noteQuestion`), which is the truth then.
+     */
+    if (
+      how === "dismiss" &&
+      answer._tag === "refused" &&
+      answer.reason === "harness_unreachable"
+    ) {
+      putAway();
+      this.notice = `Questions put away, but the agent was not told: ${answer.detail} If the harness answers again with them still waiting, they are offered again.`;
+      this.refused = true;
       return;
     }
     this.questionRefusal = {

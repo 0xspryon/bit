@@ -381,6 +381,30 @@ Not done in A7-Q: the transcript's row for the question call still reads "Ran 1 
 AskUserQuestion" rather than E3's "Asked N questions · waiting on you"; the session chip's
 warning dot (E6's "each surface keeps its own local signal") is not drawn.
 
+**Review 1 fixes (2026-11-06).**
+
+- **Plan mode is kept out of a question session.** Registering `canUseTool` offers
+  `EnterPlanMode` and `ExitPlanMode` as well as `AskUserQuestion`; plan mode leaves `dontAsk`,
+  and every gate-allowed Write and MCP call then reaches the refusing `canUseTool`, with
+  `ExitPlanMode` refused the same way. An `operatorQuestions` session therefore passes
+  `disallowedTools: ["EnterPlanMode", "ExitPlanMode"]`. Its init tool list then differs from a
+  plain session's by `AskUserQuestion` alone (31 → 32 tools, mode `dontAsk`, measured on
+  2.1.310 with bit's setting sources). Nothing changes outside those sessions. The answer hook
+  also checks `tool_name` itself.
+- **A lost harness no longer counts in Needs you.** `lost` clears a session's waiting
+  questions; `restored` re-lists what is still pending. A dismissal refused as
+  `harness_unreachable` still puts the dock away and says, above the box, that the agent was
+  not told. A replay that cannot reach the harness offers no question and its note says why:
+  a `message` built from what bit last heard would be sent to a harness that is not there.
+- **Decision: Esc in a written answer leaves the box; a second Esc dismisses.** While focus
+  is in a free-text answer (the own-words row, or a your-words box) that has words in it, Esc
+  only leaves the box, and focus moves to the dock. Esc anywhere else in the dock, or in an
+  empty box, dismisses at once, as E3 says. The reason: declining cannot be undone. A live
+  question's agent is told the operator declined, so a key pressed to leave a box must not
+  throw away what was written there.
+- A new question is announced in a visually hidden `role="status"` region, worded by the chat
+  (`ChatWords.questionsAsked`: "The importer asks 3 questions").
+
 **A7-S — Sub-agent cards and panel (M), A7-Q → A7-S. Decided by the operator (2026-11-05):
 replaces U14's "omit content".** A7's E7/E8.
 

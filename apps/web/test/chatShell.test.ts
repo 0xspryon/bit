@@ -126,6 +126,7 @@ describe("stopOffered", () => {
       sendTitle: "",
       sendQueuedTitle: "",
       countTitle: "",
+      questionsAsked: () => "",
     },
     footer: { agent: "", model: "" },
     sentNowTitle: "",

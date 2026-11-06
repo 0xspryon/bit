@@ -118,6 +118,11 @@ export interface ChatWords {
    * figure then set in bold after them. Absent: the figure alone.
    */
   readonly elapsedLead?: string | undefined;
+  /**
+   * What a screen reader hears when a question takes the box's slot (A7-Q review 1), by
+   * how many questions it holds: the importer's "The importer asks 3 questions".
+   */
+  readonly questionsAsked: (count: number) => string;
 }
 
 /**

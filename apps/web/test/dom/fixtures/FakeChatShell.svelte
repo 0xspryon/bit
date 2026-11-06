@@ -258,6 +258,7 @@
       sendTitle: "Send to the agent",
       sendQueuedTitle: "Send to the agent, queued",
       countTitle: "Characters",
+      questionsAsked: (count: number) => `The agent asks ${String(count)}`,
       get elapsedLead() {
         return elapsedLead;
       },

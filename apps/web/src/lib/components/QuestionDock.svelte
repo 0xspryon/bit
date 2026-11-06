@@ -193,6 +193,23 @@
     const typing =
       target instanceof HTMLTextAreaElement ||
       (target instanceof HTMLInputElement && target.type === "text");
+    /*
+     * Esc in a free-text answer with words in it only leaves that box, and focus moves to
+     * the dock; a second Esc dismisses (A7-Q review 1, a plan decision). A dismissal cannot
+     * be undone — a live question's agent is told the operator declined — so one key
+     * pressed to leave a box must not throw away what was written there. An empty box, or
+     * anywhere else in the dock, dismisses at once, as E3 says; kept from the shell by
+     * `preventDefault`, as the Jump to… list's Esc is.
+     */
+    if (
+      event.key === "Escape" &&
+      typing &&
+      (target as HTMLTextAreaElement | HTMLInputElement).value.trim() !== ""
+    ) {
+      event.preventDefault();
+      root?.focus();
+      return;
+    }
     if (event.key === "Enter") {
       if (target instanceof HTMLButtonElement) return;
       if (
@@ -316,6 +333,7 @@
   aria-label="{question.asker}'s questions"
   aria-describedby={note === "" ? undefined : `${uid}-note`}
   aria-busy={question.busy}
+  tabindex="-1"
   {onkeydown}
 >
   <header class="head">
@@ -961,6 +979,11 @@
   }
   .own:focus-visible {
     outline: none;
+  }
+  /* Where a first Esc in a written answer leaves focus (`onkeydown`): said, not hidden. */
+  .question-dock:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
   }
   .words {
     width: 100%;
