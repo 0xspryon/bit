@@ -2864,19 +2864,33 @@ export class ScopeImporter extends Context.Service<
         questionId: string,
       ) => {
         const key = `${held.sessionId}\u0000${questionId}`;
+        /*
+         * **Said only while this server still holds the session** (A7-S review 1). The
+         * session's close takes this fiber's scope down last, after it has ended the harness
+         * session — which, on a paused harness, waits — so a list that came back in between
+         * would dock a question on an import already ended, after its `closed`. The live map
+         * is emptied first thing in a close, so it is what says the import is over.
+         */
         const say = (detail: HarnessNarration["detail"]) =>
-          narrations.publish({
-            targetId,
-            subject: { _tag: "import", importId: held.id },
-            harnessSessionId: held.sessionId,
-            entry: {
-              type: "bit.question.rechecked",
-              sequence: undefined,
-              at: Date.now(),
-              outcome: undefined,
-              detail,
-            },
-          });
+          Effect.suspend(() =>
+            sessions.get(held.id)?.scope !== held.scope
+              ? Effect.logDebug(
+                  "a question re-checked after its session was let go of is not said again",
+                  { importId: held.id, questionId },
+                )
+              : narrations.publish({
+                  targetId,
+                  subject: { _tag: "import", importId: held.id },
+                  harnessSessionId: held.sessionId,
+                  entry: {
+                    type: "bit.question.rechecked",
+                    sequence: undefined,
+                    at: Date.now(),
+                    outcome: undefined,
+                    detail,
+                  },
+                }),
+          );
         const found = (asked: readonly HarnessQuestion[]) => {
           const question = asked.find(
             (candidate) => candidate.questionId === questionId,

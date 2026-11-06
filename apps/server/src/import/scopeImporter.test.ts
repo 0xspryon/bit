@@ -293,6 +293,11 @@ interface Script {
   holdMessages:
     { readonly entered: () => void; readonly gate: Promise<void> } | undefined;
   /**
+   * Parks the **next** `endSession` until it opens, after recording it, then clears itself:
+   * a harness that is slow to end, as a paused one is (A7-S review 1).
+   */
+  holdEnd: Promise<void> | undefined;
+  /**
    * Parks the **next** `ScopeImportProgress.settle` before it writes, until `gate` opens,
    * signalling `entered` on the way in, then clears itself: a turn's settle caught writing,
    * for a message delivered past the settling fiber's report read (A6 U4 step 0).
@@ -389,6 +394,7 @@ const newScript = (readable: readonly string[]): Script => {
     steerLatency: 0,
     written: [],
     holdMessages: undefined,
+    holdEnd: undefined,
     holdSettle: undefined,
     streamBlocks: false,
     done: Promise.resolve(),
@@ -662,8 +668,11 @@ const scriptedHarness = (script: Script) => {
           }),
       ),
     endSession: ({ id: sessionId }) =>
-      Effect.sync(() => {
+      Effect.promise(async () => {
         script.ended.push(sessionId);
+        const hold = script.holdEnd;
+        script.holdEnd = undefined;
+        await hold;
       }),
     // The transcript, in the order `AgentHarness.messages` promises - oldest first, which
     // each real driver has its own test for: the narration the session produced along the
@@ -4965,6 +4974,45 @@ describe("a question the importer's agent waits on (A7-Q)", () => {
     built.script.questions.listFail = undefined;
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(built.script.questions.listReads()).toBe(stopped);
+    expect(await said).toBeUndefined();
+    await runtime.dispose();
+  });
+
+  test("A7-S review 1: a re-check that comes back while the ended session's harness is still being stopped says nothing", async () => {
+    /*
+     * The close ends the harness session before it takes the re-check's scope down, and a
+     * paused harness ends slowly: the list it answered once it was back used to dock the
+     * question ~1 s after the import's `closed`.
+     */
+    const { built, runtime, importId } = await liveOne();
+    built.script.questions.ask("ses_import", QUESTION);
+    built.script.questions.fail = unreachable;
+    built.script.questions.listFail = unreachable;
+    const said = nextQuestionEntry(runtime);
+    await questionCall(runtime, importId, "toolu_q1");
+    await readsReach(built, built.script.questions.listReads() + 2);
+    let release: () => void = () => undefined;
+    built.script.holdEnd = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const stopping = runtime.runPromise(
+      Effect.flatMap(ScopeImporter, (importer) => importer.stop(importId)),
+    );
+    for (
+      let tries = 0;
+      tries < 400 && built.script.ended.length === 0;
+      tries += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(built.script.ended).toEqual(["ses_import"]);
+    // Back while the end is still going, the question still listed.
+    const before = built.script.questions.listReads();
+    built.script.questions.listFail = undefined;
+    await readsReach(built, before + 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    release();
+    await stopping;
     expect(await said).toBeUndefined();
     await runtime.dispose();
   });

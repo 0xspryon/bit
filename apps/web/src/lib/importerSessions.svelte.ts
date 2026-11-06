@@ -1478,6 +1478,7 @@ export class ImporterSessions {
        * reads as ended or dormant and the composer says what the next message will do; and
        * so is the replay, so a question it was waiting on reads as no longer answerable here.
        */
+      this.#closedImports.add(importId);
       void this.#server?.reread();
       void this.#rereadHistory(session.id);
       return;
@@ -2694,6 +2695,14 @@ export class ImporterSessions {
   /* ── The question dock (A7-Q) ─────────────────────────────────────────────── */
 
   /**
+   * The imports whose session the server said it let go of (`noteConnection`'s `closed`),
+   * so a `question` frame after it is not docked (A7-S review 1). An import id is one
+   * authority period, and carrying the session on opens a new one under a new id, so an id
+   * once here stays here. One entry per import ended while this tab was open.
+   */
+  #closedImports = new Set<string>();
+
+  /**
    * The question the session on screen is waiting on, or `undefined`: the replay's answer
    * (`ImporterConversationView.question`), moved by the live `question` frames since.
    */
@@ -2712,6 +2721,9 @@ export class ImporterSessions {
     if (importId === null) return;
     const session = this.sessions.find((each) => each.importId === importId);
     if (session === undefined) return;
+    // Asked of an import the server has let go of (A7-S review 1): nothing holds it to
+    // answer, and the replay already read on `closed` says what the question is now.
+    if (frame.question !== null && this.#closedImports.has(importId)) return;
     if (frame.question !== null) {
       const asked = frame.question;
       this.#replace(session.id, (before) => ({

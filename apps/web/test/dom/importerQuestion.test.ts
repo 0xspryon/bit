@@ -448,6 +448,29 @@ describe("the importer's question dock (A7-Q)", () => {
     expect(fake.countOf("importerMessages")).toBe(replays + 1);
   });
 
+  test("A7-S review 1: a question frame after the session's closed is not docked", async () => {
+    const fake = new FakeServer();
+    await continueWith(fake);
+    fake.watch.send(liveOpened());
+    await settle();
+    fake.watch.send({
+      _tag: "connection",
+      state: "closed",
+      detail: "this server stopped holding the session",
+      attemptId: null,
+      roundId: null,
+      goalId: null,
+      importId: "imp_newest",
+      at: Date.now(),
+    });
+    await settle();
+    // A re-check that came back late, as the server used to send it.
+    fake.watch.send(frame({ question: QUESTION() }));
+    await settle();
+    expect(dock()).toBeNull();
+    expect(radios()).toHaveLength(0);
+  });
+
   test("a question asked or settled reads the rail's count at once: Needs you", async () => {
     const fake = new FakeServer();
     const app = await continueWith(fake);
