@@ -546,6 +546,20 @@ the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harnes
   their servers already narrate the view, but have no per-sub-agent Stop route); the quote is
   plain text, not Markdown (note at the card); a sub-agent's own thread (note at the card and
   at `SubagentState`).
+- **Review 1 fix round (2026-11-06, `d412903`..):** ending an OpenCode session interrupts
+  every running child first (listed by `parentID`, so children the stream never saw too),
+  waits ≤1.5 s for each background child's notice, then empties the inbox and interrupts the
+  parent; a sub-agent is live only while its stream runs, and a replay reads a child's `idle`
+  marker (interrupted = stopped). A Claude Code replay of a session not held draws a
+  still-running sub-agent as stopped with its CLI (the CLI's end kills in-process
+  sub-agents, so Claude Code had no end gap). After a card's Stop, Claude Code's Stop all
+  arms a 10 s window in which a turn the CLI opens on its own is interrupted as it opens
+  (measured: the notification turn opened 25 ms after Stop all and was stopped before any
+  reply). A question re-check never publishes for a session no longer held, and the page
+  ignores a `question` frame after `closed`. The panel re-applies the 560px rule on resize
+  (`ResizeObserver`), Esc on a card closes it, long names have titles, long quotes are cut to
+  8 lines with Show all; E3's "waiting on you" needs the question's `answerability` to be
+  `live`; a live finished card quotes the hand-back. Test children die with the test run.
 
 **F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
 refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
