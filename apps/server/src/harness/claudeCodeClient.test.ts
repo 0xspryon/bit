@@ -76,6 +76,7 @@ import {
   storedSteers,
   takenNarration,
   transcriptContext,
+  xmlText,
   type ClaudeCodeHarnessOptions,
   type ClaudeContextUsage,
   type ClaudeCodeSdk,
@@ -7733,6 +7734,78 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
     );
     expect(all).not.toContain("Subagent hand-back");
     expect(all).not.toContain("<task-notification>");
+  });
+
+  test("A7-S review 4: the five XML entities and numeric references are decoded, once", () => {
+    expect(
+      xmlText("sleep 40 &amp;&amp; echo &lt;x&gt; &quot;q&quot; &apos;s&apos;"),
+    ).toBe(`sleep 40 && echo <x> "q" 's'`);
+    expect(xmlText("&#38; &#x3C; &#X3e;")).toBe("& < >");
+    // One pass: an escaped entity is the entity, not what it names.
+    expect(xmlText("a&amp;amp;b &amp;lt;")).toBe("a&amp;b &lt;");
+    // Anything else is left as it is.
+    expect(xmlText("&nbsp; & &amp &#xZZ; R&D")).toBe(
+      "&nbsp; & &amp &#xZZ; R&D",
+    );
+  });
+
+  test("A7-S review 4: a stopped background command's note reads its command as written", async () => {
+    // The reviewer's case: `sleep 40 && echo …` stopped, its note drawn "&amp;&amp;".
+    const SESSION_B = "11111111-0000-4000-8000-0000000000b4";
+    const entries = await withHarness(
+      {
+        transcript: [
+          {
+            type: "user",
+            uuid: "n1",
+            session_id: SESSION_B,
+            message: {
+              role: "user",
+              content:
+                "<task-notification>\n<task-id>b9</task-id>\n<tool-use-id>toolu_b9</tool-use-id>\n<status>killed</status>\n<summary>Background command &quot;sleep 40 &amp;&amp; echo &lt;done&gt;&quot; was stopped</summary>\n</task-notification>",
+            },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+            origin: { kind: "task-notification" },
+          } as unknown as SessionMessage,
+        ],
+      },
+      (harness) => harness.messages(SESSION_B),
+    );
+    expect(entries.map((entry) => [entry.marker, entry.text])).toEqual([
+      ["task", 'Background command "sleep 40 && echo <done>" was stopped'],
+    ]);
+  });
+
+  test("A7-S review 4: a stored notification's text is XML-escaped, and is read back as the words", async () => {
+    // Measured on CLI 2.1.310 (`spike/taskNotificationProbe.ts`): `&` `<` `>` are stored as
+    // entities in `<summary>` and `<result>`, quotes as they are, and a literal entity in a
+    // sub-agent's words is escaped once more.
+    const escaped = (await transcript()).map(
+      (entry) =>
+        JSON.parse(
+          JSON.stringify(entry)
+            .replace(
+              "<result>PING</result>",
+              '<result>PING &amp;&amp; PONG &lt;tag&gt; \\"q\\" a&amp;amp;b</result>',
+            )
+            .replace(
+              'Agent \\"Say PING later\\" finished',
+              'Agent \\"sleep 40 &amp;&amp; echo &lt;x&gt;\\" finished',
+            ),
+        ) as SessionMessage,
+    );
+    expect(JSON.stringify(escaped)).toContain("&amp;amp;b");
+    const entries = await withHarness({ transcript: escaped }, (harness) =>
+      harness.messages(SESSION),
+    );
+    const ended = newest(entries.flatMap((entry) => entry.parts));
+    expect(ended.get(BACKGROUND)?.result).toBe(
+      'PING && PONG <tag> "q" a&amp;b',
+    );
+    const all = JSON.stringify(entries);
+    expect(all).not.toContain("&amp;&amp;");
+    expect(all).not.toContain("&lt;");
   });
 
   test("replay equals live: the same sub-agent items, through the one projection", async () => {

@@ -93,6 +93,7 @@
     chip,
     aside,
     asideOverlay = false,
+    asideLabelledBy,
     subagent,
   }: {
     session: ChatSession<Subject>;
@@ -118,8 +119,14 @@
     /**
      * `aside` overlays the chat as a drawer instead of narrowing it (A7-S review 3): where
      * the column beside it would be under 560px even with the rail away. Same width.
+     *
+     * A drawer is a **modal dialog** (A7-S review 4): it covers the composer's right side,
+     * so Tab and Shift+Tab stay inside it and a wheel over it never scrolls the chat
+     * behind. Closing it, including Esc from outside it, is the chat's (`ImporterChat`).
      */
     asideOverlay?: boolean;
+    /** The id of the element that names the aside, for the drawer's `aria-labelledby`. */
+    asideLabelledBy?: string | undefined;
     subagent?: Snippet<[ChatRow]> | undefined;
   } = $props();
 
@@ -250,6 +257,70 @@
     if (chip === undefined || chips === undefined) return;
     return chips.place(chip);
   });
+
+  /**
+   * Tab and Shift+Tab inside the drawer (A7-S review 4): from its last control to its first
+   * and back, so focus never walks onto the composer it covers. The heading the panel
+   * focuses on open is not a Tab stop, so Shift+Tab from it goes to the last control.
+   */
+  function trapTab(event: KeyboardEvent): void {
+    if (!asideOverlay || event.key !== "Tab") return;
+    const drawer = event.currentTarget;
+    if (!(drawer instanceof HTMLElement)) return;
+    const stops = [
+      ...drawer.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ),
+    ].filter((stop) => !stop.closest("[hidden], [inert]"));
+    const first = stops[0];
+    const last = stops.at(-1);
+    if (first === undefined || last === undefined) {
+      event.preventDefault();
+      return;
+    }
+    const at = document.activeElement;
+    const isStop = at instanceof HTMLElement && stops.includes(at);
+    if (event.shiftKey) {
+      // From the first control, or from the heading, which comes before it.
+      if (!isStop || at === first) {
+        event.preventDefault();
+        last.focus();
+      }
+    } else if (at === last || !(at instanceof Node && drawer.contains(at))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  /**
+   * A wheel over the drawer scrolls the drawer, or nothing (A7-S review 4): at its top or
+   * bottom, or with nothing to scroll, the wheel is not handed on to the transcript behind
+   * it, which the operator cannot see. `overscroll-behavior` alone does not stop that for a
+   * box with nothing to scroll, so a wheel no box in the drawer can take is cancelled.
+   * Non-passive, which is why it is an attachment and not `onwheel`.
+   */
+  function containWheel(drawer: HTMLElement): () => void {
+    const onwheel = (event: WheelEvent): void => {
+      if (event.deltaY === 0) return;
+      for (
+        let box = event.target instanceof Element ? event.target : null;
+        box !== null;
+        box = box === drawer ? null : box.parentElement
+      ) {
+        if (!(box instanceof HTMLElement)) continue;
+        const room = box.scrollHeight - box.clientHeight;
+        if (room <= 0) continue;
+        const scroll = getComputedStyle(box).overflowY;
+        if (scroll !== "auto" && scroll !== "scroll") continue;
+        if (event.deltaY < 0 ? box.scrollTop > 0 : box.scrollTop < room - 1) {
+          return;
+        }
+      }
+      event.preventDefault();
+    };
+    drawer.addEventListener("wheel", onwheel, { passive: false });
+    return () => drawer.removeEventListener("wheel", onwheel);
+  }
 
   let elapsed = $derived(
     turn.since === undefined
@@ -522,7 +593,21 @@
       E8's panel (A7-S): 400px beside the chat, which reflows to the width left. Its
       heading, close and contents are the chat's.
     -->
-    <aside class={["aside", asideOverlay && "overlay"]}>
+    <!--
+      As a drawer over the chat, a modal dialog, so Tab stays in it and a wheel over it is
+      its own (A7-S review 4). The rest of the chat is still under the pointer, so a click
+      there still works, Stop among it; Esc from anywhere but the question dock closes it.
+      One element either way, so a resize between drawer and column does not remount it.
+    -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <aside
+      class={["aside", asideOverlay && "overlay"]}
+      role={asideOverlay ? "dialog" : undefined}
+      aria-modal={asideOverlay ? "true" : undefined}
+      aria-labelledby={asideOverlay ? asideLabelledBy : undefined}
+      onkeydown={trapTab}
+      {@attach asideOverlay && containWheel}
+    >
       {@render aside()}
     </aside>
   {/if}
@@ -589,6 +674,7 @@
   */
   .aside.overlay {
     position: absolute;
+    overscroll-behavior: contain;
     top: 0;
     right: 0;
     bottom: 0;

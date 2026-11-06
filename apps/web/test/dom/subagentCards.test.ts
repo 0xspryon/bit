@@ -830,6 +830,170 @@ describe("the 560px rule follows a resize while the panel is open (A7-S review 1
     expect(document.activeElement?.id).toBe("subagent-toolu_done");
   });
 
+  /** At 768px, with the panel open as a drawer. */
+  const drawerAt768 = async (
+    options: { readonly question?: PendingQuestion } = {},
+  ) => {
+    const { size } = sized();
+    size.window = 768;
+    size.shell = 536;
+    const app = await continueWith(new FakeServer(), [RUNNING, FINISHED], {
+      ...(options.question === undefined ? {} : { question: options.question }),
+    });
+    click(chip()!);
+    await settle();
+    return app;
+  };
+  const drawer = () => document.querySelector<HTMLElement>("aside.aside");
+  const key = (
+    on: Element,
+    init: KeyboardEventInit & { readonly key: string },
+  ): KeyboardEvent => {
+    const event = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    });
+    on.dispatchEvent(event);
+    return event;
+  };
+
+  test("A7-S review 4: the drawer is a modal dialog, and Tab and Shift+Tab stay inside it", async () => {
+    await drawerAt768();
+    expect(drawer()?.getAttribute("role")).toBe("dialog");
+    expect(drawer()?.getAttribute("aria-modal")).toBe("true");
+    expect(drawer()?.getAttribute("aria-labelledby")).toBe(
+      "subagent-panel-heading",
+    );
+    const heading = document.getElementById("subagent-panel-heading")!;
+    expect(document.activeElement).toBe(heading);
+    const stops = [
+      ...drawer()!.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+    ];
+    // Shift+Tab from the heading is the drawer's last control, not the composer's.
+    const back = key(heading, { key: "Tab", shiftKey: true });
+    expect(back.defaultPrevented).toBe(true);
+    expect(document.activeElement?.outerHTML).toBe(stops.at(-1)?.outerHTML);
+    // Tab from the last goes round to the first.
+    key(stops.at(-1)!, { key: "Tab" });
+    expect(document.activeElement?.outerHTML).toBe(stops[0]?.outerHTML);
+    // Shift+Tab from the first goes to the last again.
+    key(stops[0]!, { key: "Tab", shiftKey: true });
+    expect(document.activeElement?.outerHTML).toBe(stops.at(-1)?.outerHTML);
+    // Tab between two of its controls is the browser's own.
+    stops[0]!.focus();
+    expect(key(stops[0]!, { key: "Tab" }).defaultPrevented).toBe(false);
+  });
+
+  test("A7-S review 4: beside the chat the panel is no dialog and traps nothing", async () => {
+    const { size } = sized();
+    size.window = 1440;
+    size.shell = 1208;
+    await continueWith(new FakeServer(), [RUNNING]);
+    click(chip()!);
+    await settle();
+    expect(drawer()?.classList.contains("overlay")).toBe(false);
+    expect(drawer()?.getAttribute("role")).toBeNull();
+    expect(drawer()?.getAttribute("aria-modal")).toBeNull();
+    const heading = document.getElementById("subagent-panel-heading")!;
+    expect(key(heading, { key: "Tab", shiftKey: true }).defaultPrevented).toBe(
+      false,
+    );
+    const wheel = new WheelEvent("wheel", {
+      deltaY: 120,
+      bubbles: true,
+      cancelable: true,
+    });
+    panel()!.dispatchEvent(wheel);
+    expect(wheel.defaultPrevented).toBe(false);
+  });
+
+  test("A7-S review 4: a wheel over the drawer that nothing in it can take is not handed to the chat behind", async () => {
+    await drawerAt768();
+    for (const deltaY of [120, -120]) {
+      const wheel = new WheelEvent("wheel", {
+        deltaY,
+        bubbles: true,
+        cancelable: true,
+      });
+      panel()!.querySelector(".row")!.dispatchEvent(wheel);
+      expect(wheel.defaultPrevented).toBe(true);
+    }
+  });
+
+  test("A7-S review 4: Esc closes the drawer from the chip and from the composer, and focus stays there", async () => {
+    await drawerAt768();
+    chip()!.focus();
+    expect(key(chip()!, { key: "Escape" }).defaultPrevented).toBe(true);
+    await settle();
+    expect(panel()).toBeNull();
+    expect(document.activeElement?.className).toContain("subagents-chip");
+
+    click(chip()!);
+    await settle();
+    const box =
+      document.querySelector<HTMLTextAreaElement>("#importer-message")!;
+    box.focus();
+    key(box, { key: "Escape" });
+    await settle();
+    expect(panel()).toBeNull();
+    expect(document.activeElement?.id).toBe("importer-message");
+  });
+
+  test("A7-S review 4: an Esc an input method is using, or one a popover takes, leaves the drawer open", async () => {
+    await drawerAt768();
+    const box =
+      document.querySelector<HTMLTextAreaElement>("#importer-message")!;
+    key(box, { key: "Escape", isComposing: true });
+    await settle();
+    expect(panel()).not.toBeNull();
+    // An open popover's Esc is that popover's alone.
+    const opener = document.createElement("button");
+    opener.setAttribute("aria-haspopup", "listbox");
+    opener.setAttribute("aria-expanded", "true");
+    document.body.append(opener);
+    key(box, { key: "Escape" });
+    await settle();
+    expect(panel()).not.toBeNull();
+    opener.remove();
+    key(box, { key: "Escape" });
+    await settle();
+    expect(panel()).toBeNull();
+  });
+
+  test("A7-S review 4: an Esc inside the question dock is the dock's, and the drawer stays", async () => {
+    await drawerAt768({
+      question: {
+        questionId: "toolu_q",
+        harnessSessionId: "ses_newest",
+        fields: [
+          {
+            key: "Which hosts?",
+            header: "Hosts",
+            question: "Which hosts?",
+            kind: "text",
+            options: [],
+            custom: true,
+            required: false,
+          },
+        ],
+        askedAt: NOW,
+        answerability: "live",
+        attemptId: null,
+        roundId: null,
+        goalId: null,
+        importId: "imp_newest",
+      },
+    });
+    const inDock = document.querySelector<HTMLElement>(
+      ".importer .dock textarea, .importer .dock input, .importer .dock button",
+    );
+    expect(inDock).not.toBeNull();
+    key(inDock!, { key: "Escape" });
+    await settle();
+    expect(panel()).not.toBeNull();
+  });
+
   test("A7-S review 3: a resize moves the panel between drawer and column, and a rail the panel took comes back when it becomes a drawer", async () => {
     const { size, resize } = sized();
     size.window = 1024;
@@ -877,28 +1041,63 @@ describe("the 560px rule follows a resize while the panel is open (A7-S review 1
 
 describe("a portrait tablet (A7-S review 3)", () => {
   /**
-   * `window.matchMedia` answering `matches` for the chip's compact query and no other:
-   * happy-dom has no layout, so the viewport the query reads is the test's to say.
+   * `window.matchMedia` for a viewport `width` px wide: a `(max-width: Npx)` or
+   * `(min-width: Npx)` query is answered from it, as a browser would (A7-S review 4: a stub
+   * keyed on the constant could not tell a wrong breakpoint from the right one). happy-dom
+   * has no layout, so the viewport is the test's to say.
    */
-  const viewportBelow900 = (matches: boolean) => {
+  let width = 0;
+  let stubbed = false;
+  const viewport = (to: number) => {
+    width = to;
+    if (stubbed) return;
+    stubbed = true;
     const before = window.matchMedia.bind(window);
-    window.matchMedia = ((query: string) => ({
-      matches: query === SUBAGENT_CHIP_COMPACT_QUERY ? matches : false,
-      media: query,
-      onchange: null,
-      addEventListener: () => undefined,
-      removeEventListener: () => undefined,
-      addListener: () => undefined,
-      removeListener: () => undefined,
-      dispatchEvent: () => false,
-    })) as typeof window.matchMedia;
+    window.matchMedia = ((query: string) => {
+      const max = /\(max-width:\s*([\d.]+)px\)/.exec(query);
+      const min = /\(min-width:\s*([\d.]+)px\)/.exec(query);
+      const matches =
+        (max !== null || min !== null) &&
+        (max === null || width <= Number(max[1])) &&
+        (min === null || width >= Number(min[1]));
+      return {
+        matches,
+        media: query,
+        onchange: null,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      };
+    }) as typeof window.matchMedia;
     restore.push(() => {
       window.matchMedia = before;
+      stubbed = false;
     });
   };
 
+  test("the compact breakpoint is 900px: 899 and 768 are compact, 900 is not", async () => {
+    // The query itself, so a change to it is a change to this line too.
+    expect(SUBAGENT_CHIP_COMPACT_QUERY).toBe("(max-width: 899.98px)");
+    for (const [wide, compact] of [
+      [768, true],
+      [899, true],
+      [900, false],
+      [1024, false],
+    ] as const) {
+      viewport(wide);
+      await continueWith(new FakeServer(), [RUNNING]);
+      expect(
+        `${String(wide)} ${String(chip()?.classList.contains("compact"))}`,
+      ).toBe(`${String(wide)} ${String(compact)}`);
+      for (const each of mounted.splice(0)) each.destroy();
+      await settle();
+    }
+  });
+
   test("below 900px the chip is its icon and counts, its words in its name and title", async () => {
-    viewportBelow900(true);
+    viewport(768);
     await continueWith(new FakeServer(), [RUNNING, FINISHED, FAILED]);
     expect(chip()?.classList.contains("compact")).toBe(true);
     expect(chip()?.querySelector(".label")).toBeNull();
@@ -913,7 +1112,7 @@ describe("a portrait tablet (A7-S review 3)", () => {
   });
 
   test("from 900px it keeps its words", async () => {
-    viewportBelow900(false);
+    viewport(900);
     await continueWith(new FakeServer(), [RUNNING, FINISHED, FAILED]);
     expect(chip()?.classList.contains("compact")).toBe(false);
     expect(text(chip()?.querySelector(".label"))).toBe("3 sub-agents");

@@ -645,6 +645,37 @@ the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harnes
   as the End's; at 768×1024, 820, 900, 1024×768 and 1440×900 the page never scrolls sideways,
   panel open or closed. Shots in `/run/media/hbt/work/a7sf3-shots/`.
 
+**Review 4 passed; its leftovers are done (2026-11-06).**
+
+- **The drawer is a modal dialog.** `ChatShell`'s `aside.overlay` now has `role="dialog"`,
+  `aria-modal="true"` and `aria-labelledby`, and Tab and Shift+Tab wrap inside it, so focus
+  no longer walks onto the composer it covers. It is still one element whether drawer or
+  column, so a resize does not remount the panel. `inert` was weighed instead and not
+  taken: it would leave the question dock under the drawer visible but dead. As a modal,
+  the dock stays clickable, and one Esc away from the keyboard.
+- **A wheel over the drawer is its own.** `overscroll-behavior: contain`, plus a
+  non-passive wheel listener that cancels a wheel no box in the drawer can take. The
+  transcript behind stays where it was.
+- **Esc closes the drawer from anywhere**: the chip, the composer, the transcript. It does
+  not when the key is inside the question dock, when an input method is using it, or when
+  a popover (`[aria-haspopup][aria-expanded="true"]`) or another modal is open. It is a
+  `window` capture listener, because those popovers listen on `window` themselves. Focus
+  stays where it was.
+- **The compact chip's breakpoint is pinned.** The DOM stub of `matchMedia` answers from a
+  viewport width, so a `(max-width: 699.98px)` mutation fails.
+- **Stopped-task notes read their words.** CLI 2.1.310 XML-escapes `&`, `<` and `>` in a
+  stored `<task-notification>`'s `<summary>` and `<result>`, and the live frame does not
+  (measured, `spike/taskNotificationProbe.ts`). `xmlText` decodes every value read from a
+  stored note, in one pass.
+- **A `V2(chat):` note on OpenCode's Stop all:** there is no second pass, and a child
+  launched in its window of about 260 ms is missed.
+
+Live at 768×1024 and 1440×900 (haiku). Tab and Shift+Tab stayed inside the drawer over 19
+presses, and a wheel over it left the transcript at the same scroll offset. Esc from the
+chip and from the composer closed the drawer and left focus there. At 1440 the panel is a
+column and nothing is trapped. A stopped `sleep 40 && echo "<stopped>"` reads `Task "sleep
+40 && echo <stopped>" was stopped…`. Shots in `/run/media/hbt/work/f12-shots/`.
+
 **F12 — Built server cannot open Claude Code sessions (S), last.** Superseded: policy
 removed on 2026-11-06. It was fixed first (`635c1fc`): each hook source had been counted two
 folders up from `import.meta.dir`, which is right from `src/policy/` but not from the

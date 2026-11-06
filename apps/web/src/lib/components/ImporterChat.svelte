@@ -299,6 +299,42 @@
   });
 
   /**
+   * A7-S review 4: while the panel is a drawer, Esc closes it from anywhere — the chip, the
+   * composer, the transcript — not only from inside it or a card: it covers the right of
+   * the chat, and the operator reaching for Esc should not first have to find it.
+   *
+   * Not an Esc that is another control's: one inside the question dock (it gives the
+   * composer back, A7-Q), one an input method is using (`composing`), and one while a
+   * popover (a control with `aria-haspopup` that is expanded: the model, agent and session
+   * pickers, the context meter) or another modal dialog is open, which closes that alone.
+   * Those listen on `window`, after this would have, so this listens in the capture phase
+   * and asks the page rather than `defaultPrevented`. Focus stays where it was, unless it
+   * was in the drawer, where `closePanel` sends it to the chip.
+   */
+  $effect(() => {
+    if (!panelOpen || !panelOverlay) return;
+    const onkeydown = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape" || composing(event)) return;
+      const on = event.target instanceof Element ? event.target : null;
+      if (on?.closest(".dock") != null) return;
+      const drawer = document.querySelector('aside.overlay[role="dialog"]');
+      const otherDialog = [
+        ...document.querySelectorAll('[aria-modal="true"]'),
+      ].some((dialog) => dialog !== drawer);
+      if (otherDialog) return;
+      if (document.querySelector('[aria-haspopup][aria-expanded="true"]')) {
+        return;
+      }
+      event.preventDefault();
+      closePanel(on?.closest(SUBAGENT_CARD_SELECTOR) != null);
+    };
+    window.addEventListener("keydown", onkeydown, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", onkeydown, { capture: true });
+    };
+  });
+
+  /**
    * E8: selecting a row scrolls the transcript to its card, and focus goes with it. A
    * drawer (`panelOverlay`) closes first, since it would cover the card (A7-S review 3).
    */
@@ -666,6 +702,7 @@
   rootClass="importer"
   aside={panelOpen ? subagentPanel : undefined}
   asideOverlay={panelOverlay}
+  asideLabelledBy="subagent-panel-heading"
 >
   {#snippet subagent(row)}
     {#if row.item.subagent !== undefined}

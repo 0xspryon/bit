@@ -3429,6 +3429,16 @@ export const openCodeHarness = (
        * V2(chat): a parent that was idle — background children alone — is still woken by
        * their notices, which reach it at once rather than wait in its inbox, for a turn the
        * route's Stop then aborts (stored as an aborted step, as at an End).
+       *
+       * V2(chat): there is **no second pass** (A7-S review 4). The children are listed once,
+       * at the start, and the whole takes about 260 ms (measured on GLM: the parent's newest
+       * step settled 218–264 ms after the press). A background child the parent launches in
+       * that window is not in the list, keeps running, and comes back as a running card; a
+       * second Stop all stops it. A foreground child launched in the window is not in
+       * {@link foregroundChildren} yet either, so the server's `parentID` list hands it to
+       * step 2 as a background one: interrupted directly, which fails the parent's call
+       * rather than letting the parent's own interrupt read it `aborted`. Proper V2: list
+       * again after the route's Stop, and stop whatever is new until a pass finds nothing.
        */
       const stopSubagents: AgentHarness["Service"]["stopSubagents"] = Effect.fn(
         "openCodeHarness.stopSubagents",

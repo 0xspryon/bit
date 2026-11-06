@@ -2006,8 +2006,42 @@ const readSubagentTranscript = (
 };
 
 /**
+ * The text of a tag in a stored `<task-notification>`, as the words it holds.
+ *
+ * The CLI writes the note as XML and **escapes its text**: measured on CLI 2.1.310
+ * (`src/spike/taskNotificationProbe.ts`, A7-S review 4), `<summary>` and `<result>` store
+ * `&` `<` `>` as `&amp;` `&lt;` `&gt;` (a sub-agent's literal `a&amp;b` is stored
+ * `a&amp;amp;b`), while quotes stay as they are. Read raw, a stopped task's note read
+ * "sleep 40 &amp;&amp; echo". So every value read out of a stored note goes through this:
+ * the five XML entities and numeric references, in **one pass**, so `&amp;lt;` is `&lt;`
+ * and not `<`. The live `task_notification` frame's `summary` is not escaped and is not
+ * passed through it.
+ */
+export const xmlText = (text: string): string =>
+  text.replace(
+    /&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-f]+));/gi,
+    (whole, named: string | undefined, decimal?: string, hex?: string) => {
+      if (named !== undefined) {
+        return (
+          { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" }[
+            named.toLowerCase() as "amp" | "lt" | "gt" | "quot" | "apos"
+          ] ?? whole
+        );
+      }
+      const code = Number.parseInt(
+        decimal ?? hex ?? "",
+        decimal === undefined ? 16 : 10,
+      );
+      return Number.isInteger(code) && code >= 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : whole;
+    },
+  );
+
+/**
  * The `<tool-use-id>` and `<status>` of a stored `<task-notification>`, the user entry the
- * CLI writes when a task ends (`testdata/claude-code-transcript/`).
+ * CLI writes when a task ends (`testdata/claude-code-transcript/`). Each value is decoded
+ * ({@link xmlText}).
  */
 const storedNotification = (
   text: string,
@@ -2032,15 +2066,15 @@ const storedNotification = (
   const closed = text.lastIndexOf("</result>");
   const result =
     opened >= 0 && closed > opened
-      ? text.slice(opened + "<result>".length, closed).trim()
+      ? xmlText(text.slice(opened + "<result>".length, closed).trim())
       : undefined;
   const tail = closed >= 0 ? text.slice(closed) : head;
   return toolUseId === undefined || status === undefined
     ? undefined
     : {
-        toolUseId: toolUseId.trim(),
-        status: status.trim(),
-        taskId,
+        toolUseId: xmlText(toolUseId.trim()),
+        status: xmlText(status.trim()),
+        taskId: taskId === undefined ? undefined : xmlText(taskId),
         result,
         calls: toolUsesIn(tail),
       };
@@ -2060,9 +2094,9 @@ const storedNotification = (
 const notificationLine = (text: string): string => {
   const head = text.split("<result>", 1)[0] ?? "";
   const summary = /<summary>([\s\S]*?)<\/summary>/.exec(head)?.[1]?.trim();
-  if (summary !== undefined && summary !== "") return summary;
+  if (summary !== undefined && summary !== "") return xmlText(summary);
   const status = /<status>([^<]+)<\/status>/.exec(head)?.[1]?.trim();
-  return status === undefined ? "Task notification" : `Task ${status}`;
+  return status === undefined ? "Task notification" : `Task ${xmlText(status)}`;
 };
 
 /** The model an `assistant` message names (`message.model`), or `undefined`. */
