@@ -50,6 +50,16 @@ const BOUNDS: ReapBounds = { terminateGrace: 400, killGrace: 1_500, poll: 10 };
 const scratches: string[] = [];
 let spawned: number[] = [];
 
+/**
+ * A stand-in's endless loop, **for as long as this test process lives** (A7-S review 1):
+ * the teardown SIGKILLs what was spawned, but a run killed from outside (`timeout`, an OOM
+ * kill) runs no teardown, and every stand-in is detached into a group of its own, so it ran
+ * on for hours. Polling the runner ends it within 0.2 s of the run's end instead.
+ */
+const LOOP_WHILE_RUNNER = `while kill -0 ${String(process.pid)} 2>/dev/null; do sleep 0.2; done`;
+/** A tool stand-in (a CLI's Bash) that runs for as long, rather than a fixed `sleep 30`. */
+const TOOL_WHILE_RUNNER = `sh -c '${LOOP_WHILE_RUNNER}'`;
+
 const scratch = (): string => {
   const directory = mkdtempSync(join(SCRATCH_ROOT, "reap-"));
   scratches.push(directory);
@@ -101,13 +111,13 @@ const sleeper = async (
   const trap = options.ignoresTerm === true ? "trap '' TERM; " : "";
   const child =
     options.withChild === true
-      ? `sh -c 'while true; do sleep 0.2; done' & echo $! > ${childPidFile}; `
+      ? `sh -c '${LOOP_WHILE_RUNNER}' & echo $! > ${childPidFile}; `
       : "";
   const process_ = Bun.spawn({
     cmd: [
       "sh",
       "-c",
-      `${trap}${child}echo ready > ${readyFile}; while true; do sleep 0.2; done`,
+      `${trap}${child}echo ready > ${readyFile}; ${LOOP_WHILE_RUNNER}`,
     ],
     stdin: "ignore",
     stdout: "ignore",
@@ -442,7 +452,7 @@ describe("stopOwnedChild", () => {
       cmd: [
         "sh",
         "-c",
-        `${body(directory)}; echo ready > ${readyFile}; while true; do sleep 0.2; done`,
+        `${body(directory)}; echo ready > ${readyFile}; ${LOOP_WHILE_RUNNER}`,
       ],
       stdin: "ignore",
       stdout: "ignore",
@@ -479,7 +489,8 @@ describe("stopOwnedChild", () => {
      * through `setsid` and `exec`, so neither goes on `SIGTERM` and this is the kill path.
      */
     const { directory, stoppable } = await standIn(
-      (dir) => `trap '' TERM; setsid sleep 30 & echo $! > ${join(dir, "tool")}`,
+      (dir) =>
+        `trap '' TERM; setsid ${TOOL_WHILE_RUNNER} & echo $! > ${join(dir, "tool")}`,
     );
     const tool = await pidIn(join(directory, "tool"));
     expect(processIdentity(tool)).toBeDefined();
@@ -495,7 +506,8 @@ describe("stopOwnedChild", () => {
     // On `SIGTERM` the stand-in starts a fresh tool in its own session, as a CLI mid-step
     // can; only a tree read again while waiting knows it exists.
     const { directory, stoppable } = await standIn(
-      (dir) => `trap 'setsid sleep 30 & echo $! > ${join(dir, "late")}' TERM`,
+      (dir) =>
+        `trap 'setsid sh -c "${LOOP_WHILE_RUNNER}" & echo $! > ${join(dir, "late")}' TERM`,
     );
 
     const outcome = await Effect.runPromise(stopOwnedChild(stoppable, STOP));
@@ -513,7 +525,7 @@ describe("stopOwnedChild", () => {
     const directory = scratch();
     const toolFile = join(directory, "tool");
     const child = Bun.spawn({
-      cmd: ["sh", "-c", `sleep 30 & echo $! > ${toolFile}; exit 3`],
+      cmd: ["sh", "-c", `${TOOL_WHILE_RUNNER} & echo $! > ${toolFile}; exit 3`],
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",

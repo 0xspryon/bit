@@ -125,14 +125,48 @@ const fakeBinary = (
   writeFileSync(path, `#!/usr/bin/env bun\n${PID_PRELUDE}\n${body}`);
   chmodSync(path, 0o755);
   pidFiles.push(pidFile);
-  return { path, cwd, pidFile, extraArgs: [`--pidfile=${pidFile}`] };
+  return {
+    path,
+    cwd,
+    pidFile,
+    extraArgs: [`--pidfile=${pidFile}`, `--runner=${String(process.pid)}`],
+  };
 };
 
+/*
+ * **A probe dies with the test run** (A7-S review 1). The teardown above SIGKILLs every
+ * recorded pid, but a run killed from outside (`timeout`, the 1 GB scope's OOM kill) runs no
+ * teardown, and each probe is detached into its own group, so nothing else reaches it: a
+ * `fake-opencode serve` and its TERM-ignoring holder were found alive two hours after such
+ * a run. So `--runner=` names the test process, each probe polls it, and the first probe to
+ * find it gone SIGKILLs everything recorded (groups first) and then itself. The poll is
+ * `unref`'d, so a probe that would exit on its own still does. A holder that escaped the
+ * probe's group polls the runner itself (`holdsPipeOpen`).
+ */
 const PID_PRELUDE = `
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync as readRecorded } from "node:fs";
 const pidFile = (Bun.argv.find((a) => a.startsWith("--pidfile=")) ?? "").slice(10);
 const recordPid = (pid) => { if (pidFile !== "") appendFileSync(pidFile, pid + "\\n"); };
 recordPid(process.pid);
+const runner = Number(
+  (Bun.argv.find((a) => a.startsWith("--runner=")) ?? "--runner=0").slice(9),
+);
+if (runner > 1) {
+  setInterval(() => {
+    try {
+      process.kill(runner, 0);
+      return;
+    } catch {}
+    let recorded = "";
+    try { recorded = readRecorded(pidFile, "utf8"); } catch {}
+    for (const pid of recorded.split("\\n").map(Number)) {
+      if (!(pid > 1) || pid === process.pid) continue;
+      try { process.kill(-pid, "SIGKILL"); } catch {}
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+    process.kill(process.pid, "SIGKILL");
+  }, 200).unref();
+}
 const port = Number(
   (Bun.argv.find((a) => a.startsWith("--port=")) ?? "--port=0").slice(7),
 );
@@ -162,7 +196,11 @@ Bun.serve({
  */
 const holdsPipeOpen = (escape: boolean) => `
 const holder = Bun.spawn({
-  cmd: ["sh", "-c", "trap '' TERM; echo holder $$; while true; do sleep 0.2; done"],
+  cmd: [
+    "sh",
+    "-c",
+    "trap '' TERM; echo holder $$; while kill -0 " + runner + " 2>/dev/null; do sleep 0.2; done",
+  ],
   stdin: "ignore",
   stdout: "inherit",
   stderr: "inherit",

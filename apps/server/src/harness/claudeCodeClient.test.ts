@@ -5558,6 +5558,13 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     return { sdk, seen };
   };
 
+  /**
+   * A Bash tool stand-in that runs **for as long as this test process lives** (A7-S review
+   * 1), where a fixed `sleep 30` outlived a run killed from outside — `timeout`, an OOM kill
+   * — by up to 30 s in a session of its own, which no teardown reaches.
+   */
+  const TOOL = `sh -c 'while kill -0 ${String(process.pid)} 2>/dev/null; do sleep 0.2; done'`;
+
   /** Opens a conversation on a CLI running `script`, ends it, and says what was left. */
   const endedWhileRunning = async (script: (pidFile: string) => string) => {
     const scratch = await mkdtemp(join(tmpdir(), "bit-cli-stop-"));
@@ -5628,7 +5635,7 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
    */
   test("the CLI and the tool it is running are gone by the time endSession returns", async () => {
     const outcome = await endedWhileRunning(
-      (pidFile) => `setsid sleep 30 & echo $! > '${pidFile}'; wait`,
+      (pidFile) => `setsid ${TOOL} & echo $! > '${pidFile}'; wait`,
     );
     expect(outcome.before).toEqual({ leader: true, tool: true });
     expect(outcome.after).toEqual({ leader: false, tool: false });
@@ -5642,7 +5649,7 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     // SIGTERM: the kill path, which is the one the CLI's own handler does not cover.
     const outcome = await endedWhileRunning(
       (pidFile) =>
-        `trap '' TERM; setsid sleep 30 & echo $! > '${pidFile}'; wait`,
+        `trap '' TERM; setsid ${TOOL} & echo $! > '${pidFile}'; wait`,
     );
     expect(outcome.before).toEqual({ leader: true, tool: true });
     expect(outcome.after).toEqual({ leader: false, tool: false });
@@ -5736,7 +5743,7 @@ describe("ending a session stops the CLI it runs in, and what that CLI started",
     const scratch = await mkdtemp(join(tmpdir(), "bit-cli-crash-"));
     const pidFile = join(scratch, "tool.pid");
     const { sdk, seen } = spawningSdk(
-      `setsid sleep 30 & echo $! > '${pidFile}'; sleep 0.4; kill -9 $$`,
+      `setsid ${TOOL} & echo $! > '${pidFile}'; sleep 0.4; kill -9 $$`,
     );
     let tool: number | undefined;
     try {
