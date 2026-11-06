@@ -353,7 +353,7 @@ const run = <A, E>(
     Effect.gen(function* () {
       const probe = yield* world(options);
       return yield* body(probe).pipe(Effect.ensuring(probe.close));
-    }) as Effect.Effect<A, never>,
+    }).pipe(Effect.orDie),
   );
 
 const question = (id: string): HarnessQuestion => ({
