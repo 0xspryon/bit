@@ -247,8 +247,11 @@
     if (event.key !== "Escape" || event.defaultPrevented || composing(event)) {
       return;
     }
+    // An owner that cannot dismiss: Esc is not a dismissal there.
+    const dismiss = question?.dismiss;
+    if (dismiss === undefined) return;
     event.preventDefault();
-    question?.dismiss();
+    dismiss();
   }
 
   // E8's chip goes in the app's title bar, for as long as this chat is on screen.

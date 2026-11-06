@@ -26,7 +26,9 @@
  * ## What an owner leaves out
  *
  * The server's members are the chat's abilities: an owner whose server has no `context`
- * has no meter, no `switchModel` no picker, no `stopSubagent` no card Stop. The binding
+ * has no meter, no `switchModel` no picker, no `stopSubagent` no card Stop, no `stopAll`
+ * no Stop all, no `answerQuestion` no dock ({@link ConversationAbilities}). Nothing falls
+ * back to another action in a missing one's place. The binding
  * names how the owner's frames are routed, what an empty session is, and the agent as
  * sentences name it. The importer's starters, agent registry, mock scenarios and stand-in
  * reply are its own (`importerSessions.svelte.ts`).
@@ -136,6 +138,38 @@ export interface ConversationBinding<S extends ConversationSession> {
    */
   readonly standIn?: { readonly headline: string; readonly body: string };
 }
+
+/**
+ * The optional abilities a chat draws a control for (review 1 of slice 2). Leaving one out
+ * of the owner's {@link ConversationServer} means the chat cannot do that thing: no
+ * `stopAll`, no Stop all pill; no `answerQuestion`, no dock (the question is only the
+ * transcript's tool row); no `dismissQuestion`, a dock with no dismissal; no
+ * `stopSubagent`, no Stop on a sub-agent's card (the page that draws the cards reads it).
+ */
+export interface ConversationAbilities {
+  readonly stopAll: boolean;
+  readonly stopSubagent: boolean;
+  readonly answerQuestion: boolean;
+  readonly dismissQuestion: boolean;
+}
+
+/** What `server` can do; everything, for no server (the prototype draws it all). */
+export const abilitiesOf = (
+  server: ConversationServer | undefined,
+): ConversationAbilities =>
+  server === undefined
+    ? {
+        stopAll: true,
+        stopSubagent: true,
+        answerQuestion: true,
+        dismissQuestion: true,
+      }
+    : {
+        stopAll: server.stopAll !== undefined,
+        stopSubagent: server.stopSubagent !== undefined,
+        answerQuestion: server.answerQuestion !== undefined,
+        dismissQuestion: server.dismissQuestion !== undefined,
+      };
 
 /** A binding nothing is routed to, until the constructor installs the real one. */
 const UNBOUND: ConversationBinding<ConversationSession> = {
@@ -679,6 +713,14 @@ export class ConversationSessions<
   #serverAgents: AgentsView | undefined = undefined;
   #server: ConversationServer | undefined = undefined;
 
+  /**
+   * Which of the server's optional abilities the chat draws (review 1 of slice 2): one the
+   * owner's server leaves out is a control that is not drawn, never a quiet fallback to
+   * another action. Read from the server when it is installed. Without one — the state
+   * picker's scenarios — the prototype draws everything, as it always has.
+   */
+  abilities = $state<ConversationAbilities>(abilitiesOf(undefined));
+
   constructor(
     binding: ConversationBinding<S>,
     now: () => number = () => Date.now(),
@@ -715,6 +757,7 @@ export class ConversationSessions<
     this.#activityOf.clear();
     this.#forgetBreakdowns();
     this.#server = undefined;
+    this.abilities = abilitiesOf(undefined);
     this.notice = "";
     this.refused = false;
     this.sending = false;
@@ -856,6 +899,7 @@ export class ConversationSessions<
     this.#activityOf.clear();
     this.#forgetBreakdowns();
     this.#server = server;
+    this.abilities = abilitiesOf(server);
     this.draft = "";
     this.files.clear();
     this.notice = "";
@@ -2169,6 +2213,8 @@ export class ConversationSessions<
       this.#turnsEnded();
       return;
     }
+    // An owner without Stop all cannot stop all: nothing falls back to a plain Stop.
+    if (all && server.stopAll === undefined) return;
     if (this.stopping) return;
     this.stopping = true;
     // Stop all (A7-S, E7): the session's sub-agents first, then the turn, in one request.
@@ -2665,7 +2711,10 @@ export class ConversationSessions<
    * (`ImporterConversationView.question`), moved by the live `question` frames since.
    */
   question = $derived<PendingQuestion | undefined>(
-    this.current?.history.question ?? undefined,
+    // An owner that cannot answer has no dock: the question is the transcript's tool row.
+    this.abilities.answerQuestion
+      ? (this.current?.history.question ?? undefined)
+      : undefined,
   );
 
   /**
@@ -2742,21 +2791,24 @@ export class ConversationSessions<
       session === undefined ||
       question === undefined ||
       conversationId === undefined ||
-      server.answerQuestion === undefined ||
-      server.dismissQuestion === undefined ||
       this.questionBusy
     ) {
       return;
     }
-    this.questionBusy = true;
-    const answer =
+    // Only what the owner can do: one without the ability is not asked, nor another instead.
+    const { answerQuestion, dismissQuestion } = server;
+    const settle =
       how === "answer"
-        ? await server.answerQuestion(
-            conversationId,
-            question.questionId,
-            answers ?? {},
-          )
-        : await server.dismissQuestion(conversationId, question.questionId);
+        ? answerQuestion === undefined
+          ? undefined
+          : () =>
+              answerQuestion(conversationId, question.questionId, answers ?? {})
+        : dismissQuestion === undefined
+          ? undefined
+          : () => dismissQuestion(conversationId, question.questionId);
+    if (settle === undefined) return;
+    this.questionBusy = true;
+    const answer = await settle();
     this.questionBusy = false;
     if (this.#server !== server) return;
     const putAway = (): void =>

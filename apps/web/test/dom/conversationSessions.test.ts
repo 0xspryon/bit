@@ -4,13 +4,14 @@
  * `ConversationSessions`, `conversationServer` and `chatSessionOf` — the three pieces a goal
  * chat is to be built from — with fake endpoints standing in for its routes.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 import type {
   ConversationStopped,
   LiveConnection,
   LiveItem,
   LiveQuestion,
+  QuestionAnswerability,
 } from "@bit/contracts";
 
 import type { Call } from "../../src/lib/client";
@@ -19,7 +20,10 @@ import {
   type ConversationReplayView,
   type ConversationSession,
 } from "../../src/lib/conversationChat";
-import { chatSessionOf } from "../../src/lib/conversationChatSession";
+import {
+  chatSessionOf,
+  type ConversationChatWords,
+} from "../../src/lib/conversationChatSession";
 import {
   conversationServer,
   type ConversationEndpoints,
@@ -29,6 +33,15 @@ import {
   type ConversationBinding,
 } from "../../src/lib/conversationSessions.svelte";
 import { AT, ok, replayItem } from "../fakeServer";
+import { click, mountInto, press, settle as drawn, type Mounted } from "./dom";
+
+const { default: ProbeChat } = await import("./fixtures/ProbeChat.svelte");
+
+let mounted: Mounted[] = [];
+afterEach(() => {
+  for (const each of mounted) each.destroy();
+  mounted = [];
+});
 
 /** The probe's accepted message on its (imaginary) wire. */
 interface ProbeTurn {
@@ -116,6 +129,7 @@ const world = (
   const calls: string[] = [];
   const forgotten: string[] = [];
   let live: readonly LiveItem[] = [];
+  let turn: "idle" | "running" = "idle";
   let next: ProbeTurn = {
     periodId: "gper_1",
     sessionId: "ses_1",
@@ -150,9 +164,7 @@ const world = (
       return Promise.resolve(ok(stopped));
     },
     activity: (id) =>
-      Promise.resolve(
-        ok({ conversationId: id, turn: "idle" as const, background: false }),
-      ),
+      Promise.resolve(ok({ conversationId: id, turn, background: false })),
     answerQuestion: (id, questionId) => {
       calls.push(`answer ${id} ${questionId}`);
       return Promise.resolve(ok({ questionId, settled: "answered" as const }));
@@ -225,8 +237,120 @@ const world = (
     answerNext: (turn: ProbeTurn) => {
       next = turn;
     },
+    /** What the activity route answers from now on: a turn running, or nothing. */
+    running: (running: boolean) => {
+      turn = running ? "running" : "idle";
+    },
   };
 };
+
+/** The probe owner's words: empty but for the ones a test reads. */
+const WORDS: ConversationChatWords = {
+  shell: {
+    working: "",
+    copyReply: "",
+    stopTurn: "Stop the goal agent",
+    stopBackground: "",
+    messageLabel: "",
+    sendLabel: "",
+    sendTitle: "",
+    sendQueuedTitle: "",
+    countTitle: "",
+    questionsAsked: () => "",
+  },
+  empty: "",
+  agent: "Goal agent",
+  stopAll: "Stop every sub-agent, then the goal agent",
+  placeholder: () => "",
+  stranded: () => ({ note: "", placeholder: "" }),
+  ended: { note: "", placeholder: "" },
+  reading: () => "",
+  sendNow: () => "",
+  sentNow: () => "",
+};
+
+/** The probe's chat as the shell takes it, with `running` sub-agents bit can stop. */
+const probeChat = (
+  state: ConversationSessions<ConversationSession>,
+  options: {
+    readonly connection?: () => LiveConnection | undefined;
+    readonly subagents?: number;
+  } = {},
+) =>
+  chatSessionOf({
+    state,
+    words: WORDS,
+    label: () => "Goal chat",
+    endedReason: "goal_ended",
+    connection: () => options.connection?.(),
+    stoppableSubagents: () => options.subagents ?? 0,
+    maxChars: 100,
+    loadFile: () => Promise.reject(new Error("no files")),
+  });
+
+/** The probe's chat drawn by the real shell; unmounted after the test. */
+const drawChat = async (
+  chat: ReturnType<typeof probeChat>["chat"],
+): Promise<HTMLElement> => {
+  const view = mountInto(ProbeChat, { chat });
+  mounted.push(view);
+  await drawn();
+  return view.target;
+};
+
+/** A question frame for the probe's period `gper_1`, routed by `goalId`. */
+const asked = (
+  answerability: QuestionAnswerability = "live",
+  questionId = "q_1",
+): LiveQuestion =>
+  ({
+    _tag: "question",
+    question: {
+      questionId,
+      harnessSessionId: "ses_1",
+      fields: [
+        {
+          key: "Change production?",
+          header: "Critical action",
+          question: "Change production?",
+          kind: "one",
+          options: [
+            { label: "Approve once", description: null },
+            { label: "Deny", description: null },
+          ],
+          custom: true,
+          required: true,
+        },
+      ],
+      askedAt: AT,
+      answerability,
+      // The A9 seam: a critical action, carried through untouched.
+      tag: "critical",
+      attemptId: null,
+      roundId: null,
+      goalId: "gper_1",
+      importId: null,
+    },
+    questionId,
+    settled: null,
+    at: AT,
+    attemptId: null,
+    roundId: null,
+    goalId: "gper_1",
+    importId: null,
+  }) as unknown as LiveQuestion;
+
+const dockOf = (root: HTMLElement): HTMLElement | null =>
+  root.querySelector("section.question-dock");
+const named = (
+  root: HTMLElement,
+  name: string,
+): HTMLButtonElement | undefined =>
+  [...root.querySelectorAll("button")].find(
+    (each) =>
+      (each.getAttribute("aria-label") ?? each.textContent ?? "").trim() ===
+      name,
+  );
 
 describe("the generic chat state through a goal-shaped owner", () => {
   test("lists the owner's sessions newest first and replays one, routed by goalId", async () => {
@@ -303,38 +427,7 @@ describe("the generic chat state through a goal-shaped owner", () => {
     let frame: LiveConnection | undefined;
     probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
     probe.state.open("ses_1");
-    const { chat } = chatSessionOf({
-      state: probe.state,
-      words: {
-        shell: {
-          working: "",
-          copyReply: "",
-          stopTurn: "",
-          stopBackground: "",
-          messageLabel: "",
-          sendLabel: "",
-          sendTitle: "",
-          sendQueuedTitle: "",
-          countTitle: "",
-          questionsAsked: () => "",
-        },
-        empty: "",
-        agent: "Goal agent",
-        stopAll: "",
-        placeholder: () => "",
-        stranded: () => ({ note: "", placeholder: "" }),
-        ended: { note: "", placeholder: "" },
-        reading: () => "",
-        sendNow: () => "",
-        sentNow: () => "",
-      },
-      label: () => "Goal chat",
-      endedReason: "goal_ended",
-      connection: (id) => (id === "gper_1" ? frame : undefined),
-      stoppableSubagents: () => 0,
-      maxChars: 100,
-      loadFile: () => Promise.reject(new Error("no files")),
-    });
+    const { chat } = probeChat(probe.state, { connection: () => frame });
     expect(chat.connection).toBe("");
     frame = {
       _tag: "connection",
@@ -352,16 +445,56 @@ describe("the generic chat state through a goal-shaped owner", () => {
     expect(chat.footer.agent).toBe("Goal agent");
   });
 
-  test("Stop goes to the period; Stop all without the ability falls back to Stop", async () => {
+  test("Stop goes to the period; without the Stop all ability, Stop all is never asked for", async () => {
     const probe = world({ leaveOut: ["stopAll"] });
     probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
     probe.state.open("ses_1");
     await settle();
     await probe.state.stop();
+    // Nothing falls back to a plain Stop under Stop all's name (review 1 of slice 2).
     await probe.state.stop(true);
     expect(probe.calls.filter((call) => call.startsWith("stop"))).toEqual([
       "stop gper_1",
+    ]);
+  });
+
+  test("an owner without Stop all draws no Stop all: running sub-agents leave the turn's Stop", async () => {
+    const probe = world({ leaveOut: ["stopAll"] });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.running(true);
+    probe.state.draft = "Go on";
+    probe.state.send();
+    await settle();
+    expect(probe.state.current?.working).toBe(true);
+    const { chat } = probeChat(probe.state, { subagents: 2 });
+    expect(chat.stopAll).toBeUndefined();
+    const root = await drawChat(chat);
+    const stop = root.querySelector<HTMLButtonElement>("button.stop");
+    expect(stop?.getAttribute("title")).toBe("Stop the goal agent");
+    expect(stop?.textContent ?? "").not.toContain("Stop all");
+    if (stop === null) throw new Error("no Stop");
+    click(stop);
+    await settle();
+    expect(probe.calls.filter((call) => call.startsWith("stop"))).toEqual([
       "stop gper_1",
+    ]);
+  });
+
+  test("an owner with Stop all draws it in Stop's place while sub-agents run, and asks for it", async () => {
+    const probe = world();
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    const root = await drawChat(probeChat(probe.state, { subagents: 2 }).chat);
+    const stop = root.querySelector<HTMLButtonElement>("button.stop");
+    expect(stop?.textContent ?? "").toContain("Stop all");
+    if (stop === null) throw new Error("no Stop all");
+    click(stop);
+    await settle();
+    expect(probe.calls.filter((call) => call.startsWith("stop"))).toEqual([
+      "stopAll gper_1",
     ]);
   });
 
@@ -370,47 +503,65 @@ describe("the generic chat state through a goal-shaped owner", () => {
     probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
     probe.state.open("ses_1");
     await settle();
-    const question: LiveQuestion = {
-      _tag: "question",
-      question: {
-        questionId: "q_1",
-        harnessSessionId: "ses_1",
-        fields: [
-          {
-            key: "Change production?",
-            header: "Critical action",
-            question: "Change production?",
-            kind: "one",
-            options: [
-              { label: "Approve once", description: null },
-              { label: "Deny", description: null },
-            ],
-            custom: true,
-            required: true,
-          },
-        ],
-        askedAt: AT,
-        answerability: "live",
-        // The A9 seam: a critical action, carried through untouched.
-        tag: "critical",
-        attemptId: null,
-        roundId: null,
-        goalId: "gper_1",
-        importId: null,
-      },
-      questionId: "q_1",
-      settled: null,
-      at: AT,
-      attemptId: null,
-      roundId: null,
-      goalId: "gper_1",
-      importId: null,
-    } as unknown as LiveQuestion;
+    const question = asked();
     probe.state.noteQuestion(question);
     expect(probe.state.question?.questionId).toBe("q_1");
     expect(probe.state.question?.tag).toBe("critical");
     await probe.state.answerQuestion({ "Change production?": ["Deny"] });
     expect(probe.calls).toContain("answer gper_1 q_1");
+  });
+
+  test("an owner that cannot answer has no dock: the box stays, and nothing is sent", async () => {
+    const probe = world({ leaveOut: ["answerQuestion", "dismissQuestion"] });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.state.noteQuestion(asked());
+    expect(probe.state.question).toBeUndefined();
+    const { chat } = probeChat(probe.state);
+    expect(chat.question).toBeUndefined();
+    const root = await drawChat(chat);
+    expect(dockOf(root)).toBeNull();
+    expect(root.querySelector("textarea")).not.toBeNull();
+    await probe.state.answerQuestion({ "Change production?": ["Deny"] });
+    await probe.state.dismissQuestion();
+    expect(
+      probe.calls.filter(
+        (call) => call.startsWith("answer") || call.startsWith("dismiss"),
+      ),
+    ).toEqual([]);
+  });
+
+  test("an owner that answers but cannot dismiss: a dock with no dismissal, and Esc does not dismiss", async () => {
+    const probe = world({ leaveOut: ["dismissQuestion"] });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.state.noteQuestion(asked());
+    const { chat } = probeChat(probe.state);
+    expect(chat.question?.dismiss).toBeUndefined();
+    const root = await drawChat(chat);
+    const dock = dockOf(root);
+    expect(dock).not.toBeNull();
+    expect(named(root, "Dismiss these questions")).toBeUndefined();
+    expect(dock?.textContent ?? "").not.toContain("reply in chat instead");
+    root.querySelector<HTMLInputElement>(".current input[type=radio]")?.focus();
+    press("Escape");
+    await drawn();
+    expect(dockOf(root)).not.toBeNull();
+    await probe.state.dismissQuestion();
+    expect(probe.calls.some((call) => call.startsWith("dismiss"))).toBe(false);
+    expect(probe.state.question?.questionId).toBe("q_1");
+  });
+
+  test("a question no longer waiting natively, on an owner that cannot dismiss, is not docked", async () => {
+    const probe = world({ leaveOut: ["dismissQuestion"] });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.state.noteQuestion(asked("not_resumable"));
+    // Nothing could be sent from it and it could not be put away: it would hold the box.
+    expect(probeChat(probe.state).chat.question).toBeUndefined();
   });
 
   test("an owner without a meter or a switch leaves them out", async () => {

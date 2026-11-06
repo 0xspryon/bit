@@ -256,9 +256,10 @@ export interface ChatQuestion {
   /**
    * Dismisses the question: Esc in the dock, or its own control. `live`: the agent is told
    * the operator declined. Otherwise the question is put away. The shell then puts focus in
-   * the box.
+   * the box. Absent where the owner cannot dismiss: no dismiss control, and Esc does not
+   * dismiss.
    */
-  readonly dismiss: () => void;
+  readonly dismiss?: (() => void) | undefined;
   /** An answer or a dismissal the server refused, for the F2 dialog. */
   readonly refusal?: ErrorNotice | undefined;
   readonly dismissRefusal?: (() => void) | undefined;

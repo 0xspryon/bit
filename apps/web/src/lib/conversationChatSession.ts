@@ -258,6 +258,8 @@ export const chatSessionOf = <S extends ConversationSession>(
      * from here, so a card a replay still draws running with no Stop is not counted.
      */
     get stopAll() {
+      // No Stop all ability, no Stop all: Stop stays where it is (review 1 of slice 2).
+      if (!input.state.abilities.stopAll) return undefined;
       return {
         running: input.stoppableSubagents(),
         stop: () => void input.state.stop(true),
@@ -275,17 +277,31 @@ export const chatSessionOf = <S extends ConversationSession>(
      * session, when the dock reads only.
      */
     get question(): ChatQuestion | undefined {
+      // No `answerQuestion`, no question here (the state offers none): no dock.
       const pending = input.state.question;
       if (pending === undefined) return undefined;
+      const sendAsMessage = blocked()
+        ? undefined
+        : (text: string) => input.state.sendAnswersAsMessage(text);
+      const dismisses = input.state.abilities.dismissQuestion;
+      /*
+       * A dock with nothing it can send and no dismissal would hold the box for good: a
+       * question no longer waiting natively, on an owner that cannot dismiss, is left to the
+       * transcript's tool row.
+       */
+      const readOnly =
+        pending.answerability === "not_resumable" ||
+        (pending.answerability === "message" && sendAsMessage === undefined);
+      if (readOnly && !dismisses) return undefined;
       return {
         pending,
         asker: `The ${agentLabel().toLowerCase()}`,
         busy: input.state.questionBusy || input.state.sending,
         answer: (answers) => void input.state.answerQuestion(answers),
-        sendAsMessage: blocked()
-          ? undefined
-          : (text) => input.state.sendAnswersAsMessage(text),
-        dismiss: () => void input.state.dismissQuestion(),
+        sendAsMessage,
+        dismiss: dismisses
+          ? () => void input.state.dismissQuestion()
+          : undefined,
         refusal: input.state.questionRefusal,
         dismissRefusal: () => input.state.dismissQuestionRefusal(),
       };

@@ -83,6 +83,8 @@
       (pending.answerability === "message" && !canMessage),
   );
   let note = $derived(answerabilityNote(pending, question.asker, canMessage));
+  /** Whether the owner can dismiss: without it, no dismiss control and no Esc to dismiss. */
+  let dismisses = $derived(question.dismiss !== undefined);
 
   // svelte-ignore state_referenced_locally
   const kept = drafts.get(questionSignature(question.pending));
@@ -440,18 +442,21 @@
     >
       <IconAngleRight />
     </button>
-    <button
-      type="button"
-      class="arrow dismiss"
-      aria-label={pending.answerability === "live"
-        ? "Dismiss these questions"
-        : "Put these questions away"}
-      title={dismissTitle}
-      disabled={question.busy}
-      onclick={() => question.dismiss()}
-    >
-      <IconClose />
-    </button>
+    {#if question.dismiss !== undefined}
+      {@const dismiss = question.dismiss}
+      <button
+        type="button"
+        class="arrow dismiss"
+        aria-label={pending.answerability === "live"
+          ? "Dismiss these questions"
+          : "Put these questions away"}
+        title={dismissTitle}
+        disabled={question.busy}
+        onclick={() => dismiss()}
+      >
+        <IconClose />
+      </button>
+    {/if}
   </header>
 
   {#if answered.length > 0}
@@ -583,20 +588,25 @@
           <kbd>1–{field.options.length + (field.custom ? 1 : 0)}</kbd>
           choose · <kbd>Enter</kbd> next
         {/if}
-        · <kbd>Esc</kbd>
-        {inWords
-          ? "leave the box"
-          : pending.answerability === "live"
-            ? "reply in chat instead"
-            : "put away"}
-      {:else}
+        {#if inWords || dismisses}
+          · <kbd>Esc</kbd>
+          {inWords
+            ? "leave the box"
+            : pending.answerability === "live"
+              ? "reply in chat instead"
+              : "put away"}
+        {/if}
+      {:else if dismisses}
         <kbd>Esc</kbd> put away
       {/if}
     </span>
     {#if readOnly}
-      <button type="button" class="primary" onclick={() => question.dismiss()}>
-        Dismiss
-      </button>
+      {#if question.dismiss !== undefined}
+        {@const dismiss = question.dismiss}
+        <button type="button" class="primary" onclick={() => dismiss()}>
+          Dismiss
+        </button>
+      {/if}
     {:else}
       {#if !field.required && !currentAnswered && !last}
         <button type="button" class="quiet" onclick={() => go(index + 1)}
@@ -618,7 +628,9 @@
           class="primary"
           disabled={question.busy || !mayMoveOn || answeredCount === 0}
           title={answeredCount === 0
-            ? "Answer at least one question, or dismiss them (Esc)"
+            ? dismisses
+              ? "Answer at least one question, or dismiss them (Esc)"
+              : "Answer at least one question"
             : undefined}
           onclick={submit}
         >
