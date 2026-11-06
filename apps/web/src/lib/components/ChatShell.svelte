@@ -16,10 +16,23 @@
    *   and caption. A model switch is a picker over the app's harnesses, so it stays the
    *   chat's (see the plan note for what the other roles need).
    * - `below` — under the composer: the importer's starters.
-   * - `dock` — **above the composer, A7-Q's question dock** (E3/E4). Drawn whatever the
-   *   composer's state, a closed one included: a planner or a worker can ask a question and
-   *   the operator must be able to answer it there. Empty until A7-Q.
-   * - `header` — the top of the page, **A7-S's sub-agents chip** (E8). Empty until A7-S.
+   * - `dock` — **A7-Q's question dock** (E3/E4), drawn **in the composer's slot** while the
+   *   session has a `question`: the box — open, blocked or closed — is not drawn, and the
+   *   dock is, in the same column at the same width, with Stop and the elapsed clock where
+   *   they were and the sentences above the box kept. E3: "the composer's slot becomes the
+   *   question dock — same width, same border, nothing above it moves; Esc gives the
+   *   composer back". Esc in the dock asks the adapter to dismiss the question
+   *   (`ChatQuestion.dismiss`); once the adapter takes `question` away — dismissed, or
+   *   answered — the box is drawn again and, if focus went with the dock, gets it back.
+   *   Empty until A7-Q.
+   * - `controls` — beside Stop: **E7's "Stop all"** for a session's sub-agents. Drawn
+   *   whether or not Stop is; the chat decides when its control applies. Empty until A7-S.
+   * - `chip` — **E8's sub-agents chip**, which is not drawn in the chat at all: it is
+   *   placed in the app's title bar beside the session chip (`titleBarChips.svelte.ts`) for
+   *   as long as this shell is mounted. Empty until A7-S.
+   * - `aside` — **E8's 400px panel** of sub-agents, beside the chat column and narrowing it
+   *   rather than covering it. The thread's 800px column gives way first (`Chat`'s
+   *   `--column`). Empty until A7-S.
    * - `subagent` — **A7-S's card** (E7) in place of a sub-agent's U14 entry, per row.
    *   Absent until A7-S, so the entry is drawn as before.
    * - `separator`, `tail`, `footer` — a turn's bubble, cursor and footer, the shell's own
@@ -32,7 +45,7 @@
    * is drawn while the server says something runs — a turn, or background work with no
    * turn (A6 U6) — and keeps working above a closed composer, with its elapsed clock.
    */
-  import type { Snippet } from "svelte";
+  import { tick, type Snippet } from "svelte";
 
   import {
     durationLabel,
@@ -42,12 +55,15 @@
   } from "../chat";
   import {
     clockLabel,
+    openComposer,
     replyText,
     stopOffered,
     turnFooterText,
+    type ChatQuestion,
     type ChatSession,
     type ThreadTurn,
   } from "../chatShell";
+  import { titleBarChips } from "../titleBarChips.svelte";
   import { setAttachmentLoader } from "../attachmentFiles";
   import { panelFileDrop } from "../composerFiles.svelte";
   import AttachmentChips from "./AttachmentChips.svelte";
@@ -69,7 +85,9 @@
     strip,
     below,
     dock,
-    header,
+    controls: chatControls,
+    chip,
+    aside,
     subagent,
   }: {
     session: ChatSession<Subject>;
@@ -84,8 +102,14 @@
     footer?: Snippet<[ChatGroup<Subject>]> | undefined;
     strip?: Snippet | undefined;
     below?: Snippet | undefined;
-    dock?: Snippet | undefined;
-    header?: Snippet | undefined;
+    /** A7-Q's dock, drawn in the box's place while `session.question` is set. */
+    dock?: Snippet<[ChatQuestion]> | undefined;
+    /** Beside Stop: E7's "Stop all". */
+    controls?: Snippet | undefined;
+    /** E8's sub-agents chip, placed in the app's title bar. */
+    chip?: Snippet | undefined;
+    /** E8's 400px panel beside the chat column. */
+    aside?: Snippet | undefined;
     subagent?: Snippet<[ChatRow]> | undefined;
   } = $props();
 
@@ -104,6 +128,10 @@
 
   let groups = $derived(session.groups);
   let source = $derived(session.composer);
+  /** The box the operator writes in, when there is one: not closed, not absent. */
+  let open = $derived(openComposer(session));
+  /** The question holding the composer's slot (A7-Q), when there is a dock to draw it in. */
+  let question = $derived(dock === undefined ? undefined : session.question);
   let turn = $derived(session.turn);
   let working = $derived(turn.working);
 
@@ -124,10 +152,8 @@
   let dropping = $state(false);
   const fileDrop = panelFileDrop({
     accepting: () =>
-      session.composer?.files !== undefined &&
-      session.composer.closed === undefined &&
-      !session.composer.blocked,
-    take: (files) => session.composer?.files?.add(files),
+      open?.files !== undefined && !open.blocked && question === undefined,
+    take: (files) => open?.files?.add(files),
     dropping: (over) => (dropping = over),
   });
 
@@ -144,6 +170,38 @@
     }, 1000);
     return () => clearInterval(timer);
   });
+  /**
+   * The composer given back (A7-Q): a question that held its slot is dismissed or answered.
+   * Focus that was in the dock went to `<body>` with it, so it goes to the box — where the
+   * operator's reply in the chat, E3's "reply in chat instead", is written. Focus the
+   * operator has put elsewhere meanwhile is left where it is.
+   */
+  let wasDocked = false;
+  $effect(() => {
+    const docked = question !== undefined;
+    if (wasDocked && !docked) {
+      void tick().then(() => {
+        const at = document.activeElement;
+        if (at === null || at === document.body) composerView?.focus();
+      });
+    }
+    wasDocked = docked;
+  });
+
+  /** Esc in the dock gives the composer back, unless the dock's own control used it. */
+  function ondockkeydown(event: KeyboardEvent): void {
+    if (event.key !== "Escape" || event.defaultPrevented) return;
+    event.preventDefault();
+    question?.dismiss();
+  }
+
+  // E8's chip goes in the app's title bar, for as long as this chat is on screen.
+  const chips = titleBarChips();
+  $effect(() => {
+    if (chip === undefined || chips === undefined) return;
+    return chips.place(chip);
+  });
+
   let elapsed = $derived(
     turn.since === undefined
       ? ""
@@ -269,24 +327,27 @@
   ondrop={fileDrop.ondrop}
   role="presentation"
 >
-  <Chat
-    label={session.label}
-    {groups}
-    readonly={source === undefined && dock === undefined && below === undefined}
-    layout="thread"
-    note={session.note}
-    detail={session.connection}
-    empty={session.empty}
-    separator={separator ?? bubble}
-    tail={tail ?? cursor}
-    footer={footer ?? closing}
-    {footnote}
-    {header}
-    {subagent}
-  >
-    {#snippet controls()}
-      {#if stopOffered(session)}
-        <!--
+  <!-- The chat's column, which E8's panel (`aside`) narrows rather than covers. -->
+  <div class="column">
+    <Chat
+      label={session.label}
+      {groups}
+      readonly={source === undefined &&
+        question === undefined &&
+        below === undefined}
+      layout="thread"
+      note={session.note}
+      detail={session.connection}
+      empty={session.empty}
+      separator={separator ?? bubble}
+      tail={tail ?? cursor}
+      footer={footer ?? closing}
+      {footnote}
+      {subagent}
+    >
+      {#snippet controls()}
+        {#if stopOffered(session)}
+          <!--
           Stop interrupts the agent's turn and keeps the conversation (A6 F5). The cursor
           clears on the server's answer, not on the press. While the answer is coming the pill
           is aria-disabled rather than disabled, so focus stays on it.
@@ -296,68 +357,98 @@
           background work the agent started, which the pill then names, since nothing else on
           screen says it is running. Above the composer whatever its state, a closed one too.
         -->
-        <button
-          bind:this={stopButton}
-          class="stop"
-          type="button"
-          aria-disabled={turn.stopping}
-          title={working
-            ? session.words.stopTurn
-            : session.words.stopBackground}
-          onclick={() => {
-            if (!turn.stopping) session.stop?.();
-          }}
-        >
-          <span class="stop-mark" aria-hidden="true"></span>
-          <span
-            >{turn.stopping
-              ? "Stopping…"
-              : working
-                ? "Stop"
-                : "Stop background work"}</span
+          <button
+            bind:this={stopButton}
+            class="stop"
+            type="button"
+            aria-disabled={turn.stopping}
+            title={working
+              ? session.words.stopTurn
+              : session.words.stopBackground}
+            onclick={() => {
+              if (!turn.stopping) session.stop?.();
+            }}
           >
-        </button>
-        {#if elapsed !== ""}
-          <!-- How long it has run: a fact about the request, not a deadline. -->
-          <span class="elapsed" role="timer">{elapsed}</span>
+            <span class="stop-mark" aria-hidden="true"></span>
+            <span
+              >{turn.stopping
+                ? "Stopping…"
+                : working
+                  ? "Stop"
+                  : "Stop background work"}</span
+            >
+          </button>
+          {#if elapsed !== ""}
+            <!-- How long it has run: a fact about the request, not a deadline. -->
+            <span class="elapsed" role="timer"
+              >{#if session.words.elapsedLead !== undefined}{session.words
+                  .elapsedLead}
+                <strong>{elapsed}</strong>{:else}{elapsed}{/if}</span
+            >
+          {/if}
         {/if}
-      {/if}
-    {/snippet}
+        <!-- The chat's own controls beside Stop: E7's "Stop all" (A7-S). -->
+        {@render chatControls?.()}
+      {/snippet}
 
-    {#snippet composer()}
-      <div class="stack">
-        {#if dock !== undefined}
-          <!--
-            A7-Q's question dock (E3/E4), above the box and over a closed one alike: an
-            agent's question is answered here whether or not the operator may write to it.
+      {#snippet composer()}
+        <div class="stack">
+          {#each open?.notices ?? [] as notice (notice.key)}
+            <!--
+            The sentences above the box, in the chat's order: a refusal, the note on a
+            message the server accepted, a wait. Their words are the server's or the chat's,
+            never the shell's. Kept while a question holds the box's slot: they are about
+            the last message, which a question does not unsay.
           -->
-          <div class="dock">{@render dock()}</div>
-        {/if}
-        {#if session.composer !== undefined}
-          <ChatComposer
-            bind:this={composerView}
-            bind:attachButton
-            composer={session.composer}
-            words={session.words}
-            {working}
-            first={groups.length === 0}
-            {dropping}
-            {id}
-            {strip}
-          />
-        {/if}
-        {@render below?.()}
-      </div>
-    {/snippet}
-  </Chat>
+            <p
+              class={["notice", notice.kind]}
+              role={notice.tone === "alert" ? "alert" : "status"}
+            >
+              {notice.text}
+            </p>
+          {/each}
+          {#if question !== undefined && dock !== undefined}
+            <!--
+            A7-Q's question dock (E3/E4), in the box's slot: the box is not drawn while the
+            agent waits on a question, open or closed alike — a planner or a worker can ask
+            one too. Esc gives the composer back (`ondockkeydown`).
+          -->
+            <div class="dock" role="presentation" onkeydown={ondockkeydown}>
+              {@render dock(question)}
+            </div>
+          {:else if session.composer !== undefined}
+            <ChatComposer
+              bind:this={composerView}
+              bind:attachButton
+              composer={session.composer}
+              words={session.words}
+              {working}
+              first={groups.length === 0}
+              {dropping}
+              {id}
+              {strip}
+            />
+          {/if}
+          {@render below?.()}
+        </div>
+      {/snippet}
+    </Chat>
+  </div>
+  {#if aside !== undefined}
+    <!--
+      E8's panel (A7-S): 400px beside the chat, which reflows to the width left. Its
+      heading, close and contents are the chat's.
+    -->
+    <aside class="aside">{@render aside()}</aside>
+  {/if}
 </div>
 
-{#if session.composer?.files?.refusal !== undefined}
+{#if open?.files?.refusal !== undefined}
   <!-- A file the composer would not take, or a message refused for its files (A6 U13). -->
   <ErrorDialog
-    {...session.composer.files.refusal}
+    {...open.files.refusal}
     opener={attachButton ?? composerView?.input() ?? null}
-    ondismiss={() => session.composer?.files?.dismiss()}
+    ondismiss={() => open?.files?.dismiss()}
   />
 {/if}
 
@@ -370,11 +461,32 @@
 {/if}
 
 <style>
+  /*
+    A row: the chat's column, and E8's panel beside it when there is one. The column is the
+    flex column the chat was always drawn in, so without a panel nothing moves.
+  */
   .chat-shell {
     display: flex;
     flex: 1;
     min-height: 0;
+  }
+  .column {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
     flex-direction: column;
+  }
+  /*
+    E8: 400px, the height of the page under the title bar, scrolling on its own, a hairline
+    between it and the chat. What is inside — the heading, the groups — is A7-S's.
+  */
+  .aside {
+    flex: 0 0 400px;
+    min-height: 0;
+    overflow-y: auto;
+    box-sizing: border-box;
+    border-left: 1px solid var(--border-muted);
   }
 
   .streaming {
@@ -504,7 +616,7 @@
     color: var(--text-muted);
   }
 
-  /* ── The composer's column: the dock, the box, what hangs under it ─────────── */
+  /* ── The composer's column: the sentences, the box or the dock, what hangs under it ── */
   .stack {
     display: flex;
     flex: 1 1 100%;
@@ -515,6 +627,16 @@
   .dock {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+  }
+  /* ── The sentences about the last message ──────────────────────────────────── */
+  .notice {
+    margin: 0;
+    color: var(--text-muted);
+    font: 400 12px/18px var(--font-sans);
+    text-wrap: pretty;
+    overflow-wrap: anywhere;
+  }
+  .notice.refusal {
+    color: var(--state-fg-danger);
   }
 </style>

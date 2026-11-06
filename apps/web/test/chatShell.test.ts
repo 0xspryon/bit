@@ -13,14 +13,12 @@ import {
   replyText,
   stopOffered,
   turnFooterText,
-  type ChatComposerSource,
   type ChatSession,
+  type OpenChatComposer,
   type ThreadTurn,
 } from "../src/lib/chatShell";
 
-const source = (
-  over: Partial<ChatComposerSource> = {},
-): ChatComposerSource => ({
+const source = (over: Partial<OpenChatComposer> = {}): OpenChatComposer => ({
   draft: "",
   sending: false,
   blocked: false,
@@ -36,9 +34,8 @@ describe("composerCanSend", () => {
       true,
     );
     expect(composerCanSend(source({ draft: "   " }))).toBe(false);
-    expect(
-      composerCanSend(source({ draft: "hi", closed: "A planner takes none." })),
-    ).toBe(false);
+    // A closed box is its reason alone (`ClosedChatComposer`), with nothing to send.
+    expect(composerCanSend({ closed: "A planner takes none." })).toBe(false);
     expect(composerCanSend(source({ draft: "hi", blocked: true }))).toBe(false);
     expect(composerCanSend(source({ draft: "hi", sending: true }))).toBe(false);
   });

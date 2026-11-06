@@ -5,7 +5,7 @@
  * The importer's own suites (`importer.test.ts` and its neighbours) are the proof the shell
  * draws the importer as before; this file is the proof it draws a chat that is not the
  * importer — a closed composer with Stop still working, no Send now where the server cannot
- * steer, the dock over a closed box, and a sub-agent's row handed to the chat's card.
+ * steer, A7-Q's dock in the box's place, and A7-S's card, chip, panel and "Stop all".
  * Compared as strings and booleans, never with `toEqual` on a node.
  */
 import { afterEach, describe, expect, test } from "bun:test";
@@ -30,8 +30,12 @@ interface Options {
   readonly steerable?: boolean;
   readonly attachable?: boolean;
   readonly dock?: boolean;
+  readonly asking?: boolean;
   readonly cards?: boolean;
+  readonly stopAll?: boolean;
+  readonly panel?: boolean;
   readonly since?: number;
+  readonly elapsedLead?: string;
   readonly items?: readonly LiveItem[];
 }
 
@@ -52,11 +56,16 @@ const shell = async (options: Options = {}) => {
   const set = async (next: {
     readonly working?: boolean;
     readonly stopping?: boolean;
+    readonly asking?: boolean;
   }): Promise<void> => {
     chat.set(next);
     await settle();
   };
-  return { calls, root, set };
+  const attach = async (files: readonly File[]): Promise<void> => {
+    chat.attach(files);
+    await settle();
+  };
+  return { calls, root, set, attach };
 };
 
 const subagent = (outcome: string | null): LiveItem => ({
@@ -139,6 +148,20 @@ describe("a closed composer (the planner's, a worker's)", () => {
     expect(calls.join(",")).toBe("stop");
   });
 
+  test("the clock is led by the chat's own words where it has them (the planner's)", async () => {
+    const { root, set } = await shell({
+      closed: "Steered from the goal chat.",
+      since: Date.now() - 65_000,
+      elapsedLead: "Planning for",
+    });
+    await set({ working: true });
+    const clock = root.querySelector(".elapsed");
+    expect(clock?.textContent?.replace(/\s+/gu, " ").trim()).toBe(
+      "Planning for 1m 05s",
+    );
+    expect(clock?.querySelector("strong")?.textContent).toBe("1m 05s");
+  });
+
   test("a chat that cannot stop draws no Stop while it runs", async () => {
     const { root, set } = await shell({ stoppable: false });
     await set({ working: true });
@@ -197,32 +220,107 @@ describe("Send now and the queue", () => {
   });
 });
 
-describe("the hosting points for A7", () => {
-  test("A7-Q's dock is drawn above a closed composer", async () => {
-    const { root } = await shell({
+describe("A7-Q's question dock takes the composer's slot (E3)", () => {
+  const box = (root: HTMLElement) => root.querySelector(".stack > form.box");
+  const dock = (root: HTMLElement) => root.querySelector(".stack > .dock");
+
+  test("while a question waits the box is not drawn and the dock is, in its place", async () => {
+    const { root, set } = await shell({ dock: true, steerable: true });
+    await set({ working: true });
+    await type(textarea(root), "Half a sentence");
+    expect(box(root)).not.toBeNull();
+    expect(dock(root)).toBeNull();
+
+    await set({ asking: true });
+    expect(dock(root)?.querySelector("p")?.textContent).toBe(
+      "Which host first?",
+    );
+    // In the box's place: no box, no textarea, no strip, no send buttons.
+    expect(box(root)).toBeNull();
+    expect(root.querySelector("textarea")).toBeNull();
+    expect(root.querySelector(".send")).toBeNull();
+    expect(root.querySelector(".send-now")).toBeNull();
+    // Where the box was: after the sentences above it, in the composer's column.
+    const notice = root.querySelector(".stack > .notice");
+    expect(notice?.textContent?.trim()).toBe("The last message was delivered.");
+    expect(
+      notice !== null &&
+        (notice.nextElementSibling?.classList.contains("dock") ?? false),
+    ).toBe(true);
+    // Stop stays where it was, above the composer's column.
+    expect(root.querySelector(".controls .stop")?.textContent?.trim()).toBe(
+      "Stop",
+    );
+
+    // Answered on the server: the box is back, with the words that were in it.
+    await set({ asking: false });
+    expect(dock(root)).toBeNull();
+    expect(box(root)).not.toBeNull();
+    expect(textarea(root).value).toBe("Half a sentence");
+  });
+
+  test("Esc in the dock gives the composer back, focused", async () => {
+    const { root, calls } = await shell({ dock: true, asking: true });
+    expect(box(root)).toBeNull();
+    const answer = button(root, ".fake-answer");
+    answer.focus();
+    answer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    await settle();
+    expect(calls.join(",")).toBe("dismiss");
+    expect(dock(root)).toBeNull();
+    expect(box(root)).not.toBeNull();
+    expect(document.activeElement === textarea(root)).toBe(true);
+  });
+
+  test("the dock's own dismiss gives the composer back too", async () => {
+    const { root, calls } = await shell({ dock: true, asking: true });
+    click(button(root, ".fake-reply"));
+    await settle();
+    expect(calls.join(",")).toBe("dismiss");
+    expect(box(root)).not.toBeNull();
+  });
+
+  test("an Esc the dock's control kept for itself does not dismiss it", async () => {
+    const { root, calls } = await shell({ dock: true, asking: true });
+    const escape = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    escape.preventDefault();
+    button(root, ".fake-answer").dispatchEvent(escape);
+    await settle();
+    expect(calls.join(",")).toBe("");
+    expect(dock(root)).not.toBeNull();
+  });
+
+  test("it takes a closed box's place as well, its reason included", async () => {
+    const { root, set } = await shell({
       closed: "The prompt is the intent's question.",
       dock: true,
     });
-    const dock = root.querySelector(".stack > .dock");
-    const box = root.querySelector(".stack > .box");
-    expect(dock?.textContent?.trim()).toBe("Which host first?");
-    expect(box).not.toBeNull();
-    // Above it: the dock comes first in the composer's column.
-    expect(
-      dock !== null &&
-        box !== null &&
-        (dock.compareDocumentPosition(box) &
-          Node.DOCUMENT_POSITION_FOLLOWING) !==
-          0,
-    ).toBe(true);
+    expect(root.querySelector(".closed-reason")).not.toBeNull();
+    await set({ asking: true });
+    expect(root.querySelector(".closed-reason")).toBeNull();
+    expect(box(root)).toBeNull();
+    expect(dock(root)).not.toBeNull();
+    await set({ asking: false });
+    expect(root.querySelector(".closed-reason")?.textContent).toBe(
+      "The prompt is the intent's question.",
+    );
   });
 
-  test("a chat with no dock snippet draws no dock region", async () => {
-    const { root } = await shell({});
-    expect(root.querySelector(".dock")).toBeNull();
+  test("a question with no dock to draw it in leaves the box, and a chat with no dock has no region", async () => {
+    const asked = await shell({ asking: true });
+    expect(box(asked.root)).not.toBeNull();
+    expect(asked.root.querySelector(".dock")).toBeNull();
   });
+});
 
-  test("A7-S's card hook draws a sub-agent's folded row, and its header chip", async () => {
+describe("the hosting points for A7-S (E7, E8)", () => {
+  test("the card hook draws a sub-agent's folded row, and the chip goes in the title bar", async () => {
     const { root } = await shell({
       cards: true,
       items: [subagent(null), subagent("finished")],
@@ -234,15 +332,84 @@ describe("the hosting points for A7", () => {
     expect(cards.join("|")).toBe("general-purpose: finished");
     // Not also the U14 entry.
     expect(root.querySelector("li.block.subagent")).toBeNull();
-    expect(root.querySelector(".header-region .fake-chip")?.textContent).toBe(
+    // E8: in the app's title bar, not in the chat.
+    expect(root.querySelector(".fake-bar .fake-chip")?.textContent).toBe(
       "1 sub-agent",
     );
+    expect(root.querySelector(".chat-shell .fake-chip")).toBeNull();
   });
 
-  test("without the hook a sub-agent is U14's entry, as before", async () => {
+  test("a chip leaves the title bar with its chat", async () => {
+    const holder = document.body.appendChild(document.createElement("div"));
+    const chat = mount(FakeChatShell, {
+      target: holder,
+      props: { calls: [], cards: true },
+    });
+    flushSync();
+    await settle();
+    expect(holder.querySelector(".fake-bar .fake-chip")).not.toBeNull();
+    await unmount(chat);
+    holder.remove();
+    expect(document.querySelector(".fake-chip")).toBeNull();
+  });
+
+  test("without the hook a sub-agent is U14's entry, and the bar holds nothing", async () => {
     const { root } = await shell({ items: [subagent("finished")] });
     expect(root.querySelector("li.subagent-card")).toBeNull();
     expect(root.querySelector("li.block.subagent")).not.toBeNull();
-    expect(root.querySelector(".header-region")).toBeNull();
+    expect(root.querySelector(".fake-bar")?.children.length).toBe(0);
+  });
+
+  test("the aside is E8's panel beside the chat's column, not inside it", async () => {
+    const { root } = await shell({ panel: true });
+    const aside = root.querySelector(".chat-shell > aside.aside");
+    expect(aside?.textContent?.trim()).toBe("Sub-agents 1");
+    // Beside the column the chat is drawn in.
+    expect(
+      aside?.previousElementSibling?.classList.contains("column") ?? false,
+    ).toBe(true);
+    expect(root.querySelector(".column aside")).toBeNull();
+    const none = await shell({});
+    expect(none.root.querySelector("aside")).toBeNull();
+  });
+
+  test("the controls hook sits beside Stop, and is the chat's to draw", async () => {
+    const { root, calls, set } = await shell({ stopAll: true });
+    // Drawn whether or not Stop is: the chat decides when "Stop all" applies.
+    expect(root.querySelector(".controls .fake-stop-all")).not.toBeNull();
+    await set({ working: true });
+    const stop = button(root, ".controls .stop");
+    expect(stop.nextElementSibling?.classList.contains("fake-stop-all")).toBe(
+      true,
+    );
+    click(button(root, ".fake-stop-all"));
+    expect(calls.join(",")).toBe("stop-all");
+  });
+});
+
+describe("files", () => {
+  test("the hidden picker is out of the Tab order; the `+` is the way to it", async () => {
+    const { root } = await shell({ attachable: true });
+    const picker = root.querySelector('input[type="file"]');
+    expect(picker?.getAttribute("tabindex")).toBe("-1");
+    expect(button(root, ".icon-btn").getAttribute("tabindex")).toBeNull();
+  });
+
+  test("after a refused file's dialog closes, focus is back on the `+`", async () => {
+    const { root, attach } = await shell({ attachable: true });
+    const plus = button(root, ".icon-btn");
+    plus.focus();
+    await attach([new File([], "empty.txt")]);
+    const dialog = document.querySelector('[role="alertdialog"]');
+    expect(dialog?.textContent).toContain("File not attached");
+    expect(document.activeElement === plus).toBe(false);
+    const close = [...document.querySelectorAll("button")].find(
+      (each) => each.textContent?.trim() === "Close",
+    );
+    if (close === undefined) throw new Error("no Close");
+    click(close);
+    await settle();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(document.activeElement === plus).toBe(true);
   });
 });

@@ -21,6 +21,7 @@
   import Badge from "./Badge.svelte";
   import CrumbContextMeter from "./CrumbContextMeter.svelte";
   import CrumbPicker from "./CrumbPicker.svelte";
+  import TitleBarChipSlot from "./TitleBarChipSlot.svelte";
   import {
     IconAngleRight,
     IconCheck,
@@ -403,6 +404,11 @@
         }}
       />
     {/if}
+    <!--
+      What a chat on screen placed here (`titleBarChips.svelte.ts`): A7-S's sub-agents chip,
+      which E8 draws after the meter and before the session chip. Nothing today.
+    -->
+    <TitleBarChipSlot />
     {#if importerShown && importer.current !== undefined}
       <CrumbPicker
         label="Importer sessions"

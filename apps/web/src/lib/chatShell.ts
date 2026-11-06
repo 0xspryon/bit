@@ -13,9 +13,10 @@
  *
  * **Optional is "this chat cannot", not "not yet".** A session with no `stop` draws no Stop;
  * a composer with no `sendNow` draws no Send now; no `composer` at all is a read-only
- * thread; a composer with a `closed` reason draws that sentence where the input would be,
- * with Stop and the elapsed time still working above it. The shell never guesses a
- * capability from a role.
+ * thread; a closed composer ({@link ClosedChatComposer}: its reason and nothing else) draws
+ * that sentence where the input would be, with Stop and the elapsed time still working above
+ * it; a `question` puts A7-Q's dock in the box's place until the adapter takes it away. The
+ * shell never guesses a capability from a role.
  *
  * Plain TypeScript, so the rules here are tested without a browser; the shell arranges.
  */
@@ -106,6 +107,12 @@ export interface ChatWords {
   readonly sendQueuedTitle: string;
   /** The title on the count of characters, once a message nears its limit. */
   readonly countTitle: string;
+  /**
+   * The words before the elapsed clock beside Stop, for a chat with one (`turn.since`): the
+   * planner's "Planning for", a worker's "Running for" (`PlannerChat`, `ComposeBox`), the
+   * figure then set in bold after them. Absent: the figure alone.
+   */
+  readonly elapsedLead?: string | undefined;
 }
 
 /**
@@ -156,12 +163,22 @@ export interface ComposerSendNow {
 /**
  * The composer: the operator's box, its files and what sending does.
  *
- * Absent on the session is a thread with no box at all (`Chat`'s `readonly`). Present with
- * {@link closed} is a box that says why it takes nothing — the planner's ("steered from the
- * goal chat") and a worker's ("the prompt is the intent's question") — which keeps the
- * strip, the dock above it and Stop.
+ * Absent on the session is a thread with no box at all (`Chat`'s `readonly`). Otherwise one
+ * of two variants, told apart by {@link ClosedChatComposer.closed}:
+ *
+ * - {@link OpenChatComposer}, the box the operator writes in — the importer's, a goal
+ *   chat's. Every field a box needs is required, so an adapter that forgets one fails to
+ *   compile rather than drawing a box that cannot send.
+ * - {@link ClosedChatComposer}, a box that says why it takes nothing — the planner's
+ *   ("steered from the goal chat") and a worker's ("the prompt is the intent's question"):
+ *   only the reason, which keeps the strip, the dock in its slot and Stop.
  */
-export interface ChatComposerSource {
+export type ChatComposerSource = OpenChatComposer | ClosedChatComposer;
+
+/** A box the operator writes in. See {@link ChatComposerSource}. */
+export interface OpenChatComposer {
+  /** Never set on an open box: `closed` is what tells the two variants apart. */
+  readonly closed?: undefined;
   /**
    * The words being written. Read and written by the shell's textarea (`bind:value`), so an
    * adapter backs it with a getter and a setter over its own state — the importer's draft is
@@ -173,13 +190,8 @@ export interface ChatComposerSource {
   /** A send is out and has not been answered. */
   readonly sending: boolean;
   /**
-   * Why this chat takes no message at all, as a sentence drawn where the input would be.
-   * The input, the `+` and the send buttons are not drawn; the strip, the dock and Stop are.
-   */
-  readonly closed?: string | undefined;
-  /**
    * The input is drawn and disabled, its {@link placeholder} saying why (the importer's
-   * stranded, ended, refused and no-harness states). Distinct from {@link closed}: this is a
+   * stranded, ended, refused and no-harness states). Distinct from a closed box: this is a
    * conversation that cannot be continued *now*, drawn as the box it was.
    */
   readonly blocked: boolean;
@@ -192,6 +204,37 @@ export interface ChatComposerSource {
   readonly sendNow?: ComposerSendNow | undefined;
   /** The sentences above the box, in order. */
   readonly notices: readonly ComposerNotice[];
+}
+
+/**
+ * A box that takes no message at all. See {@link ChatComposerSource}.
+ *
+ * The reason is drawn where the input would be; the input, the `+`, the send buttons and the
+ * sentences above the box are not. The strip, the dock and Stop are.
+ */
+export interface ClosedChatComposer {
+  /** Why this chat takes no message, as a sentence. */
+  readonly closed: string;
+}
+
+/**
+ * A question the agent is waiting on (A7-Q, E3/E4), as far as the shell needs to know of it.
+ *
+ * **Present is "the dock holds the composer's slot".** While it is set, the shell draws the
+ * chat's `dock` snippet *in place of* the box — open or closed — in the same column, at the
+ * same width, with Stop and the elapsed clock where they were (E3: "the composer's slot
+ * becomes the question dock … nothing above it moves"). The adapter takes it away to give
+ * the composer back: when the question is answered (the server says it no longer waits), and
+ * when the operator dismisses the dock, which the shell asks for on Esc through
+ * {@link dismiss}. A dismissed question still waits on the server; replying in the chat
+ * instead is E3's "Esc reply in chat instead".
+ */
+export interface ChatQuestion {
+  /**
+   * Gives the composer back without answering: Esc in the dock, or the dock's own control.
+   * The adapter clears {@link ChatSession.question}; the shell then puts focus in the box.
+   */
+  readonly dismiss: () => void;
 }
 
 /**
@@ -222,6 +265,11 @@ export interface ChatSession<Subject extends ThreadTurn = ThreadTurn> {
   readonly dismissStopFailure?: (() => void) | undefined;
   /** The box. Absent: a read-only thread. */
   readonly composer?: ChatComposerSource | undefined;
+  /**
+   * A question the agent waits on, while it holds the composer's slot (A7-Q). Absent: the
+   * box is drawn. See {@link ChatQuestion}.
+   */
+  readonly question?: ChatQuestion | undefined;
   readonly words: ChatWords;
   /**
    * The first word of a finished turn's footer, the agent's label (D4's "Importer · …"), and
@@ -298,3 +346,11 @@ export const composerCanSend = (composer: ChatComposerSource): boolean =>
 export const stopOffered = (session: ChatSession<ThreadTurn>): boolean =>
   session.stop !== undefined &&
   (session.turn.working || session.turn.background);
+
+/** The session's box when the operator can write in it, or `undefined`. */
+export const openComposer = (
+  session: ChatSession<ThreadTurn>,
+): OpenChatComposer | undefined =>
+  session.composer === undefined || session.composer.closed !== undefined
+    ? undefined
+    : session.composer;

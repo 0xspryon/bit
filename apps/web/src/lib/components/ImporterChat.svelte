@@ -80,10 +80,10 @@
   import { IconFile, IconLink } from "../icons";
   import { connectionNote } from "../chat";
   import type {
-    ChatComposerSource,
     ChatSession,
     ChatWords,
     ComposerNotice,
+    OpenChatComposer,
   } from "../chatShell";
   import {
     ENDED_NOTE,
@@ -301,7 +301,9 @@
    * (Enter, the arrow) or go ahead of every queued one — at the next step on Claude Code,
    * once the message being written ends on OpenCode (`SendNowTiming`).
    */
-  const composer: ChatComposerSource = {
+  // An open box, typed as one: every field it needs is required there, so the compiler
+  // proves the importer supplies them all (a closed box would need only its reason).
+  const composer: OpenChatComposer = {
     get draft() {
       return importer.draft;
     },

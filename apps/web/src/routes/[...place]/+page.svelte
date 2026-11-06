@@ -53,8 +53,11 @@
     type Place,
   } from "../../lib/place";
   import { historyWrite } from "../../lib/placeHistory";
+  import { provideTitleBarChips } from "../../lib/titleBarChips.svelte";
 
   const app = new App();
+  // The title bar's chips (E8): the page holds them, a chat places one, `TitleBar` draws it.
+  provideTitleBarChips();
 
   /**
    * How many places the URL has asked for that the app has not yet reached.

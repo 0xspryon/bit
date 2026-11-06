@@ -73,7 +73,6 @@
     detail = "",
     empty,
     layout = "panel",
-    header,
     subagent,
   }: {
     /** The heading, and the list's accessible name. */
@@ -168,13 +167,6 @@
      * the style block for what each does.
      */
     layout?: "panel" | "thread";
-    /**
-     * A region at the top of the chat, for what is about the whole session rather than one
-     * turn: A7-S's sub-agents chip ("N sub-agents · running · failed", E8), which opens the
-     * panel of them. In a panel it sits in the heading's strip before the meter; in a thread,
-     * which has no heading, it is a row of its own above the note. Absent draws nothing.
-     */
-    header?: Snippet | undefined;
     /**
      * Draws a sub-agent's row in place of {@link ChatItem}'s entry (A7-S's cards, E7).
      *
@@ -306,9 +298,6 @@
       {#if count !== ""}
         <span class="count">{count}</span>
       {/if}
-      {#if header !== undefined}
-        <div class="header-region">{@render header()}</div>
-      {/if}
       <!--
         The context indicator, at the top of the pane. Last in the strip and pushed to the
         end, so the heading and the count stay where a reader's eye starts.
@@ -317,10 +306,7 @@
         <div class="meter">{@render meter()}</div>
       {/if}
     </div>
-  {:else if header !== undefined}
-    <div class="header-region">{@render header()}</div>
-  {/if}
-  {#if thread && !anything}
+  {:else if !anything}
     <!--
       A page's empty state is its lead: the label as the heading and the sentence under it,
       with the composer directly beneath, rather than a caption over an empty frame.
@@ -602,11 +588,6 @@
     margin: 0;
     padding: 0;
     list-style: none;
-  }
-  .header-region {
-    display: flex;
-    align-items: center;
-    gap: 8px;
   }
   .subagent-card {
     display: block;

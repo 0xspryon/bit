@@ -6,8 +6,9 @@
    *
    * Moved here from `ImporterChat.svelte` unchanged in what it draws, so the goal, planner
    * and worker chats mount the same box. What a chat adds to the strip — the importer's
-   * agent chip, model picker and caption — comes in through {@link strip}; the sentences
-   * above the box are the source's {@link ChatComposerSource.notices}.
+   * agent chip, model picker and caption — comes in through {@link strip}. The sentences
+   * above the box (an open source's `notices`) are the shell's to draw, above this box, so
+   * that A7-Q's dock can take the box's slot and leave them where they are.
    *
    * ## Three states, all the source's
    *
@@ -15,9 +16,10 @@
    *   now while a turn runs and the source offers it.
    * - **Blocked** (`blocked`): the box as it was, its input disabled and the placeholder
    *   saying why — the importer's stranded, ended and refused sessions.
-   * - **Closed** (`closed`): a sentence where the input would be and nothing to send with —
-   *   the planner's and a worker's, whose prompt is not the operator's to write. The strip
-   *   stays, and Stop and the dock above it are the shell's and keep working.
+   * - **Closed** (`ClosedChatComposer`): a sentence where the input would be and
+   *   nothing to send with — the planner's and a worker's, whose prompt is not the
+   *   operator's to write. The source is the reason alone; the strip stays, and Stop is the
+   *   shell's and keeps working.
    */
   import type { Snippet } from "svelte";
 
@@ -58,9 +60,14 @@
 
   let canSend = $derived(composerCanSend(composer));
   let canSendNow = $derived(
-    canSend && working && composer.sendNow?.offered === true,
+    canSend &&
+      working &&
+      composer.closed === undefined &&
+      composer.sendNow?.offered === true,
   );
-  let files = $derived(composer.files);
+  let files = $derived(
+    composer.closed === undefined ? composer.files : undefined,
+  );
   let closed = $derived(composer.closed);
 
   /**
@@ -68,10 +75,13 @@
    * a pasted statement of work is the importer's main use, and one over the limit is
    * refused on Send with both figures. Trimmed, as the limit is counted.
    */
-  let length = $derived(composer.draft.trim().length);
-  let nearLimit = $derived(
-    composer.maxChars !== undefined && length > composer.maxChars * 0.9,
+  /** The words in the box; none in a closed one, which has no box to hold them. */
+  let draft = $derived(composer.closed === undefined ? composer.draft : "");
+  let length = $derived(draft.trim().length);
+  let maxChars = $derived(
+    composer.closed === undefined ? composer.maxChars : undefined,
   );
+  let nearLimit = $derived(maxChars !== undefined && length > maxChars * 0.9);
 
   let box = $state<HTMLTextAreaElement | undefined>(undefined);
   /** The file input behind the `+`. */
@@ -97,7 +107,7 @@
 
   function submit(event: Event): void {
     event.preventDefault();
-    if (canSend) composer.send("queued");
+    if (canSend && composer.closed === undefined) composer.send("queued");
   }
 
   /**
@@ -109,7 +119,7 @@
    * nowhere.
    */
   function sendNow(): void {
-    if (!canSendNow) return;
+    if (!canSendNow || composer.closed !== undefined) return;
     composer.send("preemptive");
     box?.focus();
   }
@@ -121,7 +131,7 @@
   function onkeydown(event: KeyboardEvent): void {
     if (event.key !== "Enter" || event.shiftKey) return;
     event.preventDefault();
-    if (canSend) composer.send("queued");
+    if (canSend && composer.closed === undefined) composer.send("queued");
   }
 
   /**
@@ -139,7 +149,7 @@
 
   /** A paste of files alone attaches them; a paste with text in it is a paste of the text. */
   function onpaste(event: ClipboardEvent): void {
-    if (files === undefined) return;
+    if (files === undefined || composer.closed !== undefined) return;
     const pasted = filesOfPaste(event);
     if (pasted.length === 0 || composer.blocked) return;
     event.preventDefault();
@@ -147,25 +157,12 @@
   }
 </script>
 
-{#each composer.notices as notice (notice.key)}
-  <!--
-    The sentences above the box, in the chat's order: a refusal, the note on a message the
-    server accepted, a wait. Their words are the server's or the chat's, never the shell's.
-  -->
-  <p
-    class={["notice", notice.kind]}
-    role={notice.tone === "alert" ? "alert" : "status"}
-  >
-    {notice.text}
-  </p>
-{/each}
 <form
   class={[
     "box",
     first && "first",
     closed !== undefined && "closed",
-    (focused || composer.draft !== "" || (files?.items.length ?? 0) > 0) &&
-      "in-use",
+    (focused || draft !== "" || (files?.items.length ?? 0) > 0) && "in-use",
     dropping && "dropping",
   ]}
   onfocusin={() => (focused = true)}
@@ -174,15 +171,15 @@
     focused = next instanceof Node && event.currentTarget.contains(next);
   }}
   onsubmit={submit}
-  aria-busy={composer.sending}
+  aria-busy={composer.closed === undefined && composer.sending}
 >
-  {#if closed !== undefined}
+  {#if composer.closed !== undefined}
     <!--
       No input, and a sentence in its place: a box that took words and refused them, or a
-      textarea that could never be typed in, would be a question. What the chat can still do —
-      Stop, answer a question in the dock — is above, and the strip is below.
+      textarea that could never be typed in, would be a question. What the chat can still do
+      is the shell's: Stop above, and a question the agent asks takes this box's place.
     -->
-    <p class="closed-reason">{closed}</p>
+    <p class="closed-reason">{composer.closed}</p>
   {:else}
     <label class="visually-hidden" for="{id}-message"
       >{words.messageLabel}</label
@@ -203,7 +200,11 @@
       {onpaste}></textarea>
   {/if}
   <div class="strip">
-    {#if closed === undefined && files !== undefined}
+    {#if composer.closed === undefined && files !== undefined}
+      <!--
+        The picker behind the `+`, out of the Tab order (chat shell review 1): it is hidden,
+        so a Tab stop on it is a stop on nothing the operator can see; the `+` opens it.
+      -->
       <label class="visually-hidden" for="{id}-attach"
         >Attach files to this message</label
       >
@@ -211,6 +212,7 @@
         bind:this={picker}
         id="{id}-attach"
         class="visually-hidden"
+        tabindex="-1"
         type="file"
         multiple
         disabled={composer.blocked}
@@ -230,12 +232,12 @@
     {/if}
     {@render strip?.()}
     <span class="grow"></span>
-    {#if closed === undefined}
-      {#if nearLimit && composer.maxChars !== undefined}
+    {#if composer.closed === undefined}
+      {#if nearLimit && maxChars !== undefined}
         <span
-          class={["count", length > composer.maxChars && "over"]}
+          class={["count", length > maxChars && "over"]}
           title={words.countTitle}
-          >{length.toLocaleString("en-US")} / {composer.maxChars.toLocaleString(
+          >{length.toLocaleString("en-US")} / {maxChars.toLocaleString(
             "en-US",
           )}</span
         >
@@ -428,16 +430,5 @@
   .send-now:focus-visible {
     outline: 2px solid var(--border-focus);
     outline-offset: 1px;
-  }
-  /* ── The sentences about the last message ──────────────────────────────────── */
-  .notice {
-    margin: 0;
-    color: var(--text-muted);
-    font: 400 12px/18px var(--font-sans);
-    text-wrap: pretty;
-    overflow-wrap: anywhere;
-  }
-  .notice.refusal {
-    color: var(--state-fg-danger);
   }
 </style>
