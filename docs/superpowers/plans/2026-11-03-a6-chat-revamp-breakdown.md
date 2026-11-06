@@ -560,6 +560,23 @@ the harness's `stopSubagents`, then the turn's Stop, answered as a Stop). Harnes
   (`ResizeObserver`), Esc on a card closes it, long names have titles, long quotes are cut to
   8 lines with Show all; E3's "waiting on you" needs the question's `answerability` to be
   `live`; a live finished card quotes the hand-back. Test children die with the test run.
+- **Review 2 fix round (2026-11-06, `163478a`..):** Claude Code's quell is per stopped
+  sub-agent, not a window: a notification turn opens on a bare `system/init` 60–100 ms after
+  its task's `task_notification` (measured), so a turn the CLI opens on its own is about the
+  background tasks that notified since the last turn opened, and is stopped only when it is
+  about stopped sub-agents alone, once each; an operator message disarms it. An OpenCode end
+  keeps the ended stream's sub-agents (`endedStreams`), leaves known foreground children to
+  the parent's interrupt, stops background ones first, and lists the children once more
+  after the parent's interrupt; an aborted `subagent` call reads as stopped. Live: the End
+  with a background and a foreground child took 145 ms (was 1.66 s), no stray step. Replays
+  after a restart: Claude Code keys a sub-agent's liveness on the current CLI running it
+  (`ownedByCli`), OpenCode stops a child whose newest message is an aborted step or that
+  `session.active` does not list (unless the session's stream follows it); Stop all counts
+  only cards bit can stop; a stopped card with no time reads "stopped with the session", one
+  this process's End stopped gets the End's time. An ended import's replay draws its last
+  turn's aborted step as "Stopped when you ended this session." Test teardowns and probes
+  signal a recorded pid only while its start time matches; killed runs leave no probe
+  folders.
 
 **F12 — Built server cannot open Claude Code sessions (S), last.** `bun dist/main.js`
 refuses every Claude Code import with `import_ungated`: it resolves the policy hook at
