@@ -126,7 +126,9 @@
                 aria-label={`${subagentName(view)}: show its card`}
               >
                 <span class="row-head">
-                  <span class="name">{subagentName(view)}</span>
+                  <span class="name" title={subagentName(view)}
+                    >{subagentName(view)}</span
+                  >
                   <span class="meta" data-status={view.status}
                     >{subagentMeta(view, now)}</span
                   >

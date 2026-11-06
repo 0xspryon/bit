@@ -113,6 +113,21 @@ export const subagentCardId = (callId: string): string =>
   `subagent-${callId.replace(/[^A-Za-z0-9_-]/g, "_")}`;
 
 /**
+ * A finished card's quote longer than this — in lines, or in characters for a quote that
+ * wraps — is drawn to {@link QUOTE_CLAMP_LINES} lines with a way to read the rest (A7-S
+ * review 1): a report of a few screens otherwise pushed the transcript away. Counted from
+ * the text rather than measured, so the card knows before it is laid out.
+ */
+export const QUOTE_CLAMP_LINES = 8;
+export const QUOTE_CLAMP_CHARS = 600;
+export const quoteIsLong = (text: string): boolean =>
+  text.length > QUOTE_CLAMP_CHARS ||
+  text.split("\n").length > QUOTE_CLAMP_LINES;
+
+/** What finds a card's element, or the card an element is in (`closest`). */
+export const SUBAGENT_CARD_SELECTOR = "[data-subagent-card]";
+
+/**
  * The chip's words (E8): "5 sub-agents", the running and failed counts beside it.
  */
 export const subagentChipLabel = (count: number): string =>

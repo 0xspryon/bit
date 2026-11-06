@@ -20,6 +20,7 @@
   import { IconAngleDown, IconAngleUp, IconCheck, IconClose } from "../icons";
   import {
     callsLabel,
+    quoteIsLong,
     stopWithheld,
     subagentCardId,
     subagentMeta,
@@ -45,7 +46,11 @@
   } = $props();
 
   let open = $state(true);
+  /** A long quote read in full (`quoteIsLong`); drawn to its first lines otherwise. */
+  let quoteOpen = $state(false);
   const bodyId = $derived(`${subagentCardId(view.callId)}-body`);
+  const quoteId = $derived(`${subagentCardId(view.callId)}-quote`);
+  const longQuote = $derived(view.result !== null && quoteIsLong(view.result));
   const withheld = $derived(stopWithheld(view, agent));
   const statusWord = $derived(
     view.status === "running"
@@ -65,6 +70,7 @@
 <article
   class="card"
   id={subagentCardId(view.callId)}
+  data-subagent-card
   data-status={view.status}
   tabindex="-1"
   aria-label={`Sub-agent ${subagentName(view)}, ${statusWord}`}
@@ -81,7 +87,8 @@
         <span class="square"></span>
       {/if}
     </span>
-    <span class="name">{subagentName(view)}</span>
+    <!-- Cut to one line by its width; the whole name on hover (A7-S review 1). -->
+    <span class="name" title={subagentName(view)}>{subagentName(view)}</span>
     {#if view.task !== "" && view.task !== view.description}
       <span class="task" title={view.task}>{view.task}</span>
     {/if}
@@ -112,7 +119,22 @@
         <p class="eyebrow">Returned to {agent}</p>
         {#if view.result !== null && view.result !== ""}
           <!-- V2(chat): the quote is plain text; the sub-agent's Markdown is not rendered. -->
-          <blockquote class="quote">{view.result}</blockquote>
+          <blockquote
+            class={["quote", longQuote && !quoteOpen && "clamped"]}
+            id={quoteId}
+          >
+            {view.result}
+          </blockquote>
+          {#if longQuote}
+            <button
+              class="more"
+              type="button"
+              aria-expanded={quoteOpen}
+              aria-controls={quoteId}
+              onclick={() => (quoteOpen = !quoteOpen)}
+              >{quoteOpen ? "Show less" : "Show all of it"}</button
+            >
+          {/if}
         {:else}
           <p class="quiet">It handed back without words bit could read.</p>
         {/if}
@@ -337,6 +359,22 @@
     overflow-wrap: anywhere;
     white-space: pre-wrap;
     unicode-bidi: plaintext;
+  }
+  .quote.clamped {
+    /* QUOTE_CLAMP_LINES lines of 20px, fading into the button below. */
+    max-height: 160px;
+    overflow: hidden;
+    mask-image: linear-gradient(to bottom, #000 70%, transparent);
+  }
+  .more {
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: 500 12px/18px var(--font-sans);
+    text-decoration: underline;
+    cursor: pointer;
   }
   .reason {
     margin: 0;

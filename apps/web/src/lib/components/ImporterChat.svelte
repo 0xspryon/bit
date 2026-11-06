@@ -95,8 +95,10 @@
     type ImporterTurn,
   } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
+  import { composing } from "../composing";
   import {
     railGivesWay,
+    SUBAGENT_CARD_SELECTOR,
     subagentCardId,
     subagentGroups,
     subagentsIn,
@@ -156,19 +158,70 @@
    * otherwise be under 560px beside a 400px panel).
    */
   let railTakenByPanel = false;
+  /**
+   * The operator showed the rail again while the panel had put it away: it is theirs for
+   * the rest of this opening, and a resize does not take it again.
+   */
+  let railKeptByOperator = false;
+  /**
+   * What the page beside the shell takes while the rail shows (the window's width less the
+   * shell's), measured when the panel put the rail away: how wide the shell would be with
+   * the rail back, which is what says it may come back.
+   */
+  let besideShell = 0;
 
-  function openPanel(): void {
-    const shellWidth =
-      document.querySelector<HTMLElement>(".chat-shell.importer")
-        ?.clientWidth ?? window.innerWidth;
-    if (!app.drawerHidden && railGivesWay(shellWidth)) {
+  const shellElement = (): HTMLElement | null =>
+    document.querySelector<HTMLElement>(".chat-shell.importer");
+
+  /**
+   * The 560px rule (`railGivesWay`) for the shell's width now: the rail is put away when the
+   * column beside the panel would be too narrow, and given back once it no longer would be,
+   * if it was the panel that put it away. Applied as the panel opens and on every resize
+   * while it is open (A7-S review 1: a tablet turned from landscape to portrait, 1440 to
+   * 1024, kept the rail and left a 392px column).
+   */
+  function fitRail(shellWidth: number): void {
+    if (!app.drawerHidden) {
+      if (railTakenByPanel) {
+        // Shown again by the operator, not by this.
+        railTakenByPanel = false;
+        railKeptByOperator = true;
+        return;
+      }
+      if (railKeptByOperator || !railGivesWay(shellWidth)) return;
+      besideShell = window.innerWidth - shellWidth;
       app.drawerHidden = true;
       railTakenByPanel = true;
+      return;
     }
+    if (railTakenByPanel && !railGivesWay(window.innerWidth - besideShell)) {
+      railTakenByPanel = false;
+      app.drawerHidden = false;
+    }
+  }
+
+  function openPanel(): void {
+    railKeptByOperator = false;
+    fitRail(shellElement()?.clientWidth ?? window.innerWidth);
     panelOpen = true;
   }
 
-  function closePanel(): void {
+  // While the panel is open the rule follows the shell's width.
+  $effect(() => {
+    if (!panelOpen || typeof ResizeObserver === "undefined") return;
+    const shell = shellElement();
+    if (shell === null) return;
+    const watching = new ResizeObserver(() => {
+      fitRail(shell.clientWidth);
+    });
+    watching.observe(shell);
+    return () => {
+      watching.disconnect();
+    };
+  });
+
+  /** `toChip`: focus goes back to the chip wherever it was (an Esc on a card, below). */
+  function closePanel(toChip = false): void {
     // Asked before the panel goes: focus in it would otherwise fall to the page's body.
     const active = document.activeElement;
     const inPanel =
@@ -181,7 +234,7 @@
       if (app.drawerHidden) app.drawerHidden = false;
     }
     // Back to the chip that opened it, when focus was in the panel or nowhere.
-    if (inPanel || active === null || active === document.body) {
+    if (toChip || inPanel || active === null || active === document.body) {
       void tick().then(() => chipButton?.focus());
     }
   }
@@ -189,6 +242,32 @@
   // A panel open as the chat goes (another page, another session's chat) gives the rail back.
   $effect(() => () => {
     if (railTakenByPanel && app.drawerHidden) app.drawerHidden = false;
+  });
+
+  /*
+   * E8: Esc closes the panel from a sub-agent's card too, where a row's jump put focus (A7-S
+   * review 1: the panel's own Esc no longer heard it), and focus goes back to the chip. Not
+   * an Esc an input method is using, nor one something nearer already acted on.
+   */
+  $effect(() => {
+    if (!panelOpen) return;
+    const onkeydown = (event: KeyboardEvent): void => {
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        composing(event)
+      ) {
+        return;
+      }
+      const on = event.target instanceof Element ? event.target : null;
+      if (on?.closest(SUBAGENT_CARD_SELECTOR) == null) return;
+      event.preventDefault();
+      closePanel(true);
+    };
+    document.addEventListener("keydown", onkeydown);
+    return () => {
+      document.removeEventListener("keydown", onkeydown);
+    };
   });
 
   /** E8: selecting a row scrolls the transcript to its card, and focus goes with it. */

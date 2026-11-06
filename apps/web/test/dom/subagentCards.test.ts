@@ -525,6 +525,88 @@ describe("the sub-agents chip and panel (A7-S, E8)", () => {
     expect(document.activeElement?.id).toBe("subagent-toolu_failed");
   });
 
+  test("A7-S review 1: Esc on the card a row moved focus to closes the panel, and focus goes back to the chip", async () => {
+    const before = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = () => undefined;
+    restore.push(() => {
+      Element.prototype.scrollIntoView = before;
+    });
+    await continueWith(new FakeServer(), [RUNNING, FINISHED]);
+    click(chip()!);
+    await settle();
+    click(panel()!.querySelectorAll<HTMLButtonElement>(".row .pick")[1]!);
+    await settle();
+    expect(document.activeElement?.id).toBe("subagent-toolu_done");
+    // An Esc an input method uses is left alone here too.
+    document.activeElement!.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Escape",
+        bubbles: true,
+        isComposing: true,
+      }),
+    );
+    await settle();
+    expect(panel()).not.toBeNull();
+    document.activeElement!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    await settle();
+    expect(panel()).toBeNull();
+    expect(document.activeElement?.className).toContain("subagents-chip");
+    // Closed, an Esc on a card is nobody's here.
+    const esc = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    card("toolu_done")!.dispatchEvent(esc);
+    expect(esc.defaultPrevented).toBe(false);
+  });
+
+  test("A7-S review 1: a long name can be read in full, and a long quote is cut to its first lines with a way to read it all", async () => {
+    const name = `Scope reader for every host under the wildcard ${"x".repeat(80)}`;
+    const report = Array.from(
+      { length: 20 },
+      (_, index) => `Line ${String(index + 1)}`,
+    ).join("\n");
+    await continueWith(new FakeServer(), [
+      view({
+        callId: "toolu_long",
+        description: name,
+        status: "finished",
+        result: report,
+      }),
+      FINISHED,
+    ]);
+    const long = card("toolu_long");
+    expect(long?.querySelector(".name")?.getAttribute("title")).toBe(name);
+    const quote = long?.querySelector(".quote");
+    // All of it is there, as written, for a reader and a copy.
+    expect(quote?.textContent).toBe(report);
+    expect(quote?.classList.contains("clamped")).toBe(true);
+    const more = long?.querySelector<HTMLButtonElement>(".more");
+    expect(text(more)).toBe("Show all of it");
+    expect(more?.getAttribute("aria-expanded")).toBe("false");
+    expect(more?.getAttribute("aria-controls")).toBe(quote?.id);
+    click(more!);
+    await settle();
+    expect(quote?.classList.contains("clamped")).toBe(false);
+    expect(text(more)).toBe("Show less");
+    expect(more?.getAttribute("aria-expanded")).toBe("true");
+    // A short one is drawn whole, with no toggle.
+    const short = card("toolu_done");
+    expect(short?.querySelector(".quote")?.classList.contains("clamped")).toBe(
+      false,
+    );
+    expect(short?.querySelector(".more")).toBeNull();
+    // The panel's row names it in full on hover too.
+    click(chip()!);
+    await settle();
+    expect(panel()?.querySelector(".row .name")?.getAttribute("title")).toBe(
+      name,
+    );
+  });
+
   test("a panel row's Stop stops that sub-agent", async () => {
     const fake = new FakeServer();
     await continueWith(fake, [RUNNING]);
@@ -581,6 +663,114 @@ describe("the sub-agents chip and panel (A7-S, E8)", () => {
     click(chip()!);
     await settle();
     expect(app.drawerHidden).toBe(true);
+  });
+});
+
+describe("the 560px rule follows a resize while the panel is open (A7-S review 1)", () => {
+  /** The shell's and the window's widths, and the observers the chat made, to fire. */
+  const sized = () => {
+    const width = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "clientWidth",
+    );
+    const inner = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    const observer = (globalThis as { ResizeObserver?: unknown })
+      .ResizeObserver;
+    const size = { shell: 0, window: 0 };
+    const watching = new Set<() => void>();
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.classList.contains("chat-shell") ? size.shell : 0;
+      },
+    });
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      get: () => size.window,
+    });
+    // happy-dom has none: a stub that fires when the test says the size moved.
+    class StubResizeObserver {
+      readonly #fire: () => void;
+      constructor(callback: () => void) {
+        this.#fire = () => {
+          callback();
+        };
+      }
+      observe(): void {
+        watching.add(this.#fire);
+      }
+      disconnect(): void {
+        watching.delete(this.#fire);
+      }
+      unobserve(): void {
+        watching.delete(this.#fire);
+      }
+    }
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver =
+      StubResizeObserver;
+    restore.push(() => {
+      if (width !== undefined) {
+        Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+      }
+      if (inner !== undefined)
+        Object.defineProperty(window, "innerWidth", inner);
+      (globalThis as { ResizeObserver?: unknown }).ResizeObserver = observer;
+    });
+    /** The window resized to `to`, with the 232px rail showing or not. */
+    const resize = async (to: number, railShows: boolean) => {
+      size.window = to;
+      size.shell = railShows ? to - 232 : to;
+      for (const fire of [...watching]) fire();
+      await settle();
+    };
+    return { size, resize };
+  };
+
+  test("1440 to 1024 puts the rail away, and back to 1440 gives it back; closing leaves it as the operator had it", async () => {
+    const { size, resize } = sized();
+    size.window = 1440;
+    size.shell = 1208;
+    const app = await continueWith(new FakeServer(), [RUNNING]);
+    click(chip()!);
+    await settle();
+    expect(app.drawerHidden).toBe(false);
+    // Turned to portrait: 792 less the panel would leave 392.
+    await resize(1024, true);
+    expect(app.drawerHidden).toBe(true);
+    // The shell widened with the rail gone; that alone gives nothing back.
+    await resize(1024, false);
+    expect(app.drawerHidden).toBe(true);
+    // Back to landscape: with the rail, 808 beside the panel.
+    await resize(1440, false);
+    expect(app.drawerHidden).toBe(false);
+    await resize(1440, true);
+    expect(app.drawerHidden).toBe(false);
+    click(chip()!);
+    await settle();
+    expect(app.drawerHidden).toBe(false);
+    // Closed, the rule is not watched: a resize no longer moves the rail.
+    await resize(1024, true);
+    expect(app.drawerHidden).toBe(false);
+  });
+
+  test("a rail the operator shows again while the panel is open is not taken again by a resize", async () => {
+    const { size, resize } = sized();
+    size.window = 1440;
+    size.shell = 1208;
+    const app = await continueWith(new FakeServer(), [RUNNING]);
+    click(chip()!);
+    await settle();
+    await resize(1024, true);
+    expect(app.drawerHidden).toBe(true);
+    app.drawerHidden = false;
+    await resize(1024, true);
+    expect(app.drawerHidden).toBe(false);
+    // Nor by the next one.
+    await resize(1000, true);
+    expect(app.drawerHidden).toBe(false);
+    click(chip()!);
+    await settle();
+    expect(app.drawerHidden).toBe(false);
   });
 });
 

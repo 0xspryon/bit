@@ -242,12 +242,12 @@ export interface SwitchFailure {
   readonly notice: ErrorNotice;
 }
 
-/** What the server answered a Stop with, as the page needs it. */
 /** A sub-agent's Stop, answered (A7-S): the server's sentence either way. */
 export type ImporterSubagentStopAnswer =
   | { readonly _tag: "stopped"; readonly detail: string }
   | { readonly _tag: "refused"; readonly detail: string };
 
+/** What the server answered a Stop with, as the page needs it. */
 export type ImporterStopAnswer =
   | { readonly _tag: "stopped"; readonly stopped: ConversationStopped }
   | { readonly _tag: "refused"; readonly detail: string };
@@ -262,12 +262,6 @@ export interface ImporterActivity {
   readonly background: boolean;
 }
 
-/**
- * The page's way to the server, handed in by the app when the page is a real target's.
- *
- * Absent in the state picker's scenarios, which never touch a server and answer with the
- * stand-in reply instead.
- */
 /** What the server did with an answer or a dismissal (A7-Q). */
 export type ImporterQuestionAnswer =
   | { readonly _tag: "settled" }
@@ -279,6 +273,12 @@ export type ImporterQuestionAnswer =
     }
   | { readonly _tag: "unanswered" };
 
+/**
+ * The page's way to the server, handed in by the app when the page is a real target's.
+ *
+ * Absent in the state picker's scenarios, which never touch a server and answer with the
+ * stand-in reply instead.
+ */
 export interface ImporterServer {
   /**
    * Opens a conversation whose first turn is `text`, as the agent `agentId` — or as the
