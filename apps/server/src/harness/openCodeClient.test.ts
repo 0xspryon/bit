@@ -4187,12 +4187,28 @@ describe("sub-agents, as one entry each (A6 U14)", () => {
         id: "c2",
         error: { message: "Subagent cancelled (sessionID: ses_c2)" },
       }),
+      // A foreground one its parent's interrupt stopped (an End, A7-S review 2).
+      event("session.tool.input.started", { id: "c3", name: "subagent" }),
+      event("session.tool.called", {
+        id: "c3",
+        input: { agent: "general", description: "Parent stopped" },
+        executed: true,
+      }),
+      event("session.tool.failed", {
+        id: "c3",
+        error: {
+          type: "aborted",
+          message: "Tool execution interrupted (sessionID: ses_c3)",
+        },
+      }),
     ]);
     expect(states(failed)).toEqual([
       "c1 running general · Old name",
       "c1 failed general · Old name",
       "c2 running general · Cancelled one",
       "c2 stopped general · Cancelled one",
+      "c3 running general · Parent stopped",
+      "c3 stopped general · Parent stopped",
     ]);
     // A failed card carries the reason and OpenCode's own words (A7-S, E7).
     expect(newest(failed).get("c1")?.failure).toEqual({
@@ -5277,6 +5293,26 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
           launch("call_aborted", "ses_aborted"),
           launch("call_gone", "ses_gone"),
           launch("call_alive", "ses_alive"),
+          // A foreground one its parent's interrupt stopped.
+          {
+            ...tool,
+            id: "call_fg",
+            name: "subagent",
+            state: {
+              status: "error",
+              input: {
+                agent: "general",
+                description: "Foreground",
+                prompt: "sleep 30",
+                background: false,
+              },
+              error: {
+                type: "aborted",
+                message: "Tool execution interrupted (sessionID: ses_fg)",
+              },
+              metadata: { sessionID: "ses_fg" },
+            },
+          },
         ],
       },
     ];
@@ -5343,6 +5379,10 @@ describe("stopping a sub-agent: its child session is interrupted (A7-S)", () => 
       lines: [
         { tool: "shell", input: "sleep 30", result: "stopped", failed: true },
       ],
+    });
+    expect(states.get("call_fg")).toMatchObject({
+      status: "stopped",
+      failure: null,
     });
     // Still running in OpenCode: running, and with nobody here holding it, no Stop.
     expect(states.get("call_alive")).toMatchObject({

@@ -827,7 +827,10 @@ export const openCodeNarration = (
         if (callId === undefined) return { _tag: "opaque" };
         const tool = names.get(callId);
         names.delete(callId);
-        const error = (data["error"] ?? {}) as { message?: unknown };
+        const error = (data["error"] ?? {}) as {
+          message?: unknown;
+          type?: unknown;
+        };
         const subagent = subagents.calls.get(callId);
         if (subagent !== undefined) {
           return openCodeSubagentSettled(
@@ -837,6 +840,7 @@ export const openCodeNarration = (
             {
               ok: false,
               message: typeof error.message === "string" ? error.message : "",
+              type: error.type,
               metadata: data["metadata"],
             },
             eventAt,
@@ -1323,6 +1327,8 @@ const openCodeSubagentSettled = (
     | {
         readonly ok: false;
         readonly message: string;
+        /** OpenCode's error `type`: `aborted` is an interrupt, not a failure. */
+        readonly type?: unknown;
         readonly metadata: unknown;
       },
   at: number | null,
@@ -1334,7 +1340,15 @@ const openCodeSubagentSettled = (
   };
   adoptChild(subagents, callId, call, metadata.sessionID);
   if (!settled.ok) {
-    if (settled.message.startsWith("Subagent cancelled")) {
+    /*
+     * Its own interrupt fails the call `Subagent cancelled`; its parent's — a Stop, or an
+     * End, which leaves a foreground child to the parent's interrupt (A7-S review 2) —
+     * fails it `{type: "aborted"}`, "Tool execution interrupted". Both are a stop.
+     */
+    if (
+      settled.message.startsWith("Subagent cancelled") ||
+      settled.type === "aborted"
+    ) {
       endOpenCodeSubagent(call, "stopped", at);
     } else {
       call.failure = {
@@ -1818,6 +1832,7 @@ const assistantContentParts = (
                     typeof state.error?.message === "string"
                       ? state.error.message
                       : "",
+                  type: (state.error as { type?: unknown } | undefined)?.type,
                   metadata: state.metadata,
                 },
                 ended,
