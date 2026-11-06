@@ -92,6 +92,7 @@
     controls: chatControls,
     chip,
     aside,
+    asideOverlay = false,
     subagent,
   }: {
     session: ChatSession<Subject>;
@@ -114,6 +115,11 @@
     chip?: Snippet | undefined;
     /** E8's 400px panel beside the chat column. */
     aside?: Snippet | undefined;
+    /**
+     * `aside` overlays the chat as a drawer instead of narrowing it (A7-S review 3): where
+     * the column beside it would be under 560px even with the rail away. Same width.
+     */
+    asideOverlay?: boolean;
     subagent?: Snippet<[ChatRow]> | undefined;
   } = $props();
 
@@ -516,7 +522,9 @@
       E8's panel (A7-S): 400px beside the chat, which reflows to the width left. Its
       heading, close and contents are the chat's.
     -->
-    <aside class="aside">{@render aside()}</aside>
+    <aside class={["aside", asideOverlay && "overlay"]}>
+      {@render aside()}
+    </aside>
   {/if}
 </div>
 
@@ -552,6 +560,7 @@
     flex column the chat was always drawn in, so without a panel nothing moves.
   */
   .chat-shell {
+    position: relative;
     display: flex;
     flex: 1;
     min-height: 0;
@@ -573,6 +582,21 @@
     overflow-y: auto;
     box-sizing: border-box;
     border-left: 1px solid var(--border-muted);
+  }
+  /*
+    A7-S review 3: on a narrow window the panel is a drawer over the chat's right side, the
+    same 400px, never wider than the shell, so the chat keeps its width under it.
+  */
+  .aside.overlay {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10;
+    width: 400px;
+    max-width: 100%;
+    background: var(--bg-base);
+    box-shadow: -12px 0 32px #00000059;
   }
 
   .streaming {

@@ -161,3 +161,21 @@ export const PANEL_WIDTH = 400;
 export const COLUMN_MIN_WITH_PANEL = 560;
 export const railGivesWay = (shellWidth: number): boolean =>
   shellWidth - PANEL_WIDTH < COLUMN_MIN_WITH_PANEL;
+
+/**
+ * Whether the panel overlays the chat as a drawer instead of reflowing it (A7-S review 3,
+ * the orchestrator's decision): where the chat column would be under 560px beside it even
+ * with the rail put away — a 768px portrait tablet left it 353px. With the rail away the
+ * shell spans the window, so `viewportWidth` is the window's width. Same 400px and
+ * grouping; Esc or × closes it, and picking a row closes it and scrolls to the card.
+ */
+export const panelOverlays = (viewportWidth: number): boolean =>
+  viewportWidth - PANEL_WIDTH < COLUMN_MIN_WITH_PANEL;
+
+/**
+ * The viewport the sub-agents chip goes compact in — its icon and counts, the words in its
+ * accessible name and title (A7-S review 3, the orchestrator's decision): below about
+ * 900px its full 167px pushed the title bar's right group past the window, and the page
+ * scrolled sideways from 768 to 891px.
+ */
+export const SUBAGENT_CHIP_COMPACT_QUERY = "(max-width: 899.98px)";

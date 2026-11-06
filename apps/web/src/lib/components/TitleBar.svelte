@@ -410,121 +410,129 @@
     -->
     <TitleBarChipSlot />
     {#if importerShown && importer.current !== undefined}
-      <CrumbPicker
-        label="Importer sessions"
-        placeholder="Find a session…"
-        width={410}
-        align="end"
-        chip
-        searchable={false}
-        bind:open={importer.pickerOpen}
-        bind:query={sessionQuery}
-        onenter={() => {
-          const first = sessionRows[0];
-          if (first !== undefined) importer.open(first.id);
-        }}
-      >
-        {#snippet trigger()}
-          {#if importer.question !== undefined}
-            <!--
+      <!--
+        The session chip is what gives way on a narrow window (A7-S review 3): its name
+        ellipses rather than push the right group past the window's edge.
+      -->
+      <div class="session-slot">
+        <CrumbPicker
+          label="Importer sessions"
+          placeholder="Find a session…"
+          width={410}
+          align="end"
+          chip
+          searchable={false}
+          bind:open={importer.pickerOpen}
+          bind:query={sessionQuery}
+          onenter={() => {
+            const first = sessionRows[0];
+            if (first !== undefined) importer.open(first.id);
+          }}
+        >
+          {#snippet trigger()}
+            {#if importer.question !== undefined}
+              <!--
               E6's local signal (A6 D9): the session on screen waits on the operator's answer.
               In the warning colour, and said in words to a reader that cannot see it.
             -->
-            <span class="question-dot" aria-hidden="true"></span>
-            <span class="visually-hidden">Waiting on you:</span>
-          {:else if importer.current?.working}
-            <span class="working-dot" aria-hidden="true"></span>
-          {:else if importer.current?.tally.messages === 0}
-            <IconPlus width="11" height="11" />
-          {/if}
-          <span
-            class="crumb-text crumb-session"
-            title={importer.current === undefined
-              ? undefined
-              : sessionHover(importer.current, Date.now())}>{sessionName}</span
-          >
-        {/snippet}
-        {#snippet rows()}
-          <p class="group-label">Importer sessions · {app.selected?.name}</p>
-          {#each sessionRows as session (session.id)}
-            {@const current = session.id === importer.currentId}
-            {@const parked = importer.parked[session.id]}
-            <!--
+              <span class="question-dot" aria-hidden="true"></span>
+              <span class="visually-hidden">Waiting on you:</span>
+            {:else if importer.current?.working}
+              <span class="working-dot" aria-hidden="true"></span>
+            {:else if importer.current?.tally.messages === 0}
+              <IconPlus width="11" height="11" />
+            {/if}
+            <span
+              class="crumb-text crumb-session"
+              title={importer.current === undefined
+                ? undefined
+                : sessionHover(importer.current, Date.now())}
+              >{sessionName}</span
+            >
+          {/snippet}
+          {#snippet rows()}
+            <p class="group-label">Importer sessions · {app.selected?.name}</p>
+            {#each sessionRows as session (session.id)}
+              {@const current = session.id === importer.currentId}
+              {@const parked = importer.parked[session.id]}
+              <!--
               D5's row: the name and the model it ended on, then what it wrote and when. The
               name is the harness's title (S9) — agent-authored, so a plain label, isolated
               so a bidi control in it cannot reorder the row — or the time where it has none.
               The date stays on the row either way: it is bit's own, and outlives the title.
             -->
-            <button
-              class="option session-row"
-              aria-current={current}
-              title={sessionHover(session, Date.now(), parked)}
-              onclick={() => importer.open(session.id)}
-            >
-              <span class="check" aria-hidden="true">
-                {#if current}<IconCheck width="13" height="13" />{/if}
-              </span>
-              <span class="option-main">
-                <span class="session-line session-head">
-                  <span class="session-name"
-                    >{sessionLabel(session, parked)}</span
-                  >
-                  <!--
+              <button
+                class="option session-row"
+                aria-current={current}
+                title={sessionHover(session, Date.now(), parked)}
+                onclick={() => importer.open(session.id)}
+              >
+                <span class="check" aria-hidden="true">
+                  {#if current}<IconCheck width="13" height="13" />{/if}
+                </span>
+                <span class="option-main">
+                  <span class="session-line session-head">
+                    <span class="session-name"
+                      >{sessionLabel(session, parked)}</span
+                    >
+                    <!--
                     A "Not sent" row (nothing said, listed only for the parked words it
                     holds) opened nothing on any model, and its `model` is the empty page's
                     placeholder rather than the chip's pick: no model is shown.
                   -->
-                  {#if session.tally.messages !== 0}
-                    <span class="session-model" title={session.model}
-                      >{session.model}</span
+                    {#if session.tally.messages !== 0}
+                      <span class="session-model" title={session.model}
+                        >{session.model}</span
+                      >
+                    {/if}
+                  </span>
+                  <span class="session-line">
+                    <span class="session-tally">{tallyLine(session.tally)}</span
                     >
-                  {/if}
-                </span>
-                <span class="session-line">
-                  <span class="session-tally">{tallyLine(session.tally)}</span>
-                  <span class="session-when"
-                    >{sessionWhen(session.startedAt, Date.now())}</span
-                  >
-                </span>
-                <!--
+                    <span class="session-when"
+                      >{sessionWhen(session.startedAt, Date.now())}</span
+                    >
+                  </span>
+                  <!--
                   Parked words (U8 review 4): marked on a session with a name of its own,
                   whose label does not say so, and quoted on every such row, so two rows
                   holding some are told apart. The operator's words, isolated as a title is.
                 -->
-                {#if parked !== undefined}
-                  <span class="session-line session-parked">
-                    {#if session.tally.messages !== 0}
-                      <span class="parked-mark">{parkedMark(parked)}</span>
-                    {/if}
-                    <span class="parked-words"
-                      >“<span class="parked-text"
-                        >{parkedStart(parked.text)}</span
-                      >”</span
-                    >
-                  </span>
-                {/if}
+                  {#if parked !== undefined}
+                    <span class="session-line session-parked">
+                      {#if session.tally.messages !== 0}
+                        <span class="parked-mark">{parkedMark(parked)}</span>
+                      {/if}
+                      <span class="parked-words"
+                        >“<span class="parked-text"
+                          >{parkedStart(parked.text)}</span
+                        >”</span
+                      >
+                    </span>
+                  {/if}
+                </span>
+              </button>
+            {:else}
+              <p class="none">No session matches.</p>
+            {/each}
+          {/snippet}
+          {#snippet footer()}
+            <button
+              class="foot-item new-session"
+              onclick={() => importer.start()}
+            >
+              <IconPlus width="14" height="14" />
+              <span class="new-session-text">
+                <span>Start a new session</span>
+                <span class="new-session-sub">
+                  Empty thread, same target. What it writes adds to the scope
+                  that is already there.
+                </span>
               </span>
             </button>
-          {:else}
-            <p class="none">No session matches.</p>
-          {/each}
-        {/snippet}
-        {#snippet footer()}
-          <button
-            class="foot-item new-session"
-            onclick={() => importer.start()}
-          >
-            <IconPlus width="14" height="14" />
-            <span class="new-session-text">
-              <span>Start a new session</span>
-              <span class="new-session-sub">
-                Empty thread, same target. What it writes adds to the scope that
-                is already there.
-              </span>
-            </span>
-          </button>
-        {/snippet}
-      </CrumbPicker>
+          {/snippet}
+        </CrumbPicker>
+      </div>
     {/if}
     {#if app.reconnecting}
       <span class="chip" role="status">Reconnecting…</span>
@@ -807,12 +815,29 @@
     line-height: 15px;
   }
 
+  /*
+    Shrinks, with the session chip the one part that does (A7-S review 3): kept whole, the
+    right group pushed the page sideways on a portrait tablet once the sub-agents chip
+    joined it.
+  */
   .right {
     display: flex;
-    flex: none;
+    flex: 0 1 auto;
     align-items: center;
     gap: 8px;
+    min-width: 0;
     margin-left: auto;
+  }
+  .session-slot {
+    display: flex;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .session-slot :global(.crumb-picker) {
+    flex: 0 1 auto;
+  }
+  .session-slot :global(.crumb) {
+    max-width: 100%;
   }
   /* The persistent half of the reconnecting signal: dismissing the banner
      must not hide a dead connection. */

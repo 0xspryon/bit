@@ -5,9 +5,15 @@
    * sub-agent of the session, including ones whose cards have long scrolled away, and opens
    * the sub-agents panel; it stays pressed while the panel is open. Drawn once the agent has
    * started its first sub-agent, and not before.
+   *
+   * **Compact below about 900px of viewport** (A7-S review 3): the icon and the two counts,
+   * the words in its accessible name and title, so the title bar fits a portrait tablet.
    */
+  import { MediaQuery } from "svelte/reactivity";
+
   import { IconRobot } from "../icons";
   import {
+    SUBAGENT_CHIP_COMPACT_QUERY,
     subagentChipLabel,
     subagentChipName,
     type SubagentGroups,
@@ -29,21 +35,27 @@
   const total = $derived(
     groups.running.length + groups.failed.length + groups.finished.length,
   );
+  const compact = new MediaQuery(SUBAGENT_CHIP_COMPACT_QUERY, false);
+  const action = $derived(
+    open ? "Close the sub-agents panel" : "Open the sub-agents panel",
+  );
 </script>
 
 {#if total > 0}
   <button
     bind:this={button}
-    class="subagents-chip"
+    class={["subagents-chip", compact.current && "compact"]}
     type="button"
     aria-pressed={open}
     aria-controls="subagent-panel"
     aria-label={subagentChipName(groups)}
-    title={open ? "Close the sub-agents panel" : "Open the sub-agents panel"}
+    title={compact.current ? `${subagentChipName(groups)}. ${action}` : action}
     onclick={ontoggle}
   >
     <IconRobot width="13" height="13" aria-hidden="true" />
-    <span class="label">{subagentChipLabel(total)}</span>
+    {#if !compact.current}
+      <span class="label">{subagentChipLabel(total)}</span>
+    {/if}
     <span class="count running" aria-hidden="true"
       ><span class="dot"></span>{groups.running.length}</span
     >
@@ -69,6 +81,10 @@
     font: 400 12px/16px var(--font-mono);
     white-space: nowrap;
     cursor: pointer;
+  }
+  .subagents-chip.compact {
+    gap: 5px;
+    padding: 0 7px;
   }
   .subagents-chip:hover {
     background: var(--overlay-hover);

@@ -97,6 +97,7 @@
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import { composing } from "../composing";
   import {
+    panelOverlays,
     railGivesWay,
     SUBAGENT_CARD_SELECTOR,
     subagentCardId,
@@ -151,6 +152,12 @@
     return () => clearInterval(ticking);
   });
   let panelOpen = $state(false);
+  /**
+   * The panel is a drawer over the chat, not beside it (`panelOverlays`, A7-S review 3):
+   * the window is too narrow for a 560px column beside it even with the rail away. Read as
+   * the panel opens and on every resize while it is open; the rail is not taken for it.
+   */
+  let panelOverlay = $state(false);
   let chipButton = $state<HTMLButtonElement | undefined>(undefined);
   /**
    * The rail was put away by the panel, not by the operator: given back when the panel
@@ -200,19 +207,36 @@
     }
   }
 
+  /**
+   * Both rules for the window and shell as they are now: a drawer where even the whole
+   * window leaves under 560px beside the panel — and then a rail the panel took is given
+   * back, since a drawer needs no room — else the rail rule.
+   */
+  function fitPanel(shellWidth: number): void {
+    panelOverlay = panelOverlays(window.innerWidth);
+    if (!panelOverlay) {
+      fitRail(shellWidth);
+      return;
+    }
+    if (railTakenByPanel) {
+      railTakenByPanel = false;
+      if (app.drawerHidden) app.drawerHidden = false;
+    }
+  }
+
   function openPanel(): void {
     railKeptByOperator = false;
-    fitRail(shellElement()?.clientWidth ?? window.innerWidth);
+    fitPanel(shellElement()?.clientWidth ?? window.innerWidth);
     panelOpen = true;
   }
 
-  // While the panel is open the rule follows the shell's width.
+  // While the panel is open the rules follow the window's and the shell's widths.
   $effect(() => {
     if (!panelOpen || typeof ResizeObserver === "undefined") return;
     const shell = shellElement();
     if (shell === null) return;
     const watching = new ResizeObserver(() => {
-      fitRail(shell.clientWidth);
+      fitPanel(shell.clientWidth);
     });
     watching.observe(shell);
     return () => {
@@ -220,8 +244,11 @@
     };
   });
 
-  /** `toChip`: focus goes back to the chip wherever it was (an Esc on a card, below). */
-  function closePanel(toChip = false): void {
+  /**
+   * `toChip`: focus goes back to the chip wherever it was (an Esc on a card, below);
+   * `"stay"`: it is left to the caller (a drawer's row, which moves it to the card).
+   */
+  function closePanel(toChip: boolean | "stay" = false): void {
     // Asked before the panel goes: focus in it would otherwise fall to the page's body.
     const active = document.activeElement;
     const inPanel =
@@ -233,6 +260,7 @@
       // Given back only if the operator did not show it again meanwhile.
       if (app.drawerHidden) app.drawerHidden = false;
     }
+    if (toChip === "stay") return;
     // Back to the chip that opened it, when focus was in the panel or nowhere.
     if (toChip || inPanel || active === null || active === document.body) {
       void tick().then(() => chipButton?.focus());
@@ -270,10 +298,14 @@
     };
   });
 
-  /** E8: selecting a row scrolls the transcript to its card, and focus goes with it. */
+  /**
+   * E8: selecting a row scrolls the transcript to its card, and focus goes with it. A
+   * drawer (`panelOverlay`) closes first, since it would cover the card (A7-S review 3).
+   */
   function showCard(callId: string): void {
     const card = document.getElementById(subagentCardId(callId));
     if (card === null) return;
+    if (panelOverlay) closePanel("stay");
     card.scrollIntoView({ block: "center", behavior: "smooth" });
     card.focus({ preventScroll: true });
   }
@@ -633,6 +665,7 @@
   id="importer"
   rootClass="importer"
   aside={panelOpen ? subagentPanel : undefined}
+  asideOverlay={panelOverlay}
 >
   {#snippet subagent(row)}
     {#if row.item.subagent !== undefined}

@@ -15,6 +15,7 @@ import type {
 } from "@bit/contracts";
 
 import { App } from "../../src/lib/app.svelte";
+import { SUBAGENT_CHIP_COMPACT_QUERY } from "../../src/lib/subagents";
 import { FakeCountdown } from "../fakeCountdown";
 import {
   FakeServer,
@@ -787,6 +788,72 @@ describe("the 560px rule follows a resize while the panel is open (A7-S review 1
     expect(app.drawerHidden).toBe(false);
   });
 
+  test("A7-S review 3: at 768px the panel is a drawer over the chat: the rail stays, Esc closes it to the chip, and a row closes it and goes to its card", async () => {
+    const { size } = sized();
+    size.window = 768;
+    size.shell = 536;
+    const scrolled: string[] = [];
+    const before = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this.id);
+    };
+    restore.push(() => {
+      Element.prototype.scrollIntoView = before;
+    });
+    const app = await continueWith(new FakeServer(), [RUNNING, FINISHED]);
+    click(chip()!);
+    await settle();
+    const aside = () => panel()?.closest("aside.aside");
+    expect(aside()?.classList.contains("overlay")).toBe(true);
+    // A drawer needs no room: the rail is not put away for it.
+    expect(app.drawerHidden).toBe(false);
+    // The same panel: its groups and rows.
+    expect(
+      [...(panel()?.querySelectorAll(".group-title") ?? [])].map((title) =>
+        text(title),
+      ),
+    ).toEqual(["Running 1", "Finished 1"]);
+    panel()!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    await settle();
+    expect(panel()).toBeNull();
+    expect(document.activeElement?.className).toContain("subagents-chip");
+    click(chip()!);
+    await settle();
+    click(panel()!.querySelectorAll<HTMLButtonElement>(".row .pick")[1]!);
+    await settle();
+    expect(panel()).toBeNull();
+    expect(chip()?.getAttribute("aria-pressed")).toBe("false");
+    expect(scrolled).toEqual(["subagent-toolu_done"]);
+    // Focus is the card's, not sent back to the chip by the close.
+    expect(document.activeElement?.id).toBe("subagent-toolu_done");
+  });
+
+  test("A7-S review 3: a resize moves the panel between drawer and column, and a rail the panel took comes back when it becomes a drawer", async () => {
+    const { size, resize } = sized();
+    size.window = 1024;
+    size.shell = 792;
+    const app = await continueWith(new FakeServer(), [RUNNING]);
+    click(chip()!);
+    await settle();
+    const overlaid = () =>
+      panel()?.closest("aside.aside")?.classList.contains("overlay");
+    // 1024: beside the chat, the rail away.
+    expect(overlaid()).toBe(false);
+    expect(app.drawerHidden).toBe(true);
+    // Turned to portrait: a drawer, and the rail back.
+    await resize(768, false);
+    expect(overlaid()).toBe(true);
+    expect(app.drawerHidden).toBe(false);
+    // 959 is still too narrow; 960 leaves 560 beside it.
+    await resize(959, true);
+    expect(overlaid()).toBe(true);
+    await resize(1440, true);
+    expect(overlaid()).toBe(false);
+    expect(app.drawerHidden).toBe(false);
+  });
+
   test("a rail the operator shows again while the panel is open is not taken again by a resize", async () => {
     const { size, resize } = sized();
     size.window = 1440;
@@ -805,6 +872,52 @@ describe("the 560px rule follows a resize while the panel is open (A7-S review 1
     click(chip()!);
     await settle();
     expect(app.drawerHidden).toBe(false);
+  });
+});
+
+describe("a portrait tablet (A7-S review 3)", () => {
+  /**
+   * `window.matchMedia` answering `matches` for the chip's compact query and no other:
+   * happy-dom has no layout, so the viewport the query reads is the test's to say.
+   */
+  const viewportBelow900 = (matches: boolean) => {
+    const before = window.matchMedia.bind(window);
+    window.matchMedia = ((query: string) => ({
+      matches: query === SUBAGENT_CHIP_COMPACT_QUERY ? matches : false,
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    restore.push(() => {
+      window.matchMedia = before;
+    });
+  };
+
+  test("below 900px the chip is its icon and counts, its words in its name and title", async () => {
+    viewportBelow900(true);
+    await continueWith(new FakeServer(), [RUNNING, FINISHED, FAILED]);
+    expect(chip()?.classList.contains("compact")).toBe(true);
+    expect(chip()?.querySelector(".label")).toBeNull();
+    expect(text(chip()?.querySelector(".count.running"))).toBe("1");
+    expect(text(chip()?.querySelector(".count.failed"))).toBe("1");
+    expect(chip()?.getAttribute("aria-label")).toBe(
+      "3 sub-agents, 1 running, 1 failed",
+    );
+    expect(chip()?.getAttribute("title")).toBe(
+      "3 sub-agents, 1 running, 1 failed. Open the sub-agents panel",
+    );
+  });
+
+  test("from 900px it keeps its words", async () => {
+    viewportBelow900(false);
+    await continueWith(new FakeServer(), [RUNNING, FINISHED, FAILED]);
+    expect(chip()?.classList.contains("compact")).toBe(false);
+    expect(text(chip()?.querySelector(".label"))).toBe("3 sub-agents");
+    expect(chip()?.getAttribute("title")).toBe("Open the sub-agents panel");
   });
 });
 
