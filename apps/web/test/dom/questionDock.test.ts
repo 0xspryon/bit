@@ -355,6 +355,54 @@ describe("Jump to…, and Esc", () => {
     expect(calls.join(",")).toBe("dismiss");
   });
 
+  test("an input method's Enter and Esc are its own: no next question, no leaving the box, no dismissal (A7-Q review 2)", async () => {
+    const { root, calls } = await asking({
+      fields: [field({ key: "Which" }), field({ key: "Then" })],
+    });
+    const own = root.querySelector<HTMLInputElement>(".current input.own");
+    if (own === null) throw new Error("no own-words row");
+    own.focus();
+    await write(own, "にほ");
+    // Both spellings of "the IME has this key": the standard flag, and keyCode 229.
+    for (const ime of [{ isComposing: true }, { keyCode: 229 }]) {
+      const enter = press("Enter", ime);
+      await settle();
+      expect(enter.defaultPrevented).toBe(false);
+      expect(text(dock(root).querySelector(".counter"))).toBe(
+        "Question 1 of 2",
+      );
+      const escape = press("Escape", ime);
+      await settle();
+      expect(escape.defaultPrevented).toBe(false);
+      expect(document.activeElement === own).toBe(true);
+      expect(calls.join(",")).toBe("");
+    }
+    // Composition over, the same keys work as before.
+    press("Enter");
+    await settle();
+    expect(text(dock(root).querySelector(".counter"))).toBe("Question 2 of 2");
+  });
+
+  test("the footer's Esc hint says what Esc does where focus is: leave the box with words in it, else reply in chat", async () => {
+    const { root } = await asking({
+      fields: [field({ key: "Notify whom", kind: "text", options: [] })],
+    });
+    const keys = () => text(dock(root).querySelector(".foot .keys"));
+    expect(keys()).toContain("Esc reply in chat instead");
+    const box = root.querySelector<HTMLTextAreaElement>(".current textarea");
+    if (box === null) throw new Error("no answer box");
+    box.focus();
+    await settle();
+    // Empty, Esc still dismisses.
+    expect(keys()).toContain("Esc reply in chat instead");
+    await write(box, "security@acme.test");
+    expect(keys()).toContain("Esc leave the box");
+    press("Escape");
+    await settle();
+    // Out of the box, on the dock: the next Esc dismisses, and the hint says so.
+    expect(keys()).toContain("Esc reply in chat instead");
+  });
+
   test("the header's dismiss says what it does, and does it", async () => {
     const { root, calls } = await asking();
     const dismiss = buttonNamed(root, "Dismiss these questions");

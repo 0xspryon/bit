@@ -17,6 +17,7 @@
    */
   import type { Snippet } from "svelte";
   import { IconAngleDown, IconSearch } from "../icons";
+  import { composing } from "../composing";
 
   let {
     label,
@@ -82,7 +83,7 @@
     close(false);
   }}
   onkeydown={(event) => {
-    if (open && event.key === "Escape") {
+    if (open && event.key === "Escape" && !composing(event)) {
       event.preventDefault();
       close(true);
     }
@@ -116,7 +117,11 @@
           {placeholder}
           aria-label={placeholder}
           onkeydown={(event) => {
-            if (event.key === "Enter" && onenter !== undefined) {
+            if (
+              event.key === "Enter" &&
+              onenter !== undefined &&
+              !composing(event)
+            ) {
               event.preventDefault();
               onenter();
               close(false);

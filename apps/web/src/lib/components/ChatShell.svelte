@@ -64,6 +64,7 @@
     type ThreadTurn,
   } from "../chatShell";
   import { titleBarChips } from "../titleBarChips.svelte";
+  import { composing } from "../composing";
   import { setAttachmentLoader } from "../attachmentFiles";
   import { panelFileDrop } from "../composerFiles.svelte";
   import AttachmentChips from "./AttachmentChips.svelte";
@@ -227,7 +228,10 @@
 
   /** Esc in the dock gives the composer back, unless the dock's own control used it. */
   function ondockkeydown(event: KeyboardEvent): void {
-    if (event.key !== "Escape" || event.defaultPrevented) return;
+    // An input method's Esc cancels its conversion, and is not a dismissal (A7-Q review 2).
+    if (event.key !== "Escape" || event.defaultPrevented || composing(event)) {
+      return;
+    }
     event.preventDefault();
     question?.dismiss();
   }

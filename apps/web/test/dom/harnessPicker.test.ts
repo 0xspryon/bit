@@ -105,6 +105,42 @@ describe("the importer's picker", () => {
   });
 });
 
+describe("an input method in the picker's filter (A7-Q review 2)", () => {
+  test("Esc and the arrows while composing are the input method's, not the dialog's; after it, Esc closes", async () => {
+    await show("importer-first");
+    const chip = document.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"][aria-label^="Harness and model"]',
+    );
+    if (chip === null) throw new Error("no model chip");
+    click(chip);
+    await settle();
+    const filter = dialog().querySelector<HTMLInputElement>("input.search");
+    if (filter === null) throw new Error("no filter");
+    filter.focus();
+    for (const ime of [{ isComposing: true }, { keyCode: 229 }]) {
+      const escape = press("Escape", ime);
+      await settle();
+      expect(escape.defaultPrevented).toBe(false);
+      expect(dialog().isConnected).toBe(true);
+    }
+    // The arrows choose the IME's candidate while it converts, not a model row.
+    const down = press("ArrowDown", { isComposing: true });
+    await settle();
+    expect(down.defaultPrevented).toBe(false);
+    expect(document.activeElement === filter).toBe(true);
+    press("ArrowDown");
+    await settle();
+    expect(document.activeElement?.classList.contains("model-row")).toBe(true);
+    press("Escape");
+    await settle();
+    expect(
+      document.querySelector(
+        '[role="dialog"][aria-label="Choose a harness and model"]',
+      ),
+    ).toBeNull();
+  });
+});
+
 /*
  * The model list is a roving tabindex: every row but one is a `tabindex="-1"` button. A
  * trap that counted those took the last row for its last stop, so with a picked model that

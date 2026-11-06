@@ -57,6 +57,7 @@
  * so the error's opener is in the picker, and closing the error puts focus back there.
  */
 import type { Attachment } from "svelte/attachments";
+import { composing } from "./composing";
 import { wrapTab } from "./dialogFocus";
 
 /**
@@ -165,7 +166,8 @@ export function dialogKeydown(
   onclose: () => void,
 ): void {
   if (panel === null || event.defaultPrevented || !isTopmost(panel)) return;
-  if (event.key === "Escape") {
+  // A text field's input method cancels its conversion with Esc: not the dialog's to close.
+  if (event.key === "Escape" && !composing(event)) {
     event.preventDefault();
     onclose();
     return;

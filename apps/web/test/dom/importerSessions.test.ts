@@ -317,6 +317,32 @@ describe("Continue that session", () => {
     expect(rows[0]?.getAttribute("aria-current")).toBe("true");
   });
 
+  test("an input method's Enter and Esc in the picker's search are its own: nothing opened, nothing closed (A7-Q review 2)", async () => {
+    const { app } = await openScope(SESSIONS);
+    click(button("Continue that session"));
+    await settle();
+    const current = app.importer.current?.id;
+    app.importer.pickerOpen = true;
+    await settle();
+    const search = document.querySelector<HTMLInputElement>(
+      '[role="dialog"][aria-label="Importer sessions"] input',
+    );
+    if (search === null) throw new Error("no search field");
+    search.focus();
+    for (const ime of [{ isComposing: true }, { keyCode: 229 }]) {
+      for (const key of ["Enter", "Escape"]) {
+        const event = press(key, ime);
+        await settle();
+        expect(event.defaultPrevented).toBe(false);
+        expect(app.importer.pickerOpen).toBe(true);
+        expect(app.importer.current?.id).toBe(current);
+      }
+    }
+    press("Escape");
+    await settle();
+    expect(app.importer.pickerOpen).toBe(false);
+  });
+
   test("D5's rows: the harness's name and the model it ended on, then what it wrote and when (U8)", async () => {
     const titled = [
       importerSessionView({

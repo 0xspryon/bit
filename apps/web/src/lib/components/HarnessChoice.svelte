@@ -52,6 +52,7 @@
    */
   import Badge from "./Badge.svelte";
   import { IconSearch } from "../icons";
+  import { composing } from "../composing";
   import type { HarnessInstanceView } from "@bit/contracts";
   import type { Snippet } from "svelte";
 
@@ -148,6 +149,8 @@
   }
 
   function onkeydown(event: KeyboardEvent) {
+    // The filter's input method owns its keys while converting: Esc, Enter, the arrows.
+    if (composing(event)) return;
     if (event.key === "Escape") {
       // The same key closes both shells. The inline one had no Escape at all, which is
       // the kind of difference that only exists because the markup was written twice.

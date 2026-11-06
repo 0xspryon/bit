@@ -209,6 +209,28 @@ describe("Send now and the queue", () => {
     );
   });
 
+  test("an input method's Enter accepts its candidate and sends nothing (A7-Q review 2)", async () => {
+    const { root, calls } = await shell({ steerable: true });
+    await type(textarea(root), "にほんご");
+    for (const ime of [{ isComposing: true }, { keyCode: 229 }]) {
+      const enter = new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+        ...ime,
+      });
+      textarea(root).dispatchEvent(enter);
+      await settle();
+      expect(enter.defaultPrevented).toBe(false);
+    }
+    expect(calls.join(",")).toBe("");
+    textarea(root).dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+    );
+    await settle();
+    expect(calls.join(",")).toBe("send:queued:にほんご");
+  });
+
   test("not offered: no Send now while a turn runs, and Enter still queues", async () => {
     const { root, calls, set } = await shell({ steerable: false });
     await set({ working: true });

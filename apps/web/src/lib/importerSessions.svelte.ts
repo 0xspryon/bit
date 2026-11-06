@@ -78,6 +78,7 @@ import type {
 } from "@bit/contracts";
 import {
   IMPORTER_MESSAGE_MAX_CHARS,
+  QUESTION_RECHECK_MS,
   sameModel,
   sameWindow,
   truncateNarration,
@@ -608,6 +609,13 @@ export class ImporterSessions {
   notice = $state("");
   /** Whether {@link notice} is a refusal, which the composer shows as one. */
   refused = $state(false);
+  /**
+   * The line a dismissal the harness did not answer left above the box, and whose session
+   * it is (A7-Q review 2): taken away if the question is offered again.
+   */
+  #putAwayNotice:
+    { readonly sessionId: string; readonly notice: string } | undefined =
+    undefined;
   /**
    * The words of messages that did not land where they were sent, by the session they wait
    * on (`importerParked.ts`): refused, or with no answer, after the operator had left that
@@ -2657,6 +2665,16 @@ export class ImporterSessions {
         ...before,
         history: { ...before.history, question: asked },
       }));
+      // Offered again after a dismissal the harness did not answer: the line saying it
+      // was put away is no longer true, and goes while it is still the line on screen.
+      const said = this.#putAwayNotice;
+      if (said?.sessionId === session.id) {
+        this.#putAwayNotice = undefined;
+        if (this.notice === said.notice) {
+          this.notice = "";
+          this.refused = false;
+        }
+      }
       return;
     }
     if (session.history.question?.questionId !== frame.questionId) return;
@@ -2729,8 +2747,13 @@ export class ImporterSessions {
      * box hostage to it. So it is put away here, and the line above the box that comes back
      * says the agent may not have heard — a line rather than the dialog, which is the
      * dock's and goes with it; cleared, as any of those lines, by the next message or
-     * another session. Should the harness come back still waiting, its re-listing offers
-     * the question again (`noteQuestion`), which is the truth then.
+     * another session.
+     *
+     * Whether it is offered again is the server's to find out (A7-Q review 2): it asks the
+     * harness again for `QUESTION_RECHECK_MS` and publishes the question again while it
+     * still waits (`noteQuestion` docks it, and takes this line away), or takes it off
+     * once settled. A harness away for longer is found again only by a reload, so the
+     * line says so. Never "the agent was not told": that is not known.
      */
     if (
       how === "dismiss" &&
@@ -2738,8 +2761,10 @@ export class ImporterSessions {
       answer.reason === "harness_unreachable"
     ) {
       putAway();
-      this.notice = `Questions put away, but the agent was not told: ${answer.detail} If the harness answers again with them still waiting, they are offered again.`;
+      const notice = putAwayNotice(answer.detail);
+      this.notice = notice;
       this.refused = true;
+      this.#putAwayNotice = { sessionId: session.id, notice };
       return;
     }
     this.questionRefusal = {
@@ -2874,3 +2899,14 @@ const unansweredDetail = (first: boolean): string =>
 
 const sentenceCase = (text: string): string =>
   text === "" ? text : `${text[0]?.toUpperCase() ?? ""}${text.slice(1)}`;
+
+/**
+ * The line above the box after a dismissal the harness did not answer (A7-Q review 2): the
+ * server's sentence, which says whether the agent heard is not known, then what happens
+ * next — the server asks again for {@link QUESTION_RECHECK_MS}, and after that only a
+ * reload checks.
+ */
+export const putAwayNotice = (detail: string): string =>
+  `Questions put away. ${sentenceCase(detail)} If the harness comes back within ${String(
+    Math.round(QUESTION_RECHECK_MS / 60_000),
+  )} minutes still waiting on them, they are offered here again; after that, reload the page to check.`;

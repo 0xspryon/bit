@@ -36,6 +36,7 @@
    * Every word in it is the agent's: plain text, never markup.
    */
   import { tick } from "svelte";
+  import { composing } from "../composing";
 
   import {
     questionAnswersAsMessage,
@@ -186,9 +187,26 @@
     problem = "";
   }
 
+  /**
+   * Whether focus is in a written answer with words in it, where the first Esc only leaves
+   * the box (`onkeydown`): the footer's Esc hint says so there (A7-Q review 2). Read from
+   * the focused element on each focus move and keystroke rather than from the draft, since
+   * the own-words row of a choice and a your-words box both count.
+   */
+  let inWords = $state(false);
+  function readWords(): void {
+    const at = document.activeElement;
+    inWords =
+      root?.contains(at) === true &&
+      (at instanceof HTMLTextAreaElement ||
+        (at instanceof HTMLInputElement && at.type === "text")) &&
+      at.value.trim() !== "";
+  }
+
   /** The dock's own keys; Esc is the shell's, unless the Jump to… list took it. */
   function onkeydown(event: KeyboardEvent): void {
-    if (event.defaultPrevented || readOnly) return;
+    // An input method's Enter or Esc is its own (A7-Q review 2): no next question, no leaving.
+    if (event.defaultPrevented || readOnly || composing(event)) return;
     const target = event.target as HTMLElement | null;
     const typing =
       target instanceof HTMLTextAreaElement ||
@@ -263,6 +281,7 @@
 
   /** The Jump to… list's keys. Esc closes the list and is kept from the shell. */
   function onjumpkeydown(event: KeyboardEvent): void {
+    if (composing(event)) return;
     if (event.key === "Escape") {
       event.preventDefault();
       closeJump(true);
@@ -335,6 +354,9 @@
   aria-busy={question.busy}
   tabindex="-1"
   {onkeydown}
+  onfocusin={readWords}
+  onfocusout={readWords}
+  oninput={readWords}
 >
   <header class="head">
     <span class="mark" aria-hidden="true"><IconHelp /></span>
@@ -562,9 +584,11 @@
           choose · <kbd>Enter</kbd> next
         {/if}
         · <kbd>Esc</kbd>
-        {pending.answerability === "live"
-          ? "reply in chat instead"
-          : "put away"}
+        {inWords
+          ? "leave the box"
+          : pending.answerability === "live"
+            ? "reply in chat instead"
+            : "put away"}
       {:else}
         <kbd>Esc</kbd> put away
       {/if}

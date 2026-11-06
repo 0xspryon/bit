@@ -294,7 +294,7 @@ describe("the importer's question dock (A7-Q)", () => {
     expect(fake.countOf("importerMessages")).toBe(asked + 1);
   });
 
-  test("a dismissal the harness could not be told of still puts the dock away, and says the agent was not told", async () => {
+  test("a dismissal the harness could not be told of still puts the dock away, and says the agent may not have heard", async () => {
     const fake = new FakeServer();
     await continueWith(fake, QUESTION());
     fake.onDismissImporterQuestion = (
@@ -322,9 +322,18 @@ describe("the importer's question dock (A7-Q)", () => {
     expect(document.querySelector("[role=alertdialog]")).toBeNull();
     const said = document.querySelector(".importer .stack > .notice.refusal");
     expect(said?.getAttribute("role")).toBe("alert");
-    expect(said?.textContent).toContain(
-      "Questions put away, but the agent was not told: the harness did not answer (connection refused)",
+    // Not "the agent was not told": whether it was is not known (A7-Q review 2).
+    expect(said?.textContent).toBe(
+      "Questions put away. The harness did not answer (connection refused), so whether the agent was told you declined is not known. If the harness comes back within 5 minutes still waiting on them, they are offered here again; after that, reload the page to check.",
     );
+    // The server asks the harness again and, still waiting, publishes it again: docked,
+    // and the line that said it was put away goes.
+    fake.watch.send(frame({ question: QUESTION() }));
+    await settle();
+    expect(dock()).not.toBeNull();
+    expect(
+      document.querySelector(".importer .stack > .notice.refusal"),
+    ).toBeNull();
   });
 
   test("an answer the harness could not take keeps the dock and the answers", async () => {

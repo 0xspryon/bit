@@ -30,6 +30,7 @@
     type ChatWords,
   } from "../chatShell";
   import { filesOfPaste } from "../composerFiles.svelte";
+  import { composing } from "../composing";
   import ComposerTray from "./ComposerTray.svelte";
 
   let {
@@ -129,7 +130,8 @@
    * reason: an agent is told things in sentences, often several.
    */
   function onkeydown(event: KeyboardEvent): void {
-    if (event.key !== "Enter" || event.shiftKey) return;
+    // An input method's Enter accepts its candidate, and sends nothing (A7-Q review 2).
+    if (event.key !== "Enter" || event.shiftKey || composing(event)) return;
     event.preventDefault();
     if (canSend && composer.closed === undefined) composer.send("queued");
   }
