@@ -913,6 +913,37 @@ export const LiveConnection = Schema.Struct({
 export type LiveConnection = typeof LiveConnection.Type;
 
 /**
+ * The provider refused a model call and the harness is about to ask again (Claude Code's
+ * `system/api_retry`): what a chat shows as a passing status line — "The provider refused
+ * (429). Retrying, attempt 3 of 10, in 2 s." — until the session says anything else or its
+ * turn ends. Not a transcript row: a retry that worked leaves nothing worth keeping, and one
+ * that did not ends the turn with the provider's own error, which is an item.
+ *
+ * `error` is the harness's category (`rate_limit`, `server_error`, `unknown`), never the
+ * provider's text: the CLI does not send it on a retry. Whose session it is, exactly as
+ * {@link LiveUsage} says it. Activity-channel and lossy, like {@link LiveConnection}; the
+ * cost of a new `_tag` is the one those state.
+ */
+export const LiveRetry = Schema.Struct({
+  _tag: Schema.Literal("retry"),
+  /** This retry's number, from 1. */
+  attempt: Schema.Int,
+  /** How many the harness will make before it gives up on the call. */
+  maxRetries: Schema.Int,
+  /** How long it waits before this one. */
+  delayMs: Schema.Int,
+  /** The HTTP status the provider refused with, or `null` with no response at all. */
+  status: Schema.NullOr(Schema.Int),
+  error: Schema.String,
+  attemptId: Schema.NullOr(Schema.String),
+  roundId: Schema.NullOr(Schema.String),
+  goalId: Schema.NullOr(Schema.String),
+  importId: Schema.NullOr(Schema.String),
+  at: EpochMillis,
+});
+export type LiveRetry = typeof LiveRetry.Type;
+
+/**
  * One frame of the live transcript.
  *
  * Tagged, because a client has to branch on it, and discriminated by `_tag` rather than by
@@ -926,5 +957,6 @@ export const LiveFrame = Schema.Union([
   LiveTurnEnded,
   LiveConnection,
   LiveQuestion,
+  LiveRetry,
 ]);
 export type LiveFrame = typeof LiveFrame.Type;

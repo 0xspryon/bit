@@ -1244,6 +1244,22 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
         importId: base.importId,
         at: base.at,
       };
+    case "retry":
+      // The provider refused a call and the harness will ask again: a passing status
+      // about the session (`LiveRetry`), not a row in it.
+      return {
+        _tag: "retry",
+        attempt: detail.attempt,
+        maxRetries: detail.maxRetries,
+        delayMs: Math.max(0, Math.round(detail.delayMs)),
+        status: detail.status,
+        error: detail.error,
+        attemptId: base.attemptId,
+        roundId: base.roundId,
+        goalId: base.goalId,
+        importId: base.importId,
+        at: base.at,
+      };
     case "question":
       // The agent is waiting on the operator (A7-Q): a frame about the session, not a row
       // in it. The tool call that asked is its own `tool.call` item, as any call is.

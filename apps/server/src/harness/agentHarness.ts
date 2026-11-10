@@ -791,6 +791,27 @@ export type NarrationDetail =
       readonly questionId: string;
       readonly settled: QuestionSettlement;
     }
+  | {
+      /**
+       * The provider refused a model call and the harness will ask again after a delay:
+       * Claude Code's `system/api_retry` (a 429, a 529, a connection that timed out). A
+       * status about the session, not a row in it, and transient: the next thing the session
+       * says, or its turn's end, makes it stale. Carries no provider text, because the CLI
+       * sends none — `error` is its category (`rate_limit`, `server_error`, …).
+       *
+       * Measured against a provider answering 429 with z.ai's code 1113 (CLI 2.1.310): ten
+       * of these, `attempt` 1–10, backing off over three minutes and more before the turn
+       * fails; with `CLAUDE_CODE_MAX_RETRIES=1`, one, and the turn's `result` carries the
+       * provider's message.
+       */
+      readonly _tag: "retry";
+      readonly attempt: number;
+      readonly maxRetries: number;
+      readonly delayMs: number;
+      /** The HTTP status, or `null` for a connection that never answered. */
+      readonly status: number | null;
+      readonly error: string;
+    }
   | { readonly _tag: "opaque" };
 
 /**

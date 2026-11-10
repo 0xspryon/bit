@@ -135,6 +135,12 @@ export const HarnessModelView = Schema.Struct({
   /** What a run names, in the form the harness takes it. */
   id: Schema.NonEmptyString,
   /**
+   * What a screen calls the model, when its instance's configuration names it (a z.ai
+   * Claude Code instance's `sonnet` is "GLM-5.3 Flash"). Never an identity: a run still
+   * names {@link id}. Absent: the id is what is shown.
+   */
+  label: Schema.optional(Schema.NonEmptyString),
+  /**
    * What this model can be asked for beyond itself.
    *
    * Absent and empty mean the same thing and both are the common case: most models offer
