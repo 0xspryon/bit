@@ -9,7 +9,9 @@ import type { LiveItem } from "@bit/contracts";
 
 import { rowsFor, type ChatGroup } from "../src/lib/chat";
 import {
+  RESTING_DRAFT,
   composerCanSend,
+  composerResting,
   replyText,
   stopOffered,
   turnFooterText,
@@ -102,37 +104,37 @@ describe("turnFooterText", () => {
   });
 });
 
-describe("stopOffered", () => {
-  const session = (
-    over: Partial<ChatSession> & { readonly running?: boolean },
-  ): ChatSession => ({
-    label: "",
-    empty: "",
-    groups: [],
-    note: "",
-    connection: "",
-    turn: {
-      working: over.running ?? false,
-      background: false,
-      stopping: false,
-    },
-    words: {
-      working: "",
-      copyReply: "",
-      stopTurn: "",
-      stopBackground: "",
-      messageLabel: "",
-      sendLabel: "",
-      sendTitle: "",
-      sendQueuedTitle: "",
-      countTitle: "",
-      questionsAsked: () => "",
-    },
-    footer: { agent: "", model: "" },
-    sentNowTitle: "",
-    ...over,
-  });
+const session = (
+  over: Partial<ChatSession> & { readonly running?: boolean },
+): ChatSession => ({
+  label: "",
+  empty: "",
+  groups: [],
+  note: "",
+  connection: "",
+  turn: {
+    working: over.running ?? false,
+    background: false,
+    stopping: false,
+  },
+  words: {
+    working: "",
+    copyReply: "",
+    stopTurn: "",
+    stopBackground: "",
+    messageLabel: "",
+    sendLabel: "",
+    sendTitle: "",
+    sendQueuedTitle: "",
+    countTitle: "",
+    questionsAsked: () => "",
+  },
+  footer: { agent: "", model: "" },
+  sentNowTitle: "",
+  ...over,
+});
 
+describe("stopOffered", () => {
   test("only while something runs, and only for a chat that can stop", () => {
     const stop = (): void => undefined;
     expect(stopOffered(session({ stop, running: true }))).toBe(true);
@@ -146,5 +148,44 @@ describe("stopOffered", () => {
         }),
       ),
     ).toBe(true);
+  });
+});
+
+describe("composerResting", () => {
+  const question = {
+    pending: {} as never,
+    asker: "The agent",
+    busy: false,
+    answer: () => undefined,
+  };
+
+  test("at rest with a short draft, with no box, or a closed one", () => {
+    expect(composerResting(session({ composer: source() }))).toBe(true);
+    expect(
+      composerResting(session({ composer: source({ draft: "a\nb\nc" }) })),
+    ).toBe(true);
+    expect(composerResting(session({}))).toBe(true);
+    expect(composerResting(session({ composer: { closed: "None." } }))).toBe(
+      true,
+    );
+  });
+
+  test("grown by a docked question, more lines, or a draft that wraps", () => {
+    expect(composerResting(session({ composer: source(), question }))).toBe(
+      false,
+    );
+    expect(
+      composerResting(session({ composer: { closed: "None." }, question })),
+    ).toBe(false);
+    expect(
+      composerResting(session({ composer: source({ draft: "a\nb\nc\nd" }) })),
+    ).toBe(false);
+    expect(
+      composerResting(
+        session({
+          composer: source({ draft: "x".repeat(RESTING_DRAFT.chars + 1) }),
+        }),
+      ),
+    ).toBe(false);
   });
 });

@@ -396,6 +396,26 @@ export const stopOffered = (session: ChatSession<ThreadTurn>): boolean =>
 export const stopsAll = (session: ChatSession<ThreadTurn>): boolean =>
   session.stop !== undefined && (session.stopAll?.running ?? 0) > 0;
 
+/** The longest draft, in lines and in characters, a floating box still rests with. */
+export const RESTING_DRAFT = { lines: 3, chars: 240 } as const;
+
+/**
+ * Whether the composer is at rest, for a floating chat (`Chat`'s `composerResting`): no
+ * question holds its slot and the draft is short. Only a resting box's height becomes the
+ * log's bottom padding, so a dock or a long draft covers more of the log rather than moving
+ * every message up. Characters as well as lines, because the box grows with a draft that
+ * wraps as much as with one that breaks: about three lines of the 800px column.
+ */
+export const composerResting = (session: ChatSession<ThreadTurn>): boolean => {
+  if (session.question !== undefined) return false;
+  const open = openComposer(session);
+  if (open === undefined) return true;
+  return (
+    open.draft.split("\n").length <= RESTING_DRAFT.lines &&
+    open.draft.length <= RESTING_DRAFT.chars
+  );
+};
+
 /** The session's box when the operator can write in it, or `undefined`. */
 export const openComposer = (
   session: ChatSession<ThreadTurn>,

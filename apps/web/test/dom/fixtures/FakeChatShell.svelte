@@ -40,6 +40,7 @@
     fields = undefined,
     answerability = "live",
     canMessage = true,
+    floating = false,
   }: {
     calls: string[];
     closed?: string | undefined;
@@ -60,6 +61,8 @@
     answerability?: QuestionAnswerability;
     /** Whether the chat takes the answers as a message (`sendAsMessage`). */
     canMessage?: boolean;
+    /** The composer floats over the thread (`ChatShell`'s `floating`). */
+    floating?: boolean;
   } = $props();
 
   // The page's title bar chips, as `+page.svelte` provides them, drawn in a stand-in bar.
@@ -302,6 +305,7 @@
   <ChatShell
     {session}
     id="fake"
+    {floating}
     {footnote}
     dock={dock ? ask : undefined}
     controls={stopAll ? stopEvery : undefined}

@@ -56,6 +56,7 @@
   } from "../chat";
   import {
     clockLabel,
+    composerResting,
     openComposer,
     replyText,
     stopOffered,
@@ -95,6 +96,7 @@
     asideOverlay = false,
     asideLabelledBy,
     subagent,
+    floating = false,
   }: {
     session: ChatSession<Subject>;
     /** The prefix of the composer's ids: `importer` → `#importer-message`. */
@@ -128,6 +130,12 @@
     /** The id of the element that names the aside, for the drawer's `aria-labelledby`. */
     asideLabelledBy?: string | undefined;
     subagent?: Snippet<[ChatRow]> | undefined;
+    /**
+     * The composer floats over the thread (`Chat`'s `floating`): the log fills the column's
+     * height and runs under the box, which rests on its bottom edge; the dock or a long
+     * draft covers more of the log rather than moving it (`composerResting`). A chat opts in.
+     */
+    floating?: boolean;
   } = $props();
 
   // Attachment chips in this thread ask the chat's server for their files (A6 U13).
@@ -459,6 +467,8 @@
         question === undefined &&
         below === undefined}
       layout="thread"
+      {floating}
+      composerResting={composerResting(session)}
       note={session.note}
       detail={session.connection}
       empty={session.empty}

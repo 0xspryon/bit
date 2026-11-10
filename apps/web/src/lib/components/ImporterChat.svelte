@@ -14,10 +14,15 @@
    * `Chat` takes the group's subject as a type parameter it never looks inside, so this is
    * the third caller and the importer's own subject ({@link ThreadTurn}) and separator are
    * written here. `layout="thread"` is the one thing `Chat` was taught for it: A6 draws the
-   * chat as the whole page — an 800px column, no frame, the composer pinned under the log —
+   * chat as the whole page — an 800px column, no frame, the composer at the foot of the log —
    * where the planner's and the goal agent's are panels among other things. Rows go through
    * {@link ChatItem} too, `narrated`: prose as prose and a call as a mono block, with the
    * same record/activity distinction and write states as the ledger reading.
+   *
+   * The composer **floats** over the log (`ChatShell`'s `floating`): the log takes the
+   * page's height and runs under the box, the last message resting just above it, and a
+   * docked question or a long draft covers more of the log instead of moving it. Scrolled
+   * up, "↓ Latest" brings the newest message back and puts focus in the box.
    *
    * One group per operator message. The separator is the operator's bubble and nothing
    * else; what the importer said and called follows as rows, with **no label over it** —
@@ -488,6 +493,7 @@
   session={chat}
   id="importer"
   rootClass="importer"
+  floating
   aside={panelOpen ? subagentPanel : undefined}
   asideOverlay={panelOverlay}
   asideLabelledBy="subagent-panel-heading"
