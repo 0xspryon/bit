@@ -579,6 +579,12 @@ interface SessionRecord {
   /** Replaced per turn of a multi-turn session, as on Claude Code. */
   idle: Deferred.Deferred<void, HarnessFailure>;
   readonly switching: Semaphore.Semaphore;
+  /**
+   * One permit, held by a delivery from its idle check to its last send (slice 2 review,
+   * L5): two messages arriving within one `clear_queue` round trip after a Stop would
+   * otherwise both take the held message and send it twice, or reach Pi out of order.
+   */
+  readonly delivering: Semaphore.Semaphore;
   rpc: RpcProcess | undefined;
   /** The opening prompt has been given; a second is refused. */
   started: boolean;
@@ -1285,6 +1291,7 @@ export const piHarness = (
           narrator: narratorFor(() => holder.record as SessionRecord),
           idle,
           switching: yield* Semaphore.make(1),
+          delivering: yield* Semaphore.make(1),
           rpc: undefined,
           started: false,
           openUnseen: false,
@@ -1448,12 +1455,16 @@ export const piHarness = (
           behavior: delivery.urgency === "preemptive" ? "steer" : "followUp",
         };
         record.deliveredIds.add(delivery.messageId);
-        const idle = !record.busy && record.pendingPrompts === 0;
-        if (idle) turnBegins(record);
         const sent = yield* Effect.result(
-          idle && record.untaken.length > 0
-            ? sendHeldFirst(record, message)
-            : sendPrompt(record, message, controlTimeout),
+          Semaphore.withPermit(record.delivering)(
+            Effect.suspend(() => {
+              const idle = !record.busy && record.pendingPrompts === 0;
+              if (idle) turnBegins(record);
+              return idle && record.untaken.length > 0
+                ? sendHeldFirst(record, message)
+                : sendPrompt(record, message, controlTimeout);
+            }),
+          ),
         );
         if (sent._tag === "Failure") {
           record.deliveredIds.delete(delivery.messageId);

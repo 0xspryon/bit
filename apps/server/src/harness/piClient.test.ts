@@ -180,6 +180,19 @@ const open = (
     }),
   );
 
+/**
+ * Without `pi` on PATH these tests cannot run, and a suite that skipped them would pass
+ * having checked nothing about the driver (slice 2 review, L7). So a missing `pi` fails
+ * here, saying why, unless `BIT_SKIP_PI_TESTS=1` says the skip is meant.
+ */
+const skipPi = !hasPi && process.env.BIT_SKIP_PI_TESTS === "1";
+
+test.skipIf(hasPi || skipPi)("pi is on PATH for the driver tests", () => {
+  throw new Error(
+    "`pi` is not on PATH, so piHarness's tests cannot run; install pi-coding-agent, or set BIT_SKIP_PI_TESTS=1 to skip them on purpose",
+  );
+});
+
 describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
   test("the catalogue is Pi's own list, labelled by its names, with windows", async () => {
     const f = await fixture();
