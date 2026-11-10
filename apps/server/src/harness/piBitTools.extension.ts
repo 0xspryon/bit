@@ -20,7 +20,8 @@
  *
  * bit writes the bearer to the Pi process's **file descriptor 3**, a pipe it closes at once,
  * and names the descriptor in `BIT_MCP_TOKEN_FD`. This reads it to the end, closes the
- * descriptor, and keeps the token in this module's closure only.
+ * descriptor, and keeps the token in this process's memory only (a global symbol, so a Pi
+ * `reload` of the extension finds it again).
  *
  * Not an environment variable, which is what the spike used. Deleting it from
  * `process.env` kept it out of the shells Pi starts, but **not out of
@@ -152,13 +153,34 @@ const readToken = (): string | undefined => {
   }
 };
 
+/**
+ * Where the endpoint and its bearer stay after the first load, in this process's memory
+ * only: a Pi `reload` runs this factory again, and by then fd 3 is closed and the variables
+ * are gone. Never the environment, which the agent's shells inherit.
+ */
+const KEPT = Symbol.for("bit.piBitTools.endpoint");
+type Kept = { readonly url: string; readonly token: string };
+const holder = globalThis as { [KEPT]?: Kept };
+
 export default async function bitTools(pi: PiExtensionApi): Promise<void> {
   const token = readToken();
-  const url = process.env.BIT_MCP_URL;
+  const named = process.env.BIT_MCP_URL;
   delete process.env.BIT_MCP_URL;
-  if (url === undefined || token === undefined) return;
+  if (named !== undefined && token !== undefined)
+    holder[KEPT] = { url: named, token };
+  const kept = holder[KEPT];
+  // No endpoint: this session was given no bit tools, and runs without them.
+  if (named === undefined && kept === undefined) return;
+  // An endpoint without its bearer is a session bit meant to have tools for: refuse to run
+  // without them, loudly, as an unreachable endpoint already does (slice 2 review, L2).
+  if (kept === undefined)
+    throw new Error(
+      "bit's tools: BIT_MCP_URL is set but no credential arrived on the descriptor named by BIT_MCP_TOKEN_FD",
+    );
+  const { url } = kept;
+  const bearer = kept.token;
 
-  const listed = await rpc(url, token, "tools/list", {});
+  const listed = await rpc(url, bearer, "tools/list", {});
   const tools = (listed.tools ?? []) as readonly McpTool[];
   for (const tool of tools) {
     pi.registerTool({
@@ -169,7 +191,7 @@ export default async function bitTools(pi: PiExtensionApi): Promise<void> {
       execute: async (_toolCallId, params, signal) => {
         const result = (await rpc(
           url,
-          token,
+          bearer,
           "tools/call",
           { name: tool.name, arguments: params ?? {} },
           signal,
