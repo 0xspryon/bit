@@ -463,6 +463,19 @@ export interface ClaudeContextUsage {
  * Bundled rather than three options because they are one dependency — "the Claude Agent
  * SDK" — and a test that replaced one and forgot another would be testing a chimera.
  */
+/**
+ * What a history read is told: the project folder, and the caller's abort signal.
+ *
+ * The signal matters only where a read is work bit owns: an instance with its own config
+ * folder reads in a child process (`claudeHistory.ts`), which is killed when the caller
+ * gives up — a title read's budget, a closed request, an interrupted replay — instead of
+ * running on to its own timeout. The in-process reader cannot be stopped and ignores it.
+ */
+export interface HistoryReadOptions {
+  readonly dir?: string;
+  readonly signal?: AbortSignal;
+}
+
 export interface ClaudeCodeSdk {
   readonly query: (params: {
     readonly prompt: AsyncIterable<SDKUserMessage>;
@@ -470,11 +483,11 @@ export interface ClaudeCodeSdk {
   }) => HarnessQuery;
   readonly sessionMessages: (
     sessionId: string,
-    options: { readonly dir?: string },
+    options: HistoryReadOptions,
   ) => Promise<readonly SessionMessage[]>;
   readonly sessionInfo: (
     sessionId: string,
-    options: { readonly dir?: string },
+    options: HistoryReadOptions,
   ) => Promise<SDKSessionInfo | undefined>;
   /**
    * One sub-agent's own transcript (`<session>/subagents/agent-<agentId>.jsonl`), what a
@@ -483,24 +496,30 @@ export interface ClaudeCodeSdk {
   readonly subagentMessages: (
     sessionId: string,
     agentId: string,
-    options: { readonly dir?: string },
+    options: HistoryReadOptions,
   ) => Promise<readonly SessionMessage[]>;
   /** The ids of the sub-agents whose transcripts are stored for the session. */
   readonly listSubagents: (
     sessionId: string,
-    options: { readonly dir?: string },
+    options: HistoryReadOptions,
   ) => Promise<readonly string[]>;
 }
 
 /** The real SDK. The default, and the only thing the server passes. */
 export const liveClaudeCodeSdk: ClaudeCodeSdk = {
   query: (params) => sdkQuery(params) satisfies Query,
-  sessionMessages: (sessionId, options) =>
-    sdkGetSessionMessages(sessionId, options),
-  sessionInfo: (sessionId, options) => sdkGetSessionInfo(sessionId, options),
-  subagentMessages: (sessionId, agentId, options) =>
-    sdkGetSubagentMessages(sessionId, agentId, options),
-  listSubagents: (sessionId, options) => sdkListSubagents(sessionId, options),
+  sessionMessages: (sessionId, { dir }) =>
+    sdkGetSessionMessages(sessionId, dir === undefined ? {} : { dir }),
+  sessionInfo: (sessionId, { dir }) =>
+    sdkGetSessionInfo(sessionId, dir === undefined ? {} : { dir }),
+  subagentMessages: (sessionId, agentId, { dir }) =>
+    sdkGetSubagentMessages(
+      sessionId,
+      agentId,
+      dir === undefined ? {} : { dir },
+    ),
+  listSubagents: (sessionId, { dir }) =>
+    sdkListSubagents(sessionId, dir === undefined ? {} : { dir }),
 };
 
 /** The main thread's block being streamed. See {@link SessionRecord.streamed}. */
@@ -538,11 +557,25 @@ const sawCall = (calls: CallSeen[], envelope: unknown): void => {
 
 /**
  * The model of the call `apiUsage` is the usage of ({@link SessionRecord.calls}), or `null`
- * when no call this stream saw has its prompt side — or two of different models do.
+ * when it cannot be told.
+ *
+ * By prompt side: the call whose prompt side equals the figure's, or `null` when two of
+ * different models do. On Anthropic's API that is the whole rule: a main-thread call's
+ * figure equals its frames' (measured), so a figure no call matches is one this stream did
+ * not see — a sub-agent's, or a call from before a resume — and nobody says whose it is.
+ *
+ * `byRecency` is for a provider behind an Anthropic-compatible endpoint whose context read
+ * and frames do not agree on the prompt side (z.ai, slice 1's review: 13,475 in the
+ * transcript, 13,517 in the context read, so nothing ever matched). For such an instance,
+ * when nothing matches and no turn is open, the figure is the newest main-thread call's:
+ * at rest `apiUsage` is the last call's. During a turn the newest call may be one
+ * `apiUsage` has not moved to yet ({@link SessionRecord.calls}), so no label is given then.
  */
-const modelOfApiUsage = (
+export const modelOfApiUsage = (
   calls: readonly CallSeen[],
   api: CallUsage,
+  turnOpen: boolean,
+  byRecency: boolean,
 ): string | null => {
   const prompt = promptTokensOf(api);
   const models = new Set(
@@ -551,7 +584,9 @@ const modelOfApiUsage = (
       .map((call) => call.model),
   );
   const [only] = models;
-  return models.size === 1 && only !== undefined ? only : null;
+  if (models.size === 1 && only !== undefined) return only;
+  if (!byRecency || models.size > 1 || turnOpen) return null;
+  return calls.at(-1)?.model ?? null;
 };
 
 /** Everything one session is, before and after it is running. */
@@ -3587,6 +3622,13 @@ export const claudeCodeHarness = (
       /** Frame spellings back to catalogue ids; see `modelSpellings.ts`. */
       const spellings = modelSpellings(options.models ?? catalogue);
       /**
+       * Whether a context figure no call matches is labelled with the newest call
+       * ({@link modelOfApiUsage}): only off Anthropic's API, where the figures are known
+       * not to agree.
+       */
+      const labelsByRecency =
+        (options.provider ?? CLAUDE_CODE_PROVIDER) !== CLAUDE_CODE_PROVIDER;
+      /**
        * What every CLI of this instance is given beyond the server's environment (which
        * `spawnOwnedCli` scrubs of bit's own settings). `undefined` when nothing is, so the
        * SDK's default — this process's environment — is kept exactly as before.
@@ -5013,7 +5055,7 @@ export const claudeCodeHarness = (
          * like, which they did not before.
          */
         const info = yield* Effect.tryPromise({
-          try: () => sdk.sessionInfo(sessionId, {}),
+          try: (signal) => sdk.sessionInfo(sessionId, { signal }),
           catch: (cause) =>
             transport(
               "session.get",
@@ -5065,7 +5107,7 @@ export const claudeCodeHarness = (
         Effect.fn("claudeCodeHarness.sessionContinuation")(
           function* (sessionId) {
             const info = yield* Effect.tryPromise({
-              try: () => sdk.sessionInfo(sessionId, {}),
+              try: (signal) => sdk.sessionInfo(sessionId, { signal }),
               catch: (cause) =>
                 transport(
                   "session.get",
@@ -5141,10 +5183,10 @@ export const claudeCodeHarness = (
       )(function* (sessionId) {
         const directory = sessions.get(sessionId)?.directory;
         const info = yield* Effect.tryPromise({
-          try: () =>
+          try: (signal) =>
             sdk.sessionInfo(
               sessionId,
-              directory === undefined ? {} : { dir: directory },
+              directory === undefined ? { signal } : { dir: directory, signal },
             ),
           catch: (cause) =>
             transport(
@@ -5269,7 +5311,12 @@ export const claudeCodeHarness = (
               record === undefined
                 ? null
                 : (spellings.toCatalogue(
-                    modelOfApiUsage(record.calls, api) ?? undefined,
+                    modelOfApiUsage(
+                      record.calls,
+                      api,
+                      record.turnOpen,
+                      labelsByRecency,
+                    ) ?? undefined,
                     record.model,
                   ) ?? null),
             ...(model === undefined ? {} : { model }),
@@ -5280,10 +5327,10 @@ export const claudeCodeHarness = (
         }
         const directory = record?.directory;
         const stored = yield* Effect.tryPromise({
-          try: () =>
+          try: (signal) =>
             sdk.sessionMessages(
               sessionId,
-              directory === undefined ? {} : { dir: directory },
+              directory === undefined ? { signal } : { dir: directory, signal },
             ),
           catch: (cause) =>
             transport(
@@ -5311,10 +5358,10 @@ export const claudeCodeHarness = (
         const record = sessions.get(sessionId);
         const directory = record?.directory;
         const entries = yield* Effect.tryPromise({
-          try: () =>
+          try: (signal) =>
             sdk.sessionMessages(
               sessionId,
-              directory === undefined ? {} : { dir: directory },
+              directory === undefined ? { signal } : { dir: directory, signal },
             ),
           catch: (cause) =>
             transport(
@@ -5434,8 +5481,9 @@ export const claudeCodeHarness = (
         record: SessionRecord | undefined,
       ) =>
         Effect.tryPromise({
-          try: async () => {
-            const dir = directory === undefined ? {} : { dir: directory };
+          try: async (signal) => {
+            const dir =
+              directory === undefined ? { signal } : { dir: directory, signal };
             const unnamed = [...subagents.values()].filter(
               (call) => call.taskId === undefined,
             );
