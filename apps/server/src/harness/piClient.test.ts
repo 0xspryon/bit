@@ -859,7 +859,7 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
         f.harness.pendingQuestions(ref.id),
       );
       expect(pending.map((each) => each.questionId)).toEqual([
-        question?.questionId,
+        question?.questionId ?? "",
       ]);
       // The turn waits on the operator, and says it is running.
       await Bun.sleep(300);
@@ -924,10 +924,9 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
       const seen = listen(f.harness, ref.id, f.scope);
       await Effect.runPromise(f.harness.prompt(ref.id, askThen("understood")));
       await until(() => details(seen, "question").length > 0, "the question");
-      const questionId = details(seen, "question")[0]?.question.questionId;
-      await Effect.runPromise(
-        f.harness.dismissQuestion(ref.id, questionId ?? ""),
-      );
+      const questionId =
+        details(seen, "question")[0]?.question.questionId ?? "";
+      await Effect.runPromise(f.harness.dismissQuestion(ref.id, questionId));
       await Effect.runPromise(f.harness.waitForIdle(ref.id));
       await until(() => outcomes(seen).length > 0, "the turn's end");
       expect(outcomes(seen)).toEqual(["succeeded"]);
@@ -952,7 +951,8 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
       const seen = listen(f.harness, ref.id, f.scope);
       await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
       await until(() => details(seen, "question").length > 0, "the question");
-      const questionId = details(seen, "question")[0]?.question.questionId;
+      const questionId =
+        details(seen, "question")[0]?.question.questionId ?? "";
       const started = Date.now();
       expect(await Effect.runPromise(f.harness.interruptSession(ref.id))).toBe(
         true,
@@ -983,7 +983,7 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
         await Effect.runPromise(f.harness.pendingQuestions(ref.id)),
       ).toEqual([]);
       const late = await Effect.runPromise(
-        Effect.result(f.harness.dismissQuestion(ref.id, questionId ?? "")),
+        Effect.result(f.harness.dismissQuestion(ref.id, questionId)),
       );
       expect(late._tag).toBe("Failure");
       // The session carries on: the next message is a new turn.
@@ -1011,7 +1011,8 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
       const seen = listen(f.harness, ref.id, f.scope);
       await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
       await until(() => details(seen, "question").length > 0, "the question");
-      const questionId = details(seen, "question")[0]?.question.questionId;
+      const questionId =
+        details(seen, "question")[0]?.question.questionId ?? "";
       process.kill(recordedPid(f.records), "SIGKILL");
       const waited = await Effect.runPromise(
         Effect.result(f.harness.waitForIdle(ref.id)),
@@ -1032,7 +1033,7 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
       ).toEqual([]);
       const late = await Effect.runPromise(
         Effect.result(
-          f.harness.answerQuestion(ref.id, questionId ?? "", { q0: ["Blue"] }),
+          f.harness.answerQuestion(ref.id, questionId, { q0: ["Blue"] }),
         ),
       );
       expect(late._tag).toBe("Failure");
