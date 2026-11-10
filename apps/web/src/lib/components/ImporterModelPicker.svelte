@@ -300,8 +300,9 @@
     onPickModel={(modelId) => app.pickImportModel(modelId)}
     onPickOption={(descriptorId, value) =>
       app.pickImportModelOption(descriptorId, value)}
-    chipLabel="Harness and model: {model}"
+    chipLabel="Harness and model: {harness}, {model}"
     onLeave={closesWithBranch}
+    namesHarness
   >
     {#snippet note()}
       A session is pinned to the harness it starts on. Changing harness starts a
@@ -328,15 +329,19 @@
     onPickModel={(modelId) => (stagedModel = modelId)}
     onPickOption={pickOption}
     switching={switching !== undefined}
-    chipLabel="Model: {model}. Change this session's model"
+    chipLabel="Model: {harness}, {model}. Change this session's model"
     chipTitle="The model this session runs on. Models and reasoning can change at any time, including mid-run; the harness is fixed."
     footer={sessionFooter}
+    namesHarness
   />
 {:else}
   <ModelChip
     kind="held"
     {harness}
     {model}
+    instance={harness === "" ? undefined : harness}
+    modelLabel={sessionInstance?.models.find((entry) => entry.id === model)
+      ?.label}
     title="The model this session ran on. Changing harness starts a new session; it never moves this one."
   />
 {/if}

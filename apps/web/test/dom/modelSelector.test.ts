@@ -79,3 +79,80 @@ describe("the model selector, alone", () => {
     expect(picked.at(-1)).toBe(`instance ${secondInstance?.instanceId ?? ""}`);
   });
 });
+
+describe("two Claude Code instances (harness instances, slice 1)", () => {
+  const instance = (
+    instanceId: string,
+    displayName: string,
+    models: readonly { id: string; label?: string }[],
+  ) => ({
+    instanceId,
+    driver: "claude-code",
+    displayName,
+    version: "2.1.310",
+    ready: true,
+    auth: "unknown" as const,
+    isDefault: instanceId === "claude-code",
+    defaultModel: models[0]?.id ?? "",
+    models,
+  });
+  const stock = instance("claude-code", "Claude Code", [
+    { id: "claude-haiku-4-5" },
+  ]);
+  const zai = instance("cc-zai", "Claude Code · z.ai", [
+    { id: "sonnet", label: "GLM-5.3 Flash" },
+    { id: "opus", label: "GLM-5.3" },
+  ]);
+
+  const mountOn = (active: typeof stock, namesHarness: boolean) =>
+    mounted.push(
+      mountInto(ModelSelector, {
+        instances: [stock, zai],
+        active,
+        model: active.defaultModel,
+        modelView: active.models[0],
+        descriptors: [],
+        selections: [],
+        dropped: [],
+        harness: active.displayName,
+        namesHarness,
+        onPickInstance: () => undefined,
+        onPickModel: () => undefined,
+        onPickOption: () => undefined,
+      }),
+    );
+
+  test("the chip names the instance and the model's configured label, so the two never look the same", () => {
+    mountOn(zai, true);
+    mountOn(stock, true);
+    const chips = [...document.querySelectorAll<HTMLElement>("button.chip")];
+    expect(
+      chips.map((chip) => chip.textContent?.replace(/\s+/g, " ").trim()),
+    ).toEqual([
+      "c Claude Code · z.ai GLM-5.3 Flash",
+      "c Claude Code claude-haiku-4-5",
+    ]);
+  });
+
+  test("a surface that does not ask keeps the glyph and the id", () => {
+    mountOn(zai, false);
+    const chip = document.querySelector<HTMLElement>("button.chip");
+    expect(chip?.textContent?.replace(/\s+/g, " ").trim()).toBe("c sonnet");
+  });
+
+  test("the picker lists the instance's models by label, with the id a run names", async () => {
+    mountOn(zai, true);
+    const chip = document.querySelector<HTMLButtonElement>("button.chip");
+    if (chip === null) throw new Error("no chip");
+    click(chip);
+    await settle();
+    const rows = [
+      ...document.querySelectorAll<HTMLElement>("button.model-row"),
+    ].map((row) => row.textContent?.replace(/\s+/g, " ").trim());
+    expect(rows).toEqual(["GLM-5.3 Flash sonnet default", "GLM-5.3 opus"]);
+    const rail = [...document.querySelectorAll<HTMLElement>(".rail-name")].map(
+      (name) => name.textContent?.trim(),
+    );
+    expect(rail).toEqual(["Claude Code default", "Claude Code · z.ai"]);
+  });
+});

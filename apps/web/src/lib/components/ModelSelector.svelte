@@ -49,6 +49,7 @@
     note,
     footer,
     onLeave,
+    namesHarness = false,
     trigger = $bindable(null),
   }: {
     /** Every configured instance, ready or not. */
@@ -88,9 +89,23 @@
     footer?: Snippet;
     /** The selector left the page (its branch changed): the caller closes what it holds. */
     onLeave?: () => void;
+    /**
+     * Whether the chip names the instance and the model's configured label (harness
+     * instances, slice 1), so two instances of one driver never read the same. The
+     * importer's chip does; other surfaces keep the glyph alone.
+     */
+    namesHarness?: boolean;
     /** The chip, which the dialog hands focus back to when it closes. */
     trigger?: HTMLButtonElement | null;
   } = $props();
+
+  /** The chip's model, and what its instance's configuration calls it. */
+  let chipModelId = $derived(chipModel ?? model);
+  let chipModelLabel = $derived(
+    instances
+      .find((each) => each.displayName === harness)
+      ?.models.find((entry) => entry.id === chipModelId)?.label,
+  );
 
   const leaves = () => () => {
     onLeave?.();
@@ -100,7 +115,9 @@
 <div class="picker" {@attach leaves}>
   <ModelChip
     {harness}
-    model={chipModel ?? model}
+    model={chipModelId}
+    instance={namesHarness ? harness : undefined}
+    modelLabel={namesHarness ? chipModelLabel : undefined}
     expanded={open}
     {switching}
     label={chipLabel}

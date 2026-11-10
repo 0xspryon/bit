@@ -207,7 +207,7 @@ describe("U3: switching a started session's model", () => {
     await settle();
     // Staged, not sent: the chip behind still says the session's model.
     expect(fake.countOf("switchImporterModel")).toBe(0);
-    expect(said(sessionChip())).toBe(`o ${SOL}`);
+    expect(said(sessionChip())).toBe(`o OpenCode ${SOL}`);
 
     // The chip follows the switch's answer, not a later reading of the list.
     const releaseList = fake.hold("importerSessions");
@@ -224,7 +224,7 @@ describe("U3: switching a started session's model", () => {
     ]);
     expect(picker()).toBeNull();
     expect(app.importer.current?.model).toBe(FIVE);
-    expect(said(sessionChip())).toBe(`o ${FIVE}`);
+    expect(said(sessionChip())).toBe(`o OpenCode ${FIVE}`);
     // Between turns: the next message runs on it.
     expect(page()).toContain(`Now on ${FIVE}. Your next message runs on it.`);
     releaseList();
@@ -541,7 +541,7 @@ describe("U3: another harness is a new session", () => {
     const chip = document.querySelector(
       'button[aria-label^="Harness and model"]',
     );
-    expect(said(chip)).toBe("c claude-opus-5");
+    expect(said(chip)).toBe("c Claude Code claude-opus-5");
     // The session it came from is untouched, still listed.
     expect(
       app.importer.sessions.find((each) => each.id === "ses_old")?.model,

@@ -102,7 +102,11 @@
     const wanted = query.trim().toLowerCase();
     return wanted === ""
       ? all
-      : all.filter((entry) => entry.id.toLowerCase().includes(wanted));
+      : all.filter(
+          (entry) =>
+            entry.id.toLowerCase().includes(wanted) ||
+            (entry.label?.toLowerCase().includes(wanted) ?? false),
+        );
   });
 
   /** The one model row in the tab order, among those the filter shows. */
@@ -296,7 +300,13 @@
               onfocus={() => (focusedModel = entry.id)}
               onclick={() => onPickModel(entry.id)}
             >
-              <span class="model-name mono">{entry.id}</span>
+              {#if entry.label !== undefined}
+                <!-- The instance's own name for it, with the id a run names beside it. -->
+                <span class="model-name">{entry.label}</span>
+                <span class="model-id mono">{entry.id}</span>
+              {:else}
+                <span class="model-name mono">{entry.id}</span>
+              {/if}
               {#if entry.id === active?.defaultModel}
                 <span class="model-tag">default</span>
               {/if}
@@ -544,6 +554,12 @@
     font-size: 12px;
     white-space: nowrap;
     text-overflow: ellipsis;
+  }
+  /* The id beside a configured label: what a run names, quieter than the name. */
+  .model-id {
+    flex: none;
+    color: var(--text-muted);
+    font-size: 11px;
   }
   .no-results p,
   .models-note {

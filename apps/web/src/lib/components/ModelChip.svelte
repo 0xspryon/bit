@@ -13,6 +13,8 @@
   let {
     harness,
     model,
+    instance,
+    modelLabel,
     kind = "button",
     expanded = false,
     switching = false,
@@ -25,6 +27,14 @@
     harness: string;
     /** The model id, as `provider/model`; `""` reads "No model". */
     model: string;
+    /**
+     * The instance's name, said before the model (harness instances, slice 1): where two
+     * instances share a driver — two Claude Code configurations — the glyph alone would make
+     * them look the same. Absent: the glyph alone, as before.
+     */
+    instance?: string | undefined;
+    /** What the instance's configuration calls {@link model}. Absent: the id. */
+    modelLabel?: string | undefined;
     kind?: "button" | "held";
     /** Whether the picker this chip opens is open. */
     expanded?: boolean;
@@ -53,13 +63,21 @@
     {onclick}
   >
     <span class="glyph" aria-hidden="true">{letter}</span>
-    <span class="model">{model === "" ? "No model" : model}</span>
+    {#if instance !== undefined}
+      <span class="instance">{instance}</span>
+    {/if}
+    <span class="model"
+      >{model === "" ? "No model" : (modelLabel ?? model)}</span
+    >
     <IconAngleDown class="caret" width="11" height="11" />
   </button>
 {:else}
   <span class={["chip", "held"]} {title}>
     <span class="glyph" aria-hidden="true">{letter}</span>
-    <span class="model">{model}</span>
+    {#if instance !== undefined}
+      <span class="instance">{instance}</span>
+    {/if}
+    <span class="model">{modelLabel ?? model}</span>
   </span>
 {/if}
 
@@ -115,6 +133,16 @@
     background: var(--bg-layer-03);
     color: var(--text-base);
     font: 500 9px/15px var(--font-mono);
+  }
+  /* The instance's name, in the sans face, before the model; at most half the chip. */
+  .instance {
+    flex: none;
+    max-width: 50%;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-family: var(--font-sans);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .model {
     min-width: 0;

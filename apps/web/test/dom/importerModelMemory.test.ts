@@ -93,8 +93,11 @@ const chip = (): HTMLButtonElement => {
   return found;
 };
 
+/** The chip's model: its label names the instance, then the model (harness instances). */
 const chipModel = (): string =>
-  chip().getAttribute("aria-label")?.replace("Harness and model: ", "") ?? "";
+  chip()
+    .getAttribute("aria-label")
+    ?.replace(/^Harness and model: [^,]*, /, "") ?? "";
 
 const autoLoad = async (app: App): Promise<void> => {
   app.openImporter();

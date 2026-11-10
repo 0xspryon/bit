@@ -659,7 +659,7 @@ describe("D6: the model chip is the picker the operator already has", () => {
     const chip = document.querySelector('button[aria-label^="Model: "]');
     expect(chip?.textContent).toContain("openai/gpt-5.6-sol");
     expect(chip?.getAttribute("aria-label")).toBe(
-      "Model: openai/gpt-5.6-sol. Change this session's model",
+      "Model: OpenCode, openai/gpt-5.6-sol. Change this session's model",
     );
     // D3's caption beside it.
     expect(text()).toContain("OpenCode for this session · any of its models");
