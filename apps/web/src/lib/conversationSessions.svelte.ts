@@ -1700,10 +1700,16 @@ export class ConversationSessions<
     session: S,
     text: string,
     urgency: SteerUrgency,
-    /** `files: false` sends none of the composer's files (the question dock's message). */
-    options: { readonly files: boolean } = { files: true },
-  ): Promise<void> {
-    if (this.sending) return;
+    /**
+     * `files: false` sends none of the composer's files. `dock`: the question dock's
+     * message, whose words are the dock's and not the box's, so a refusal of it on the
+     * session on screen is the caller's to say and nothing goes into the box.
+     */
+    options: { readonly files: boolean; readonly dock?: boolean } = {
+      files: true,
+    },
+  ): Promise<PostOutcome | undefined> {
+    if (this.sending) return undefined;
     this.sending = true;
     this.notice = "";
     this.refused = false;
@@ -1757,7 +1763,7 @@ export class ConversationSessions<
     this.sending = false;
     this.waitingForSwitch = false;
     // The page was left or reset meanwhile: nothing here is the answer's to change.
-    if (this.#server !== server) return;
+    if (this.#server !== server) return undefined;
     if (
       answer._tag === "refused" &&
       answer.files === true &&
@@ -1765,7 +1771,20 @@ export class ConversationSessions<
     ) {
       // About the files: said in the dialog, and the words and files stay as they were.
       this.files.refuse({ title: "Message not sent", sentence: answer.detail });
-      return;
+      return { _tag: "refused", detail: answer.detail };
+    }
+    if (
+      answer._tag !== "accepted" &&
+      options.dock === true &&
+      this.currentId === session.id
+    ) {
+      // The dock's words are still in the dock, which says so (`sendAnswersAsMessage`).
+      if (answer._tag === "refused" && answer.ended === true) {
+        void server.reread();
+      }
+      return answer._tag === "refused"
+        ? { _tag: "refused", detail: answer.detail }
+        : { _tag: "unanswered", detail: unansweredDetail(false) };
     }
     if (answer._tag !== "accepted") {
       const outcome = answer._tag === "refused" ? "refused" : "unknown";
@@ -1810,7 +1829,7 @@ export class ConversationSessions<
       if (answer._tag === "unanswered") {
         void this.#confirm(server, session, text, heldOn, known, baseline);
       }
-      return;
+      return { _tag: answer._tag, detail };
     }
     const turn = answer.turn;
     /*
@@ -1931,6 +1950,7 @@ export class ConversationSessions<
     });
     this.#watch(turn.conversationId);
     void server.reread();
+    return { _tag: "accepted" };
   }
 
   /** Says why the message on screen did not land; its words are still in the box. */
@@ -2910,20 +2930,38 @@ export class ConversationSessions<
    * Sends the answers as an ordinary message (A7-Q's `message` fallback): the question is
    * no longer waiting natively, but the session can be carried on. Posted like a message
    * from the box, without the box's draft or files, which stay where they are.
+   *
+   * **The dock stays until the message is accepted** (slice 3 fix, L2): it waits, busy,
+   * while the message is out, and is put away only once the server took it. A refusal — a
+   * session whose harness died a moment ago, say — keeps the dock and the operator's
+   * answers in it, and says why in its dialog, as a refused answer does. Putting it away
+   * first lost the answers with the dock.
    */
-  sendAnswersAsMessage(text: string): void {
+  async sendAnswersAsMessage(text: string): Promise<void> {
     const session = this.current;
     const server = this.#server;
     if (session === undefined || server === undefined) return;
     const question = this.question;
-    // Put away first, so the dock gives the box back as the message goes.
-    if (question !== undefined) {
-      this.#replace(session.id, (before) => ({
-        ...before,
-        history: { ...before.history, question: null },
-      }));
+    this.questionRefusal = undefined;
+    const outcome = await this.#post(server, session, text, "queued", {
+      files: false,
+      dock: true,
+    });
+    if (this.#server !== server || question === undefined) return;
+    if (outcome?._tag === "accepted") {
+      // Wherever the thread went: the same session, or a fresh one opened in its place.
+      this.sessions = this.sessions.map((each) =>
+        each.history.question?.questionId === question.questionId
+          ? { ...each, history: { ...each.history, question: null } }
+          : each,
+      );
+      return;
     }
-    void this.#post(server, session, text, "queued", { files: false });
+    if (outcome === undefined || this.currentId !== session.id) return;
+    this.questionRefusal = {
+      title: "Answers not sent",
+      sentence: sentenceCase(outcome.detail),
+    };
   }
 
   dismissQuestionRefusal(): void {
@@ -2936,6 +2974,11 @@ export class ConversationSessions<
  * the server words a switch's refusal as a clause ("another model switch of import … has not
  * answered yet"). The words are otherwise the server's, as they stand.
  */
+/** How one post ended, as far as its caller needs it: the dock's message reads it. */
+type PostOutcome =
+  | { readonly _tag: "accepted" }
+  | { readonly _tag: "refused" | "unanswered"; readonly detail: string };
+
 /** Where the words of a message that did not land were put ({@link ImporterSessions}). */
 interface WordsHeld {
   /** In the composer of {@link sessionId}, or parked on it. */

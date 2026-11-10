@@ -175,6 +175,13 @@ export const CARRIED_NOTE =
  * after a reload, in place of "not answered yet" — which a turn that is over never is — or
  * the marker's bare `[Request interrupted by user]`.
  */
+/**
+ * What a message the harness never took says under it (slice 3 fix): its process ended
+ * with the message still queued in it, so it was not delivered and will not be.
+ */
+export const undeliveredNote = (agent: string): string =>
+  `Not delivered: the ${agent}'s process ended before it read this message. Send it again if it still matters.`;
+
 export const stoppedNote = (agent: string): string =>
   `Stopped before the ${agent} wrote anything in reply.`;
 
@@ -225,6 +232,12 @@ export interface ConversationHistory {
    * live `question` frames. `null` for none; absent where the server has not said.
    */
   readonly question?: PendingQuestion | null;
+  /**
+   * The messages the server says were never delivered (`ConversationQueuedMessage.lost`,
+   * slice 3 fix): the harness's process ended before it took them. By message id. Absent
+   * where none was.
+   */
+  readonly lost?: readonly string[];
 }
 
 /** What the next message will do: the server's answer, with a refusal only on `refused`. */
@@ -258,6 +271,13 @@ export const historyOf = (
   truncated: view.truncated,
   items: view.items,
   question: view.question,
+  ...(view.queued.some((message) => message.lost === true)
+    ? {
+        lost: view.queued
+          .filter((message) => message.lost === true)
+          .map((message) => message.messageId),
+      }
+    : {}),
   standing:
     view.continuation === "refused"
       ? { continuation: "refused", refusal: view.refusal }
@@ -652,10 +672,14 @@ export const withReplay = <S extends ConversationSession>(
   }
   for (const row of rows) floors[row.id] = floor;
   // Only a message still waiting is queued: one the harness took is an ordinary turn.
+  // A lost message waits on nothing: the process it was queued in is gone.
   const midTurn = [
     ...rows
       .filter((row) =>
-        messagesOf(row).every((id) => waiting.get(id)?.taken === false),
+        messagesOf(row).every(
+          (id) =>
+            waiting.get(id)?.taken === false && waiting.get(id)?.lost !== true,
+        ),
       )
       .map((row) => row.id),
     ...(session.midTurn ?? []).filter((id) => keptIds.has(id)),
@@ -1286,10 +1310,16 @@ export const buildConversationChat = (
   );
   const midTurn = new Set(input.midTurn ?? []);
   const urgent = new Set(input.sentNow ?? []);
+  const lostIds = new Set(history.lost ?? []);
+  /** Never delivered (slice 3 fix): the harness's process ended before it took it. */
+  const lost = (operator: LiveItem): boolean =>
+    messagesOf(operator).length > 0 &&
+    messagesOf(operator).every((id) => lostIds.has(id));
   const sentNow = (operator: LiveItem): boolean =>
-    messagesOf(operator).some((id) => urgent.has(id));
+    !lost(operator) && messagesOf(operator).some((id) => urgent.has(id));
   /** Whether a turn's message still waits behind the turn running before it. */
   const waiting = (operator: LiveItem): boolean =>
+    !lost(operator) &&
     input.working &&
     midTurn.has(operator.id) &&
     messagesOf(operator).length > 0 &&
@@ -1343,6 +1373,7 @@ export const buildConversationChat = (
         working: false,
         queued: false,
         sentNow: false,
+        undelivered: false,
         startedAt: null,
         midBlock: false,
       },
@@ -1410,49 +1441,52 @@ export const buildConversationChat = (
         working,
         queued,
         sentNow: sentNow(turn.operator),
+        undelivered: lost(turn.operator),
         startedAt: take?.at ?? turn.operator.at,
         midBlock,
       },
-      prose: queued
-        ? {
-            _tag: "pending",
-            note: sentNow(turn.operator)
-              ? sendingNowNote(input.sendNow ?? "unknown", input.agent)
-              : queuedNote(input.agent),
-          }
-        : carried && !spoke
-          ? { _tag: "none", note: CARRIED_NOTE }
-          : stopped
-            ? { _tag: "none", note: stoppedNote(input.agent) }
-            : midBlock
-              ? { _tag: "pending", note: MID_BLOCK_NOTE }
-              : replayed
-                ? spoke
-                  ? {
-                      _tag: "replayed",
-                      note: replayNote(),
-                      ephemeral: true,
-                      // Said once, on the first turn: the answer stopped short of the oldest items.
-                      truncated:
-                        history.truncated &&
-                        position === 0 &&
-                        cut.leading.length === 0,
-                    }
-                  : {
-                      _tag: "none",
-                      note: "The harness holds this message and no reply to it.",
-                    }
-                : spoke
-                  ? { _tag: "live" }
-                  : latest
+      prose: lost(turn.operator)
+        ? { _tag: "none", note: undeliveredNote(input.agent) }
+        : queued
+          ? {
+              _tag: "pending",
+              note: sentNow(turn.operator)
+                ? sendingNowNote(input.sendNow ?? "unknown", input.agent)
+                : queuedNote(input.agent),
+            }
+          : carried && !spoke
+            ? { _tag: "none", note: CARRIED_NOTE }
+            : stopped
+              ? { _tag: "none", note: stoppedNote(input.agent) }
+              : midBlock
+                ? { _tag: "pending", note: MID_BLOCK_NOTE }
+                : replayed
+                  ? spoke
                     ? {
-                        _tag: "pending",
-                        note: `Sent. The ${input.agent} has not answered yet.`,
+                        _tag: "replayed",
+                        note: replayNote(),
+                        ephemeral: true,
+                        // Said once, on the first turn: the answer stopped short of the oldest items.
+                        truncated:
+                          history.truncated &&
+                          position === 0 &&
+                          cut.leading.length === 0,
                       }
                     : {
                         _tag: "none",
-                        note: `The ${input.agent} wrote nothing in reply to this message.`,
-                      },
+                        note: "The harness holds this message and no reply to it.",
+                      }
+                  : spoke
+                    ? { _tag: "live" }
+                    : latest
+                      ? {
+                          _tag: "pending",
+                          note: `Sent. The ${input.agent} has not answered yet.`,
+                        }
+                      : {
+                          _tag: "none",
+                          note: `The ${input.agent} wrote nothing in reply to this message.`,
+                        },
       rows: rowsFor(items, working, placed.pairing),
     });
   });

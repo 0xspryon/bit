@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  ImporterConversationRefused,
   QuestionRefused,
   type ImporterSessionView,
   type LiveQuestion,
@@ -264,6 +265,53 @@ describe("the importer's question dock (A7-Q)", () => {
     expect(fake.countOf("answerImporterQuestion")).toBe(0);
     expect(app.importer.draft).toBe("my own half-written words");
     expect(dock()).toBeNull();
+  });
+
+  test("slice 3 fix: a refused message keeps the dock and its answers, says why, and the next try puts it away", async () => {
+    const fake = new FakeServer();
+    const app = await continueWith(
+      fake,
+      QUESTION({ questionId: "call:toolu_1", answerability: "message" }),
+    );
+    // The importer's harness died a moment ago: the server would not take it.
+    fake.onSendImporterMessage = () =>
+      refused(
+        new ImporterConversationRefused({
+          reason: "harness_unreachable",
+          detail:
+            "the harness would not take the message, so this import's session has been closed",
+        }),
+      );
+    // Said as the harness's process ending, not only a Stop or a restart.
+    expect(document.querySelector(".importer .dock .note")?.textContent).toBe(
+      "The importer is no longer waiting on these questions: a Stop, a server restart or its process ending withdrew them. Your answers go to it as an ordinary message.",
+    );
+    click(radios()[1]!);
+    await settle();
+    click(button("Send 1 answer as a message"));
+    await settle();
+    expect(fake.countOf("sendImporterMessage")).toBe(1);
+    // The dock and the answer in it stay; the dialog says why.
+    expect(dock()).not.toBeNull();
+    expect(radios()[1]?.checked).toBe(true);
+    const dialog = document.querySelector("[role=alertdialog]");
+    expect(dialog?.textContent).toContain("Answers not sent");
+    expect(dialog?.textContent).toContain(
+      "The harness would not take the message",
+    );
+    // Nothing went into the box, which the dock still holds.
+    expect(app.importer.draft).toBe("");
+    expect(app.importer.question?.questionId).toBe("call:toolu_1");
+
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(importerTurnAccepted({ targetId, importId, conversation: "resumed" }));
+    click(button("Close"));
+    await settle();
+    click(button("Send 1 answer as a message"));
+    await settle();
+    expect(fake.countOf("sendImporterMessage")).toBe(2);
+    expect(dock()).toBeNull();
+    expect(document.querySelector("[role=alertdialog]")).toBeNull();
   });
 
   test("a dismissal reaches the server; a refusal is the error dialog and reads the replay again", async () => {

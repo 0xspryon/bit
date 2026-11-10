@@ -71,6 +71,12 @@ export interface ThreadTurn {
    */
   readonly sentNow: boolean;
   /**
+   * True when the server says this message was never delivered (slice 3 fix): the
+   * harness's process ended while it was still queued. Marked so under the bubble, never
+   * as sent, queued or sent now. Absent is false.
+   */
+  readonly undelivered?: boolean;
+  /**
    * When the agent started on this message, on the server's clock, or `null` on the
    * leading group: when the harness took it, for a message that waited; otherwise when it
    * was accepted (live) or stored (replayed). The start of the turn footer's duration.

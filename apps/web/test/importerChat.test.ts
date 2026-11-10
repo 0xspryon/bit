@@ -2128,6 +2128,74 @@ describe("a replay's queued messages, and a replay read again", () => {
       ...over,
     });
 
+  test("slice 3 fix: a message the harness's process never took is drawn not delivered, never sent now or queued", () => {
+    // Sent with Send now; Pi died before it read it.
+    const installed = withReplay(
+      session({ working: false, sentNow: [MESSAGE] }),
+      {
+        view: view({
+          queued: [
+            {
+              messageId: MESSAGE,
+              text: "read this next",
+              acceptedAt: AT + 5_000,
+              taken: false,
+              lost: true,
+            },
+          ],
+        }),
+        floor: 7,
+      },
+    );
+    expect(installed.history.lost).toEqual([MESSAGE]);
+    // It waits on nothing: the process it was queued in is gone.
+    expect(installed.midTurn).toEqual([]);
+    for (const working of [false, true]) {
+      const groups = buildImporterChat({
+        history: installed.history,
+        working,
+        midTurn: [`operator:queued:${MESSAGE}`],
+        sentNow: [MESSAGE],
+        items: importerFeed({
+          own: installed.items,
+          floors: installed.floors,
+          live: [],
+          importId: "imp_1",
+          historyFloor: installed.historyFloor,
+          midTurn: installed.midTurn,
+          working,
+        }),
+      });
+      const lost = groups.find(
+        (group) => group.subject.message === "read this next",
+      );
+      expect([
+        lost?.subject.undelivered,
+        lost?.subject.sentNow,
+        lost?.subject.queued,
+      ]).toEqual([true, false, false]);
+      expect(lost?.prose).toEqual({
+        _tag: "none",
+        note: "Not delivered: the importer's process ended before it read this message. Send it again if it still matters.",
+      });
+    }
+    // A message not lost keeps its marks.
+    const kept = withReplay(session(), {
+      view: view({
+        queued: [
+          {
+            messageId: MESSAGE,
+            text: "and the portal",
+            acceptedAt: AT + 5_000,
+            taken: false,
+          },
+        ],
+      }),
+      floor: 7,
+    });
+    expect(kept.history.lost).toBeUndefined();
+  });
+
   test("a queued message is a row of its own at the end, waiting, until its take", () => {
     const installed = withReplay(session(), {
       view: view({

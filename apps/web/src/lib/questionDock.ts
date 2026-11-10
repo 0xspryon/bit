@@ -193,5 +193,5 @@ export const answerabilityNote = (
   pending.answerability === "live"
     ? ""
     : pending.answerability === "message" && canMessage
-      ? `${asker} is no longer waiting on these questions: a Stop or a restart withdrew them. Your answers go to it as an ordinary message.`
+      ? `${asker} is no longer waiting on these questions: a Stop, a server restart or its process ending withdrew them. Your answers go to it as an ordinary message.`
       : `${asker} is no longer waiting on these questions, and this session cannot be carried on, so they cannot be answered. Dismiss them to get the box back.`;

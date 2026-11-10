@@ -294,7 +294,7 @@ export const chatSessionOf = <S extends ConversationSession>(
       if (pending === undefined) return undefined;
       const sendAsMessage = blocked()
         ? undefined
-        : (text: string) => input.state.sendAnswersAsMessage(text);
+        : (text: string) => void input.state.sendAnswersAsMessage(text);
       const dismisses = input.state.abilities.dismissQuestion;
       return {
         pending,

@@ -373,7 +373,13 @@
         still waiting behind the running turn says so here, until the harness takes it.
       -->
       <div class="said">
-        {#if group.subject.queued}
+        {#if group.subject.undelivered === true}
+          <!--
+            Never delivered (slice 3 fix): the harness's process ended while this was still
+            queued in it. Never marked sent; the turn's note says what happened.
+          -->
+          <span class="queued-mark undelivered">not delivered</span>
+        {:else if group.subject.queued}
           <span class="queued-mark"
             >{group.subject.sentNow ? "sending now" : "queued"}</span
           >
@@ -744,6 +750,11 @@
     font: 500 10px/16px var(--font-sans);
     letter-spacing: 0.04em;
     text-transform: uppercase;
+  }
+  .queued-mark.undelivered {
+    border-style: solid;
+    border-color: var(--state-border-warning);
+    color: var(--state-fg-warning);
   }
   .bubble {
     max-width: 560px;
