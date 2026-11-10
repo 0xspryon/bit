@@ -91,6 +91,8 @@ interface PiExtensionApi {
     description: string;
     promptSnippet?: string;
     promptGuidelines?: string[];
+    /** `sequential` runs every call of the batch one at a time (`docs/extensions.md`). */
+    executionMode?: "sequential";
     parameters: Record<string, unknown>;
     execute: (
       toolCallId: string,
@@ -294,6 +296,10 @@ const registerQuestionTool = (pi: PiExtensionApi, key: string): void => {
   pi.registerTool({
     name: QUESTION_TOOL,
     label: "Ask the operator",
+    // Two questions in one assistant message would otherwise run at once, and bit's dock
+    // shows one question at a time: the second was held unseen until a reload (slice 3
+    // review, M1). Sequential makes Pi run the whole batch one call at a time.
+    executionMode: "sequential",
     description:
       "Ask the operator — the person running this session in bit — one to four questions, and wait for their answers. Use it when you need a decision or information only they have and cannot go on well without it; do not ask what you can find out yourself. Give options when there are clear choices; they can always answer in their own words, or decline and reply in the chat instead.",
     promptSnippet: "Ask the operator questions and wait for their answers",
