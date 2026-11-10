@@ -33,6 +33,7 @@ export const BIT_ENVIRONMENT: readonly string[] = [
   "WORKSPACE_ROOT",
   "PORT",
   "HARNESS",
+  "HARNESS_INSTANCES",
   "TARGET_ID",
   "RECONCILE_ON_START",
   "CONTINUATION",

@@ -146,6 +146,7 @@ import {
   defaultInstanceIdForDriver,
   OPENCODE_DRIVER,
   type HarnessInstance,
+  type InstanceId,
   type ModelProvenance,
 } from "./identity";
 import {
@@ -2173,6 +2174,10 @@ export const newOpenCodeSessionId = (): string => SessionID.create();
 /** What a caller may vary about this harness. */
 export interface OpenCodeHarnessOptions {
   readonly timeouts?: ClientTimeouts;
+  /** The instance's id (`harness/instanceConfig.ts`). Defaults to `opencode`. */
+  readonly instanceId?: InstanceId;
+  /** For the picker and the model chip. Defaults to "OpenCode". */
+  readonly displayName?: string;
   /** The model a run gets when it names none. OpenCode's `provider/model` form. */
   readonly defaultModel?: string;
 }
@@ -2336,9 +2341,10 @@ export const openCodeHarness = (
       ];
 
       const instance: HarnessInstance = {
-        instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
+        instanceId:
+          options.instanceId ?? defaultInstanceIdForDriver(OPENCODE_DRIVER),
         driver: OPENCODE_DRIVER,
-        displayName: "OpenCode",
+        displayName: options.displayName ?? "OpenCode",
         // Read off `/api/info` during readiness, so it is the build that answered rather
         // than the one on the PATH when somebody last looked.
         version: server.version,

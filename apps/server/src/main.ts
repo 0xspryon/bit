@@ -116,17 +116,22 @@ import {
 } from "./http/browserSessions";
 import { ControlPlaneEndpoint } from "./http/controlPlane";
 import { resolveRoot } from "./http/folders";
-import { AgentHarness } from "./harness/agentHarness";
 import {
   CLAUDE_CODE_DEFAULT_MODEL,
   claudeCodeHarness,
 } from "./harness/claudeCodeClient";
-import type { HarnessProcessError } from "./harness/errors";
 import {
   CLAUDE_CODE_DRIVER,
   OPENCODE_DRIVER,
   defaultInstanceIdForDriver,
+  type InstanceId,
 } from "./harness/identity";
+import {
+  HARNESS_INSTANCES_SETTING,
+  readInstanceConfig,
+  type ClaudeCodeInstanceConfig,
+  type InstanceConfig,
+} from "./harness/instanceConfig";
 import {
   OPENCODE_DEFAULT_MODEL,
   openCodeHarness,
@@ -550,6 +555,25 @@ const workerEndpoints = WorkerEndpoints.pending();
 const SELECTED_HARNESS = harnessSelection(process.env["HARNESS"]);
 
 /**
+ * The instances an operator configured in a file, from `HARNESS_INSTANCES`, or `undefined`
+ * when the variable is unset and `HARNESS` decides as it always has.
+ *
+ * Read once, here, beside `HARNESS`. A file that is not usable stops the server with one
+ * sentence naming the field (`harness/instanceConfig.ts`): an instance silently dropped or
+ * run on the operator's default login because of a typo would write provenance nobody
+ * could trust, which is the reason `HARNESS`'s typos are reported too.
+ */
+const INSTANCE_CONFIG = ((): readonly InstanceConfig[] | undefined => {
+  const result = readInstanceConfig(process.env["HARNESS_INSTANCES"]);
+  if (result === undefined) return undefined;
+  if (result._tag === "invalid") {
+    console.error(result.sentence);
+    process.exit(1);
+  }
+  return result.instances;
+})();
+
+/**
  * The OpenCode harness: an `opencode serve` this process owns, and a client over it.
  *
  * Spawned with `WORKSPACE_ROOT` as its working directory rather than the fleet root,
@@ -560,30 +584,119 @@ const SELECTED_HARNESS = harnessSelection(process.env["HARNESS"]);
  *
  * The server runs as the user and so reads the user's own stored provider credentials; we
  * never read, copy or pass those (DECISIONS.md §12).
+ *
+ * At most one per process (`instanceConfig.ts` refuses a second): it is one child process.
  */
-const openCode: Layer.Layer<AgentHarness, HarnessProcessError> = Layer.suspend(
-  () =>
-    openCodeHarness().pipe(
-      Layer.provide(
-        OpenCodeServer.layer({
-          cwd: WORKSPACE_ROOT,
-          recordDirectory: OWNED_PROCESSES,
-        }),
+const openCodeCandidate = (
+  config: {
+    readonly instanceId: InstanceId;
+    readonly displayName: string;
+    readonly defaultModel: string | undefined;
+  } = {
+    instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
+    displayName: "OpenCode",
+    defaultModel: undefined,
+  },
+): HarnessCandidate => {
+  const defaultModel = config.defaultModel ?? OPENCODE_DEFAULT_MODEL;
+  return {
+    driver: OPENCODE_DRIVER,
+    displayName: config.displayName,
+    layer: Layer.suspend(() =>
+      openCodeHarness({
+        instanceId: config.instanceId,
+        displayName: config.displayName,
+        defaultModel,
+      }).pipe(
+        Layer.provide(
+          OpenCodeServer.layer({
+            cwd: WORKSPACE_ROOT,
+            recordDirectory: OWNED_PROCESSES,
+          }),
+        ),
       ),
     ),
-);
+    setup:
+      "Install `opencode` and make sure it is on this server's PATH, then log into a provider with `opencode auth login`.",
+    placeholder: {
+      instanceId: config.instanceId,
+      driver: OPENCODE_DRIVER,
+      displayName: config.displayName,
+      version: "unknown",
+      // The one place `installed: false` is ever reported: the harness did not come up, so
+      // this process is not holding one. Everything that *does* come up reports `true`.
+      installed: false,
+      auth: "unknown",
+      defaultModel,
+      // One entry and no option descriptors: a harness that never came up reported no
+      // catalogue, so there is nothing it can be asked about either.
+      models: [{ id: defaultModel }],
+    },
+  };
+};
 
 /**
- * The Claude Code harness, over the Claude Agent SDK.
+ * One Claude Code instance, over the Claude Agent SDK.
  *
  * **No process of ours, and no `cwd` here.** The SDK spawns and owns the CLI per session,
  * and the directory is a per-session argument, so this layer has nothing of
  * `OpenCodeServer`'s shape to set up — which is exactly the asymmetry
- * `harness/agentHarness.ts` refuses to put on the interface. It reads the user's own
- * Claude Code login, the same way `opencode serve` reads theirs.
+ * `harness/agentHarness.ts` refuses to put on the interface. The stock instance reads the
+ * user's own Claude Code login, the same way `opencode serve` reads theirs; a configured
+ * one reads the login or provider settings in its own config folder, which bit passes as a
+ * path and never opens.
+ *
+ * Any number per process: each is its own layer, so the resolver builds each once.
  */
-const claudeCode: Layer.Layer<AgentHarness, HarnessProcessError> =
-  Layer.suspend(() => claudeCodeHarness());
+const claudeCodeCandidate = (
+  config: Omit<ClaudeCodeInstanceConfig, "driver" | "id"> & {
+    readonly instanceId: InstanceId;
+  } = {
+    instanceId: defaultInstanceIdForDriver(CLAUDE_CODE_DRIVER),
+    displayName: "Claude Code",
+    configDir: undefined,
+    provider: undefined,
+    models: undefined,
+    defaultModel: undefined,
+    maxRetries: undefined,
+  },
+): HarnessCandidate => {
+  const defaultModel =
+    config.defaultModel ?? config.models?.[0]?.id ?? CLAUDE_CODE_DEFAULT_MODEL;
+  return {
+    driver: CLAUDE_CODE_DRIVER,
+    displayName: config.displayName,
+    layer: Layer.suspend(() =>
+      claudeCodeHarness({
+        instanceId: config.instanceId,
+        displayName: config.displayName,
+        defaultModel,
+        ...(config.configDir === undefined
+          ? {}
+          : { configDir: config.configDir }),
+        ...(config.provider === undefined ? {} : { provider: config.provider }),
+        ...(config.models === undefined ? {} : { models: config.models }),
+        ...(config.maxRetries === undefined
+          ? {}
+          : { maxRetries: config.maxRetries }),
+      }),
+    ),
+    setup:
+      config.configDir === undefined
+        ? "Install or upgrade `@anthropic-ai/claude-agent-sdk` in this server, and log in with `claude` once so it has a session to read."
+        : `Install or upgrade \`@anthropic-ai/claude-agent-sdk\` in this server, and make sure ${config.configDir} holds this instance's login or provider settings (run \`CLAUDE_CONFIG_DIR=${config.configDir} claude\` once).`,
+    placeholder: {
+      instanceId: config.instanceId,
+      driver: CLAUDE_CODE_DRIVER,
+      displayName: config.displayName,
+      version: "unknown",
+      installed: false,
+      auth: "unknown",
+      defaultModel,
+      models: [{ id: defaultModel }],
+    },
+  };
+};
 
 /**
  * Everything this build can be asked to drive, as resolver candidates.
@@ -597,54 +710,28 @@ const claudeCode: Layer.Layer<AgentHarness, HarnessProcessError> =
  * be visible with a reason rather than silently missing. `setup` is what to do about it,
  * and it lives here because only this module knows which binary or which package a
  * candidate came from.
+ *
+ * Without `HARNESS_INSTANCES`, these are the stock instances, one per driver, as `HARNESS`
+ * selects them. With it, the file's entries in its order.
  */
 const CANDIDATES: readonly HarnessCandidate[] = [
-  {
-    driver: OPENCODE_DRIVER,
-    displayName: "OpenCode",
-    layer: openCode,
-    setup:
-      "Install `opencode` and make sure it is on this server's PATH, then log into a provider with `opencode auth login`.",
-    placeholder: {
-      instanceId: defaultInstanceIdForDriver(OPENCODE_DRIVER),
-      driver: OPENCODE_DRIVER,
-      displayName: "OpenCode",
-      version: "unknown",
-      // The one place `installed: false` is ever reported: the harness did not come up, so
-      // this process is not holding one. Everything that *does* come up reports `true`.
-      installed: false,
-      auth: "unknown",
-      defaultModel: OPENCODE_DEFAULT_MODEL,
-      // One entry and no option descriptors: a harness that never came up reported no
-      // catalogue, so there is nothing it can be asked about either.
-      models: [{ id: OPENCODE_DEFAULT_MODEL }],
-    },
-  },
-  {
-    driver: CLAUDE_CODE_DRIVER,
-    displayName: "Claude Code",
-    layer: claudeCode,
-    setup:
-      "Install or upgrade `@anthropic-ai/claude-agent-sdk` in this server, and log in with `claude` once so it has a session to read.",
-    placeholder: {
-      instanceId: defaultInstanceIdForDriver(CLAUDE_CODE_DRIVER),
-      driver: CLAUDE_CODE_DRIVER,
-      displayName: "Claude Code",
-      version: "unknown",
-      installed: false,
-      auth: "unknown",
-      defaultModel: CLAUDE_CODE_DEFAULT_MODEL,
-      models: [{ id: CLAUDE_CODE_DEFAULT_MODEL }],
-    },
-  },
+  openCodeCandidate(),
+  claudeCodeCandidate(),
 ];
 
-/** The candidates `HARNESS` asked for, in the order it asked for them. */
+const candidateOf = (config: InstanceConfig): HarnessCandidate =>
+  config.driver === "claude-code"
+    ? claudeCodeCandidate({ ...config, instanceId: config.id })
+    : openCodeCandidate({ ...config, instanceId: config.id });
+
+/** The candidates the file, or else `HARNESS`, asked for, in the order it asked for them. */
 const configured: readonly HarnessCandidate[] =
-  SELECTED_HARNESS.drivers.flatMap((driver) => {
-    const candidate = CANDIDATES.find((entry) => entry.driver === driver);
-    return candidate === undefined ? [] : [candidate];
-  });
+  INSTANCE_CONFIG !== undefined
+    ? INSTANCE_CONFIG.map(candidateOf)
+    : SELECTED_HARNESS.drivers.flatMap((driver) => {
+        const candidate = CANDIDATES.find((entry) => entry.driver === driver);
+        return candidate === undefined ? [] : [candidate];
+      });
 
 /**
  * What this process can do without a harness: serve, sweep, reconcile, and refuse to run.
@@ -1382,7 +1469,15 @@ const program = Effect.gen(function* () {
   console.log(`  folder picker root: ${WORKSPACE_ROOT}`);
   // Which agent ran a run is provenance, so which agent this process *can* run is worth
   // one line at startup rather than a guess from the absence of an error.
-  console.log(`  harness (HARNESS): ${renderSelection(SELECTED_HARNESS)}`);
+  console.log(
+    INSTANCE_CONFIG === undefined
+      ? `  harness (HARNESS): ${renderSelection(SELECTED_HARNESS)}`
+      : `  harness instances (${HARNESS_INSTANCES_SETTING}): ${process.env["HARNESS_INSTANCES"] ?? ""}, ${String(INSTANCE_CONFIG.length)} configured${
+          process.env["HARNESS"] === undefined
+            ? ""
+            : ` — HARNESS='${process.env["HARNESS"]}' is ignored while ${HARNESS_INSTANCES_SETTING} is set`
+        }`,
+  );
   // What an operator actually gets, which is not the same list: a configured instance that
   // would not start is reported here with its reason rather than left to be discovered by
   // a refused run.
