@@ -270,7 +270,9 @@ export const doingLine = (
         session.kind === "importer"
           ? session.detail === "refused"
             ? "the harness would not take the prompt"
-            : "the session did not open"
+            : session.detail === "process_gone"
+              ? "its harness process ended"
+              : "the session did not open"
           : // "Failed · failed" says nothing twice.
             reason === "failed"
             ? null

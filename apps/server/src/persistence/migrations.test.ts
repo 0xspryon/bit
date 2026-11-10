@@ -722,7 +722,7 @@ describe("what the schema refuses", () => {
     expect(outcome.orphan).toBe("Failure");
   });
 
-  test("an import session takes only the four end reasons, and null", async () => {
+  test("an import session takes only the five end reasons, and null", async () => {
     const outcome = await withSql(newDatabasePath(), (sql) =>
       Effect.gen(function* () {
         yield* migrate;
@@ -742,6 +742,14 @@ describe("what the schema refuses", () => {
           sql`UPDATE import_sessions SET ended_reason = 'crashed'
             WHERE import_id = 'imp_1'`,
         );
+        // `0004`: a session whose harness process had ended on its own.
+        const gone = yield* Effect.result(
+          sql`INSERT INTO import_sessions (
+              import_id, target_id, harness_session_id, model, caller_scope, opened_at,
+              ended_at, ended_reason
+            ) VALUES ('imp_4', 'acme-corp', 'ses_4', 'p/m',
+                      'acme-corp/import/imp_4', 600, 700, 'process_gone')`,
+        );
         // The row is written before the session exists, so an empty session id would be
         // a row naming nothing.
         const emptySession = yield* Effect.result(
@@ -753,6 +761,7 @@ describe("what the schema refuses", () => {
         return {
           open: open._tag,
           unknown: unknown._tag,
+          gone: gone._tag,
           emptySession: emptySession._tag,
           rows: yield* sql<{
             import_id: string;
@@ -765,11 +774,63 @@ describe("what the schema refuses", () => {
 
     expect(outcome.open).toBe("Success");
     expect(outcome.unknown).toBe("Failure");
+    expect(outcome.gone).toBe("Success");
     expect(outcome.emptySession).toBe("Failure");
     expect(outcome.rows).toEqual([
       { import_id: "imp_1", ended_reason: "shutdown" },
       { import_id: "imp_2", ended_reason: null },
+      { import_id: "imp_4", ended_reason: "process_gone" },
     ]);
+  });
+
+  test("0004 carries every import session row of a 0003 database across, column for column", async () => {
+    const path = newDatabasePath();
+    const before = Object.fromEntries(
+      Object.entries(MIGRATIONS).filter(([key]) => Number(key.slice(0, 4)) < 4),
+    );
+    const upTo3 = await runChain(path, SqliteMigrator.fromRecord(before));
+    expect(upTo3._tag).toBe("Success");
+    const outcome = await withSql(path, (sql) =>
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO import_sessions (
+            import_id, target_id, harness_session_id, harness_instance_id, model,
+            caller_scope, opened_at, session_created_at, ended_at, ended_reason,
+            model_options, pages, agent_id
+          ) VALUES ('imp_1', 'acme-corp', 'ses_1', 'pi', 'p/m',
+                    'acme-corp/import/imp_1', 100, 150, 300, 'refused',
+                    '{"effort":"high"}', '["https://a.example"]', 'importer'),
+                   ('imp_2', 'acme-corp', 'ses_1', NULL, 'p/m',
+                    'acme-corp/import/imp_2', 400, NULL, NULL, NULL,
+                    NULL, NULL, 'importer')`;
+        const all = sql<Record<string, unknown>>`SELECT * FROM import_sessions
+          ORDER BY import_id`;
+        const was = yield* all;
+        const applied = yield* migrate;
+        const now = yield* all;
+        // The old `CHECK` refused it; the rebuilt table takes it.
+        yield* sql`UPDATE import_sessions SET ended_at = 500,
+            ended_reason = 'process_gone' WHERE import_id = 'imp_2'`;
+        return {
+          applied,
+          was,
+          now,
+          left: yield* tablesOf(sql),
+          ended: yield* sql<{
+            ended_reason: string | null;
+          }>`SELECT ended_reason FROM import_sessions WHERE import_id = 'imp_2'`,
+          index: yield* sql<{
+            name: string;
+          }>`SELECT name FROM sqlite_master WHERE type = 'index'
+               AND tbl_name = 'import_sessions' AND sql IS NOT NULL`,
+        };
+      }),
+    );
+    expect(outcome.applied).toEqual([[4, "import_session_process_gone"]]);
+    expect(outcome.now).toEqual(outcome.was);
+    expect(outcome.was.length).toBe(2);
+    expect(outcome.left).not.toContain("import_sessions_0003");
+    expect(outcome.ended).toEqual([{ ended_reason: "process_gone" }]);
+    expect(outcome.index).toEqual([{ name: "import_sessions_target_idx" }]);
   });
 
   test("the control registry holds its per-target state to two values", async () => {

@@ -330,6 +330,8 @@ const notHeldBecause = (reason: string | null): string => {
   switch (reason) {
     case "refused":
       return "the harness refused a message into it, which closed it";
+    case "process_gone":
+      return "its harness process ended on its own (it crashed, was killed or exited)";
     case "shutdown":
       return "the server was shut down after it was opened";
     case "open_failed":

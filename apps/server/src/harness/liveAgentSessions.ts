@@ -191,15 +191,19 @@ export interface LiveAgentSession<Meta> {
  * - `operator` — the surface's own intentional close: the operator ended it.
  * - `shutdown` — this registry's layer finalizer, on the way down.
  * - `refused` — the harness refused a prompt, so the session was given up on.
+ * - `process_gone` — the harness no longer holds the session: the process that ran it
+ *   ended on its own (crashed, was killed, exited), found when a message or a Stop was
+ *   sent into it ({@link closeReasonFor}). Not `refused`: nothing refused anything, and the
+ *   resume note says why the session went (slice 3 fix 2, L2).
  * - `open_failed` — an open that published its entry and then never reached `ready`.
  *
  * Every close ends the session's authority period in this process — the credential and the
- * registration go either way. Only `operator` says the authority is *over*; the other three
- * are this process letting go. The spine passes the reason through to `afterClose` and
+ * registration go either way. Only `operator` says the authority is *over*; the others are
+ * this process letting go. The spine passes the reason through to `afterClose` and
  * does nothing else with it; a surface that persists an ending is what gives it meaning.
  */
 export type LiveSessionCloseReason =
-  "operator" | "shutdown" | "refused" | "open_failed";
+  "operator" | "shutdown" | "refused" | "process_gone" | "open_failed";
 
 /** Everything opening a session can fail with, before the surface maps it to its own refusal. */
 export type LiveSessionOpenFailure =
@@ -393,15 +397,28 @@ export type ModelSwitchFailure =
 export type ModelSwitchApplied = "live" | "recorded";
 
 /**
- * Whether a harness's refusal of a switch means "that session is not running here".
+ * Whether a harness's refusal of a call into a session — a switch, a message, a Stop —
+ * means "that session is not running here".
  *
- * Claude Code says so with {@link SESSION_NOT_FOUND_TAG} (and 404) for a query that is gone
- * or going; OpenCode's `session.switchModel` 404 carries no tag, so the status is the test,
- * as every other not-found reader on the seam already does.
+ * Claude Code and Pi say so with {@link SESSION_NOT_FOUND_TAG} (and 404) for a session that
+ * is gone or going; OpenCode's `session.switchModel` 404 carries no tag, so the status is
+ * the test, as every other not-found reader on the seam already does.
  */
-const switchFoundNoSession = (failure: HarnessFailure): boolean =>
+const foundNoSession = (failure: HarnessFailure): boolean =>
   failure._tag === "HarnessTransportError" &&
   (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
+
+/**
+ * Why a session a harness would not take a message or a Stop into is let go.
+ *
+ * A not-found answer ({@link SESSION_NOT_FOUND_TAG}) to a session this registry still holds
+ * means the harness has lost it: both drivers close a session whose process ended on its
+ * own (a Pi process that exited, a Claude Code stream that failed with its CLI), and answer
+ * every later call into it with not-found. That is `process_gone`; any other failure is the
+ * harness refusing, `refused`.
+ */
+const closeReasonFor = (failure: HarnessFailure): LiveSessionCloseReason =>
+  foundNoSession(failure) ? "process_gone" : "refused";
 
 /**
  * What {@link LiveAgentSessions.interrupt} found.
@@ -656,7 +673,7 @@ export interface LiveAgentSessions<Meta> {
    * 1. `prepare` — the surface reads its row and checks the request. It may refuse.
    * 2. Live entry: the harness's `switchModel`. Accepted — the registry's copy is updated
    *    (if the map still holds this entry), then the row is written: `live`. A refusal that
-   *    means "no such running session" ({@link switchFoundNoSession}) — the row only:
+   *    means "no such running session" ({@link foundNoSession}) — the row only:
    *    `recorded`, and the next resume opens on it. Anything else — the row is not written
    *    and the failure is {@link ModelSwitchUncertain}.
    * 3. No live entry: the row only, `recorded`.
@@ -1240,7 +1257,7 @@ export const makeLiveAgentSessions = <Meta>(
           ),
         );
         if (accepted._tag === "Failure") {
-          yield* closeSession(entry, "refused");
+          yield* closeSession(entry, closeReasonFor(accepted.failure));
           return yield* Effect.fail(accepted.failure);
         }
         if (accepted.success.delivered) yield* promptAccepted(entry);
@@ -1264,7 +1281,7 @@ export const makeLiveAgentSessions = <Meta>(
           entry.harness.interruptSession(entry.sessionId),
         );
         if (asked._tag === "Failure") {
-          yield* closeSession(entry, "refused");
+          yield* closeSession(entry, closeReasonFor(asked.failure));
           return yield* Effect.fail(asked.failure);
         }
         if (!asked.success) return { _tag: "idle", entry } as const;
@@ -1447,7 +1464,7 @@ export const makeLiveAgentSessions = <Meta>(
           entry.harness.switchModel(entry.sessionId, plan.model, plan.options),
         );
         if (switched._tag === "Failure") {
-          if (!switchFoundNoSession(switched.failure)) {
+          if (!foundNoSession(switched.failure)) {
             return yield* Effect.fail<ModelSwitchFailure>({
               _tag: "ModelSwitchUncertain",
               failure: switched.failure,

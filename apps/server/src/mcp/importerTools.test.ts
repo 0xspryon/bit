@@ -63,7 +63,7 @@ const IMPORT_ENDED = "imp-ended";
  * The ends that are this process letting go rather than the authority ending (`0027`). Each
  * gets an import of its own, ended for that reason, with a live credential.
  */
-const LET_GO = ["shutdown", "refused", "open_failed"] as const;
+const LET_GO = ["shutdown", "refused", "process_gone", "open_failed"] as const;
 const letGoImport = (reason: (typeof LET_GO)[number]) => `imp-let-go-${reason}`;
 const BUDGET = 3;
 
@@ -239,6 +239,7 @@ class Seeded extends Context.Service<
         letGoTokens: {
           shutdown: letGo["shutdown"] ?? "",
           refused: letGo["refused"] ?? "",
+          process_gone: letGo["process_gone"] ?? "",
           open_failed: letGo["open_failed"] ?? "",
         },
       });
@@ -296,6 +297,7 @@ let endedImporterToken = "";
 let letGoTokens: Readonly<Record<(typeof LET_GO)[number], string>> = {
   shutdown: "",
   refused: "",
+  process_gone: "",
   open_failed: "",
 };
 

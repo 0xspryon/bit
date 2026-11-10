@@ -1148,6 +1148,58 @@ const goalSessionModelOptions = statements(
 );
 
 /**
+ * `0004` — a fifth reason an import's period ends: `process_gone` (slice 3 fix 2, L2).
+ *
+ * A message or a Stop into a session whose harness process had ended on its own (a Pi
+ * process that exited, a Claude Code CLI killed mid-turn) found the harness holding no
+ * session, and the period was closed as `refused` — so the note on the period the message
+ * then opened said the harness had refused a message, after a crash. `process_gone` is that
+ * close, said for what it is. Like `refused`, it is this process letting go: nothing about
+ * the authority being over, and the importer toolkit does not refuse on it.
+ *
+ * SQLite cannot change a column's `CHECK`, so the table is rebuilt: the old one renamed
+ * aside, the new one created under its name with every column `0001` and `0002` gave it,
+ * filled from the old, the old dropped, and the index made again. Nothing references
+ * `import_sessions` (no foreign key, trigger or view names it), so the rename and the drop
+ * move nothing else, and the whole rebuild runs in the migrator's transaction.
+ */
+const importSessionProcessGone = statements(
+  `ALTER TABLE import_sessions RENAME TO import_sessions_0003`,
+  `CREATE TABLE import_sessions (
+    import_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    harness_session_id TEXT NOT NULL,
+    harness_instance_id TEXT,
+    model TEXT NOT NULL,
+    caller_scope TEXT NOT NULL,
+    opened_at INTEGER NOT NULL,
+    session_created_at INTEGER,
+    ended_at INTEGER,
+    ended_reason TEXT
+      CHECK (ended_reason IN
+        ('operator', 'shutdown', 'refused', 'process_gone', 'open_failed')),
+    model_options TEXT,
+    pages TEXT,
+    agent_id TEXT NOT NULL DEFAULT 'importer'
+      CHECK (length(agent_id) > 0),
+    CHECK (length(harness_session_id) > 0)
+  )`,
+  `INSERT INTO import_sessions (
+     import_id, target_id, harness_session_id, harness_instance_id, model,
+     caller_scope, opened_at, session_created_at, ended_at, ended_reason,
+     model_options, pages, agent_id
+   )
+   SELECT import_id, target_id, harness_session_id, harness_instance_id, model,
+          caller_scope, opened_at, session_created_at, ended_at, ended_reason,
+          model_options, pages, agent_id
+     FROM import_sessions_0003`,
+  // Takes the old table's index with it, so the name is free for the new one.
+  `DROP TABLE import_sessions_0003`,
+  `CREATE INDEX import_sessions_target_idx
+     ON import_sessions(target_id, opened_at)`,
+);
+
+/**
  * The ordered chain. **Append only; never edit an applied entry.**
  *
  * The key's numeric prefix is the id the journal records, and the rest is its name, so
@@ -1169,6 +1221,7 @@ export const MIGRATIONS: Record<
   "0001_baseline": baseline,
   "0002_import_session_agent": importSessionAgent,
   "0003_goal_session_model_options": goalSessionModelOptions,
+  "0004_import_session_process_gone": importSessionProcessGone,
 };
 
 /** The migrator's loader over {@link MIGRATIONS}. */

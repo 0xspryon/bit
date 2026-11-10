@@ -878,13 +878,15 @@ export type RoundTerminalStatus = Exclude<RoundStatus, "running">;
 
 /**
  * Why an import's authority period ended (`0027`), and the whole list of things that end
- * one. Only `operator` means the authority is over; the other three are a process letting
- * go of a session it can no longer, or no longer wants to, hold. See `0027` for the rule.
+ * one. Only `operator` means the authority is over; the others are a process letting go of
+ * a session it can no longer, or no longer wants to, hold. See `0027` for the rule, and
+ * `0004_import_session_process_gone` for `process_gone`.
  */
 export const ImportSessionEndReason = Schema.Literals([
   "operator",
   "shutdown",
   "refused",
+  "process_gone",
   "open_failed",
 ]);
 export type ImportSessionEndReason = typeof ImportSessionEndReason.Type;

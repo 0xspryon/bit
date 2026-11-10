@@ -460,10 +460,10 @@ const importerOrRefuse = Effect.fnUntraced(function* (write: string) {
  *
  * **Only an `operator` end refuses.** Every close stamps `ended_at`, because the picker
  * needs an honest "nothing holds this", but only the operator's stop means the authority is
- * genuinely over. `shutdown`, `refused` and `open_failed` are this process letting go: the
- * credential behind them went with the in-memory grant, so there is nothing left to gate,
- * and refusing on them would be what stops a gracefully restarted import from ever being
- * continued (S7). A row ended before `0027` has no reason and is not refused, for the same
+ * genuinely over. `shutdown`, `refused`, `process_gone` and `open_failed` are this process
+ * letting go: the credential behind them went with the in-memory grant, so there is nothing
+ * left to gate, and refusing on them would be what stops a gracefully restarted import from
+ * ever being continued (S7). A row ended before `0027` has no reason and is not refused, for the same
  * reason. The rule in full is `0027`'s header: one row is one authority period, and a later
  * period gets a new import id rather than reviving this one.
  *

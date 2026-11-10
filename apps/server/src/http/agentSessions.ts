@@ -158,6 +158,7 @@ const newest = (
 
 const ENDED_IMPORTER_FAILURES: ReadonlySet<ImporterSessionEndReason> = new Set([
   "refused",
+  "process_gone",
   "open_failed",
 ]);
 

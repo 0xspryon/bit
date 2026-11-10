@@ -479,7 +479,12 @@ describe("an import the operator ended", () => {
   });
 
   test("an end the *server* recorded is not refused: a message to it opens a way on", async () => {
-    for (const reason of ["shutdown", "refused", "open_failed"] as const) {
+    for (const reason of [
+      "shutdown",
+      "refused",
+      "process_gone",
+      "open_failed",
+    ] as const) {
       const view = await read({
         recorded: recorded({ endedReason: reason }),
         messages: [],

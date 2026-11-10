@@ -318,6 +318,11 @@ interface Script {
   failPrompt: boolean;
   /** Makes a later (steered) prompt fail, for a session that refuses a second message. */
   failSteer: boolean;
+  /**
+   * Makes a later (steered) prompt fail as both drivers answer one into a session whose
+   * process ended on its own: not found.
+   */
+  steerGone: boolean;
   /** Makes `interruptSession` fail, for a harness that will not acknowledge a Stop. */
   failInterrupt: boolean;
   /**
@@ -402,6 +407,7 @@ const newScript = (readable: readonly string[]): Script => {
     failCreate: false,
     failPrompt: false,
     failSteer: false,
+    steerGone: false,
     failInterrupt: false,
     onSteer: undefined,
     holdPrompt: undefined,
@@ -547,15 +553,23 @@ const scriptedHarness = (script: Script) => {
       operator,
     ) =>
       delivery._tag === "steer"
-        ? script.failSteer
+        ? script.failSteer || script.steerGone
           ? Effect.fail(
-              new HarnessTransportError({
-                operation: "prompt",
-                status: 409,
-                tag: undefined,
-                detail: "the scripted harness would not take the message",
-                cause: undefined,
-              }),
+              script.steerGone
+                ? new HarnessTransportError({
+                    operation: "prompt",
+                    status: 404,
+                    tag: SESSION_NOT_FOUND_TAG,
+                    detail: "the scripted session's process is gone",
+                    cause: undefined,
+                  })
+                : new HarnessTransportError({
+                    operation: "prompt",
+                    status: 409,
+                    tag: undefined,
+                    detail: "the scripted harness would not take the message",
+                    cause: undefined,
+                  }),
             )
           : Effect.sync(() => {
               script.prompts.push(text);
@@ -3011,6 +3025,29 @@ describe("a message to an import that is still opening", () => {
 });
 
 describe("a reopen", () => {
+  test("after the session's process died, the note says so, not that the harness refused (slice 3 fix 2, L2)", async () => {
+    const { built, runtime, started } = await importWith([PAGE_GOOD], {
+      links: [PAGE_GOOD],
+    });
+    if (started._tag !== "started") throw new Error("the import did not start");
+    // The process died between turns: the harness holds no session for the next message.
+    built.script.steerGone = true;
+    const next = await sendTo(runtime, started.importId, "Are you back?");
+    built.script.steerGone = false;
+    expect(next._tag).toBe("Success");
+    if (next._tag !== "Success") return;
+    expect(next.success.importId).not.toBe(started.importId);
+    expect(next.success.note).toContain(
+      "its harness process ended on its own (it crashed, was killed or exited)",
+    );
+    expect(next.success.note).not.toContain("refused");
+    expect(
+      endings(built.root).find((each) => each.import_id === started.importId)
+        ?.ended_reason,
+    ).toBe("process_gone");
+    await runtime.dispose();
+  });
+
   test("a caller that stops waiting still leaves the successor recorded: the next message continues it", async () => {
     const { built, runtime, started } = await importWith([PAGE_GOOD], {
       links: [PAGE_GOOD],

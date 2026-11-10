@@ -255,6 +255,17 @@ describe("a row's second line", () => {
         }),
       ).text,
     ).toBe("Failed · the harness would not take the prompt");
+    // Slice 3 fix 2 (L2): a session whose process died is not one the harness refused.
+    expect(
+      doingLine(
+        row({
+          state: "dormant",
+          outcome: "failed",
+          detail: "process_gone",
+          resumable: true,
+        }),
+      ).text,
+    ).toBe("Failed · its harness process ended · a message carries it on");
     expect(doingLine(row({ state: "ended", outcome: "stopped" })).text).toBe(
       "Ended by you · 3 in · 0 out · 5 assets",
     );

@@ -1114,8 +1114,9 @@ describe("the conversation core through a non-importer owner", () => {
     expect(result.sent.conversation).toBe("resumed");
     expect(result.sent.probeId).toBe("prb_2");
     expect(result.reopened).toEqual(["prb_1"]);
-    // Let go as a refused prompt is, and not ended by the operator.
-    expect(result.ended).toEqual([{ id: "prb_1", reason: "refused" }]);
+    // Let go because its process is gone (slice 3 fix 2, L2): not a refusal, and not
+    // ended by the operator.
+    expect(result.ended).toEqual([{ id: "prb_1", reason: "process_gone" }]);
     expect(result.refused).toMatchObject({
       _tag: "ProbeRefused",
       reason: "harness_unreachable",

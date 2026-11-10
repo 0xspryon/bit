@@ -284,15 +284,18 @@ export const conversationViewFields = {
  * Why a period ended (`0027`).
  *
  * Only `operator` means the authority is over: the operator ended the conversation, its
- * tools refuse every write under it, and a message to it is refused. The other three are
- * the server letting go — `shutdown` on the way down, `refused` for a prompt the harness
- * would not take, `open_failed` for a session that never opened — and a message to such a
- * period opens a fresh session under a new period id rather than being refused.
+ * tools refuse every write under it, and a message to it is refused. The others are the
+ * server letting go — `shutdown` on the way down, `refused` for a prompt the harness would
+ * not take, `process_gone` for a session whose harness process had ended on its own (found
+ * by the next message or Stop), `open_failed` for a session that never opened — and a
+ * message to such a period opens a fresh session under a new period id rather than being
+ * refused.
  */
 export const ConversationEndReason = Schema.Literals([
   "operator",
   "shutdown",
   "refused",
+  "process_gone",
   "open_failed",
 ]);
 export type ConversationEndReason = typeof ConversationEndReason.Type;

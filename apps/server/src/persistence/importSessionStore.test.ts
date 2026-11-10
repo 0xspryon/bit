@@ -407,7 +407,13 @@ describe("an import session's end (0026, 0027)", () => {
     expect(outcome.second).toBe(outcome.first);
   });
 
-  test.each(["operator", "shutdown", "refused", "open_failed"] as const)(
+  test.each([
+    "operator",
+    "shutdown",
+    "refused",
+    "process_gone",
+    "open_failed",
+  ] as const)(
     "a %s end round-trips through the column's check",
     async (reason) => {
       const path = newDatabasePath();

@@ -18,11 +18,12 @@ import { join } from "node:path";
 
 import { Deferred, Effect, Exit, Fiber, Layer, Redacted, Scope } from "effect";
 
-import type {
-  AgentHarness,
-  McpRegistration,
-  SessionRef,
-  TerminalOutcome,
+import {
+  SESSION_NOT_FOUND_TAG,
+  type AgentHarness,
+  type McpRegistration,
+  type SessionRef,
+  type TerminalOutcome,
 } from "./agentHarness";
 import { HarnessTransportError } from "./errors";
 import {
@@ -1078,6 +1079,55 @@ describe("every close ends the harness session", () => {
     );
     expect(outcome.result).toEqual(["ses_1"]);
     expect(outcome.reasons).toEqual(["refused"]);
+  });
+
+  test("a message or a Stop into a session the harness no longer holds ends it as process_gone (slice 3 fix 2, L2)", async () => {
+    // Both drivers' answer for a session whose process ended on its own; the bare 404 too.
+    const gone = (status: number | undefined, tag: string | undefined) =>
+      new HarnessTransportError({
+        operation: "session.prompt",
+        status,
+        tag,
+        detail: "the session's process is gone",
+        cause: undefined,
+      });
+    for (const failure of [
+      gone(404, SESSION_NOT_FOUND_TAG),
+      gone(undefined, SESSION_NOT_FOUND_TAG),
+      gone(404, undefined),
+    ]) {
+      const recorder = freshRecorder();
+      const base = gatedHarness(recorder, {});
+      const message: AgentHarness["Service"] = {
+        ...base,
+        prompt: (sessionId, text, delivery) =>
+          delivery?._tag === "steer"
+            ? Effect.fail(failure)
+            : base.prompt(sessionId, text, delivery),
+      };
+      const sent = await withImporterSessions(message, ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          const entry = sessions.ready(IMPORT);
+          if (entry === undefined) return yield* Effect.die("not opened");
+          return yield* Effect.flip(sessions.deliver(entry, "back?", "queued"));
+        }),
+      );
+      expect(sent.result).toBe(failure);
+      expect(sent.reasons).toEqual(["process_gone"]);
+
+      const stop: AgentHarness["Service"] = {
+        ...gatedHarness(freshRecorder(), {}),
+        interruptSession: () => Effect.fail(failure),
+      };
+      const stopped = await withImporterSessions(stop, ({ sessions, plan }) =>
+        Effect.gen(function* () {
+          yield* opening(sessions, plan);
+          yield* Effect.flip(sessions.interrupt(IMPORT));
+        }),
+      );
+      expect(stopped.reasons).toEqual(["process_gone"]);
+    }
   });
 
   test("a Stop the harness will not acknowledge ends it, as refused", async () => {
