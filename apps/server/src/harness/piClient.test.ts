@@ -805,6 +805,15 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
       await Effect.runPromise(f.harness.prompt(ref.id, askThen("thanks")));
       await until(() => details(seen, "question").length > 0, "the question");
       expect(model.requests.at(-1)?.tools).toContain("ask_user_question");
+      // Pi puts the tool's guideline into its system prompt (`promptGuidelines`).
+      expect(
+        model.requests
+          .at(-1)
+          ?.messages.find((message) => message.role === "system")
+          ?.text.includes(
+            "call ask_user_question rather than ending your reply",
+          ),
+      ).toBe(true);
       const [asked] = details(seen, "question");
       const question = asked?.question;
       const call = details(seen, "toolCall")[0];

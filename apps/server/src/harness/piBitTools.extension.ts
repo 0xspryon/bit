@@ -317,7 +317,7 @@ const registerQuestionTool = (pi: PiExtensionApi, key: string): void => {
       );
       if (signal?.aborted === true)
         throw new Error(
-          "The questions were withdrawn: the turn was stopped before the operator answered.",
+          "The questions were withdrawn before the operator answered: the turn was stopped, or the session ended.",
         );
       const reply = value === undefined ? undefined : replyOf(value);
       if (reply === undefined)

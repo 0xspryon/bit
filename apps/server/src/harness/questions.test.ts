@@ -193,7 +193,7 @@ describe("the question a transcript ends on (the `message` fallback's source)", 
         call("ask_user_question", "call_7"),
         result(
           "failed",
-          "The questions were withdrawn: the turn was stopped before the operator answered.",
+          "The questions were withdrawn before the operator answered: the turn was stopped, or the session ended.",
           "call_7",
         ),
       ])?.fields.map((field) => field.key),
