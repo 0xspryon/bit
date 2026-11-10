@@ -21,6 +21,19 @@ import { Schema } from "effect";
 const EpochMillis = Schema.Finite;
 
 /**
+ * The tools a harness asks the operator with, by harness: Claude Code's own
+ * `AskUserQuestion`, OpenCode's own `question`, and bit's `ask_user_question` for Pi, which
+ * has none (`piBitTools.extension.ts`). One list, so the server's replay and the web's
+ * thread name the same calls questions. bit's MCP tools are namespaced on every harness
+ * (`mcp__bit…`, `bit_…`), so none of these names can be one of them.
+ */
+export const QUESTION_TOOL_NAMES = {
+  claudeCode: "AskUserQuestion",
+  openCode: "question",
+  pi: "ask_user_question",
+} as const;
+
+/**
  * What kind of answer a question takes (E3/E4's tags): `one` — choose one (CHOOSE ONE),
  * `any` — choose any number (CHOOSE ANY), `text` — the operator's own words (YOUR WORDS).
  */

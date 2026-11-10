@@ -46,7 +46,7 @@ import type {
   MessageAttachmentView,
   PlanRoundView,
 } from "@bit/contracts";
-import { NARRATION_FIELD_MAX } from "@bit/contracts";
+import { NARRATION_FIELD_MAX, QUESTION_TOOL_NAMES } from "@bit/contracts";
 import { dispositionLabel } from "./goalFormat";
 
 /**
@@ -927,13 +927,12 @@ export interface ToolRunSummary {
 
 /**
  * The tools a harness asks the operator with (A7-Q): Claude Code's `AskUserQuestion`,
- * OpenCode's `question`. A tool of an MCP server is namespaced, so neither name can be one
- * of ours.
+ * OpenCode's `question`, bit's `ask_user_question` on Pi (`QUESTION_TOOL_NAMES`). A tool
+ * of an MCP server is namespaced, so none of these names can be one of ours.
  */
-const QUESTION_TOOLS: ReadonlySet<string> = new Set([
-  "AskUserQuestion",
-  "question",
-]);
+const QUESTION_TOOLS: ReadonlySet<string> = new Set(
+  Object.values(QUESTION_TOOL_NAMES),
+);
 
 /** How many questions one question-tool call asked: its input's `questions`, else one. */
 const questionsIn = (row: ChatRow): number => {
@@ -1011,11 +1010,14 @@ export const toolRunSummary = (
       failed += 1;
     }
   }
+  // By the wire name, not the reduced one: an MCP tool's reduced name could be any of these.
   const questionRun =
     rows.length > 0 &&
     rows.every(
       (row) =>
-        row.item.kind === "tool.call" && QUESTION_TOOLS.has(toolRowName(row)),
+        row.item.kind === "tool.call" &&
+        row.item.tool !== null &&
+        QUESTION_TOOLS.has(row.item.tool),
     );
   return {
     count: rows.length,

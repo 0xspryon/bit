@@ -1518,6 +1518,37 @@ describe("U4: consecutive tool calls fold into one line", () => {
     expect(inFlight.summary.pending).toBe(true);
   });
 
+  test("a run of question calls says how many were asked, on every harness's tool (Pi's too)", () => {
+    for (const tool of ["AskUserQuestion", "question", "ask_user_question"]) {
+      const [run] = threadEntries(
+        rowsFor(
+          [
+            // A harness's own tool, not an MCP one: no server namespace, no bare name.
+            activity({
+              kind: "tool.call",
+              tool,
+              toolName: null,
+              callId: "q1",
+              headline: tool,
+              body: "",
+              input: JSON.stringify({
+                questions: [{ question: "A?" }, { question: "B?" }],
+              }),
+            }),
+          ],
+          true,
+        ),
+      );
+      if (run?._tag !== "tools") throw new Error("not a run");
+      expect(run.summary.asked).toEqual({ questions: 2, waiting: true });
+    }
+    const [other] = threadEntries(
+      rowsFor([call("q2", "ask_user_question")], true),
+    );
+    if (other?._tag !== "tools") throw new Error("not a run");
+    expect(other.summary.asked).toBeUndefined();
+  });
+
   test("a record no call claims, a sub-agent and a harness note are not tool calls", () => {
     const entries = threadEntries(
       rowsFor(

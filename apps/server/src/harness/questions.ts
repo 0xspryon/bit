@@ -7,13 +7,14 @@
  * is what both share, and what a replay — which has no native request any more, only the
  * tool call in the transcript — reads a question back from.
  */
-import type {
-  LiveItem,
-  PendingQuestion,
-  QuestionAnswerability,
-  QuestionField,
-  QuestionKind,
-  QuestionOption,
+import {
+  QUESTION_TOOL_NAMES,
+  type LiveItem,
+  type PendingQuestion,
+  type QuestionAnswerability,
+  type QuestionField,
+  type QuestionKind,
+  type QuestionOption,
 } from "@bit/contracts";
 
 import type { HarnessQuestion } from "./agentHarness";
@@ -31,17 +32,17 @@ export const QUESTION_DISMISSED_MESSAGE =
   "The operator dismissed these questions without answering them. Carry on without the answers, or ask in your reply instead.";
 
 /** Claude Code's question tool. */
-export const CLAUDE_CODE_QUESTION_TOOL = "AskUserQuestion";
+export const CLAUDE_CODE_QUESTION_TOOL = QUESTION_TOOL_NAMES.claudeCode;
 
 /** OpenCode's question tool, whose request is a form (`metadata.kind: "question"`). */
-export const OPENCODE_QUESTION_TOOL = "question";
+export const OPENCODE_QUESTION_TOOL = QUESTION_TOOL_NAMES.openCode;
 
 /**
  * bit's question tool for Pi, which has none of its own (harness-instances slice 3): offered
  * by `piBitTools.extension.ts` and answered through Pi's extension-UI channel (`piClient.ts`).
  * Its input is Claude Code's `AskUserQuestion` shape, so a model that knows one knows both.
  */
-export const PI_QUESTION_TOOL = "ask_user_question";
+export const PI_QUESTION_TOOL = QUESTION_TOOL_NAMES.pi;
 
 /** Which harness's question tool shape a call is read with. */
 export type QuestionTool = "claude-code" | "opencode" | "pi";
