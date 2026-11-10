@@ -65,6 +65,25 @@
  * message *first*; this driver re-sequences so the held one goes first, as on OpenCode and
  * as the Stop notice tells the operator ({@link sendHeldFirst}).
  *
+ * ## Questions for the operator (slice 3)
+ *
+ * A session opened with `operatorQuestions` (the importer's) is offered bit's
+ * `ask_user_question` tool by the extension, which asks through Pi's extension-UI channel:
+ * one `input` dialog whose title is `bit-question:<key>`, `key` a random string this driver
+ * gives that process alone (`BIT_QUESTION_KEY`), and whose placeholder is the question set as
+ * JSON. A dialog with exactly that title is held here and narrated as a `question`; its
+ * answer or dismissal is written back as the dialog's value and becomes the tool's result.
+ * **Every other dialog is still cancelled at once**: nobody is at a terminal to answer an
+ * operator's own extension, and Pi would wait on it. The key is how the two are told apart,
+ * never the words on the dialog; it is not a secret (an extension of the same process could
+ * read it), only an id no other extension would choose.
+ *
+ * A held question is withdrawn when its tool call ends without bit's answer (a Stop aborts
+ * the tool's signal, which resolves the dialog empty; Pi's own day-long timeout does the
+ * same), when its run settles, when the process dies, and when the session ends. Nothing
+ * outlives the process that asked: a restarted server finds the question in the transcript
+ * instead, unanswered, and offers it as a message (`questions.ts`, `unansweredQuestion`).
+ *
  * ## When the process dies
  *
  * A Pi process that exits on its own mid-turn leaves the turn's outcome **unknown**: the
@@ -79,7 +98,7 @@ import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { HarnessModelView } from "@bit/contracts";
+import type { HarnessModelView, QuestionAnswers } from "@bit/contracts";
 import {
   Deferred,
   Duration,
@@ -99,6 +118,7 @@ import {
   type HarnessContextUsage,
   type HarnessFailure,
   type HarnessNarration,
+  type HarnessQuestion,
   type McpRegistration,
   type SessionRef,
   type SessionStatus,
@@ -133,6 +153,11 @@ import {
   type ProcessTree,
   type StopBounds,
 } from "./ownedProcesses";
+import {
+  QUESTION_DISMISSED_MESSAGE,
+  questionAnswersForAgent,
+  questionFieldsOfInput,
+} from "./questions";
 import {
   PiNarrator,
   hasUserMessage,
@@ -204,6 +229,12 @@ const NARRATION_BUFFER = 512;
 
 /** The fd the extension reads the credential from. */
 const TOKEN_FD = 3;
+
+/**
+ * The title prefix of bit's question dialog; the process's key follows it. The extension's
+ * `QUESTION_DIALOG`, which cannot import this.
+ */
+export const PI_QUESTION_DIALOG = "bit-question:";
 
 /** The extension file, beside this module (`.ts` from source, `.js` once built). */
 const defaultExtensionPath = (): string =>
@@ -563,6 +594,24 @@ interface PiImage {
   readonly mimeType: string;
 }
 
+/** One `ask_user_question` dialog this driver holds for the operator. */
+interface HeldPiQuestion {
+  readonly question: HarnessQuestion;
+  /** Pi's id for the dialog, which the answer is written back under. */
+  readonly dialogId: string;
+  /** The process that asked: an answer goes to it or nowhere. */
+  readonly rpc: RpcProcess;
+}
+
+/** What the extension reads from the dialog's value (`piBitTools.extension.ts`). */
+type QuestionReply =
+  | {
+      readonly outcome: "answered";
+      readonly text: string;
+      readonly answers: Readonly<Record<string, readonly string[]>>;
+    }
+  | { readonly outcome: "dismissed"; readonly text: string };
+
 interface SessionRecord {
   readonly sessionId: string;
   readonly title: string;
@@ -570,6 +619,12 @@ interface SessionRecord {
   readonly multiTurn: boolean;
   readonly resumed: boolean;
   model: string;
+  /** From `createSession`: whether the process is offered bit's question tool. */
+  readonly operatorQuestions: boolean;
+  /** The key bit's question dialogs carry in their title; see the header. */
+  readonly questionKey: string;
+  /** The questions this session's process is waiting on, by question id (its tool call). */
+  readonly questions: Map<string, HeldPiQuestion>;
   /** The registration the process starts with: one credential, one session. */
   mcp:
     | { readonly name: string; readonly url: string; readonly token: string }
@@ -816,24 +871,26 @@ export const piHarness = (
           return;
         }
         if (value.type === "extension_ui_request") {
+          const method = value.method;
+          if (typeof value.id !== "string") return;
+          if (
+            method === "input" &&
+            record.operatorQuestions &&
+            value.title === `${PI_QUESTION_DIALOG}${record.questionKey}`
+          ) {
+            holdQuestion(record, rpc, value.id, value.placeholder);
+            return;
+          }
           // A dialog an extension of the operator's opened: nobody is at a terminal to
           // answer it, and Pi waits for an answer, so it is cancelled at once. Fire-and-
           // forget requests (`notify`, `setStatus`, …) need nothing.
-          const method = value.method;
           if (
-            typeof value.id === "string" &&
-            (method === "select" ||
-              method === "confirm" ||
-              method === "input" ||
-              method === "editor")
+            method === "select" ||
+            method === "confirm" ||
+            method === "input" ||
+            method === "editor"
           ) {
-            try {
-              rpc.child.stdin?.write(
-                `${JSON.stringify({ type: "extension_ui_response", id: value.id, cancelled: true })}\n`,
-              );
-            } catch {
-              // The process is going; nothing waits on this answer any more.
-            }
+            dialogResponse(rpc, value.id, { cancelled: true });
           }
           return;
         }
@@ -848,10 +905,120 @@ export const piHarness = (
           if (entry.outcome !== undefined) record.outcome = entry.outcome;
         }
         offer(record, narrated);
+        // A question call that ended without bit's answer — a Stop aborted it, or Pi's own
+        // timeout resolved its dialog — is waiting on nobody any more.
+        if (
+          event.type === "tool_execution_end" &&
+          typeof event.toolCallId === "string"
+        ) {
+          settleQuestion(record, event.toolCallId, "withdrawn");
+        }
         if (event.type === "agent_settled") {
+          withdrawQuestions(record);
           record.busy = false;
           settleIfIdle(record);
         }
+      };
+
+      /** Writes one answer to an extension dialog; `false` when it could not be written. */
+      const dialogResponse = (
+        rpc: RpcProcess,
+        id: string,
+        body: { readonly cancelled: true } | { readonly value: string },
+      ): boolean => {
+        if (rpc.exited) return false;
+        try {
+          rpc.child.stdin?.write(
+            `${JSON.stringify({ type: "extension_ui_response", id, ...body })}\n`,
+          );
+          return true;
+        } catch {
+          // The process is going; nothing waits on this answer any more.
+          return false;
+        }
+      };
+
+      /**
+       * Takes one of bit's question dialogs: its set read as the dock's fields, held, and
+       * narrated. A set with no question in it is answered at once, so the tool says so.
+       */
+      const holdQuestion = (
+        record: SessionRecord,
+        rpc: RpcProcess,
+        dialogId: string,
+        placeholder: unknown,
+      ) => {
+        const payload = ((): unknown => {
+          try {
+            return typeof placeholder === "string"
+              ? (JSON.parse(placeholder) as unknown)
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+        const fields = questionFieldsOfInput("pi", payload);
+        const callId =
+          typeof payload === "object" &&
+          payload !== null &&
+          typeof (payload as { callId?: unknown }).callId === "string"
+            ? (payload as { callId: string }).callId
+            : undefined;
+        if (fields === undefined || record.closed) {
+          dialogResponse(rpc, dialogId, {
+            value: JSON.stringify({
+              outcome: "dismissed",
+              text: record.closed
+                ? "The session is ending, so the questions were not put to the operator."
+                : "None of the questions had any text, so nothing was asked. Each needs a `question`.",
+            } satisfies QuestionReply),
+          });
+          return;
+        }
+        const questionId = callId ?? dialogId;
+        const question: HarnessQuestion = {
+          questionId,
+          fields,
+          askedAt: Date.now(),
+          callId,
+        };
+        record.questions.set(questionId, { question, dialogId, rpc });
+        offer(record, [
+          {
+            type: "question",
+            sequence: undefined,
+            at: question.askedAt ?? Date.now(),
+            outcome: undefined,
+            detail: { _tag: "question", question },
+          },
+        ]);
+      };
+
+      /** Lets go of one held question, once, and says how it stopped waiting. */
+      const settleQuestion = (
+        record: SessionRecord,
+        questionId: string,
+        settled: "answered" | "dismissed" | "withdrawn",
+      ): HeldPiQuestion | undefined => {
+        const held = record.questions.get(questionId);
+        if (held === undefined) return undefined;
+        record.questions.delete(questionId);
+        offer(record, [
+          {
+            type: "question",
+            sequence: undefined,
+            at: Date.now(),
+            outcome: undefined,
+            detail: { _tag: "questionSettled", questionId, settled },
+          },
+        ]);
+        return held;
+      };
+
+      /** Withdraws every question a session still holds: its run or its process is over. */
+      const withdrawQuestions = (record: SessionRecord) => {
+        for (const questionId of [...record.questions.keys()])
+          settleQuestion(record, questionId, "withdrawn");
       };
 
       /** The narrator's hooks for one record: the steer join, and the model windows. */
@@ -908,6 +1075,7 @@ export const piHarness = (
               },
             ]);
           }
+          withdrawQuestions(record);
           Deferred.doneUnsafe(
             record.idle,
             running
@@ -957,6 +1125,9 @@ export const piHarness = (
                       BIT_MCP_URL: mcp.url,
                       BIT_MCP_TOKEN_FD: String(TOKEN_FD),
                     }),
+                ...(record.operatorQuestions
+                  ? { BIT_QUESTION_KEY: record.questionKey }
+                  : {}),
               },
               stdio:
                 mcp === undefined
@@ -1216,6 +1387,7 @@ export const piHarness = (
             }
           }
           record.busy = false;
+          withdrawQuestions(record);
           Deferred.doneUnsafe(record.idle, Effect.void);
           if (wasOpen) Queue.endUnsafe(record.narration);
           if (rpc === undefined || rpc.exited) records.delete(record);
@@ -1286,6 +1458,11 @@ export const piHarness = (
           multiTurn: input.multiTurn === true,
           resumed: input.resume !== undefined,
           model: input.model,
+          // As on Claude Code: only a conversation draws questions, and only one that says so.
+          operatorQuestions:
+            input.multiTurn === true && input.operatorQuestions === true,
+          questionKey: crypto.randomUUID(),
+          questions: new Map(),
           mcp: undefined,
           narration,
           narrator: narratorFor(() => holder.record as SessionRecord),
@@ -1308,10 +1485,9 @@ export const piHarness = (
         sessions.set(sessionId, record);
         records.add(record);
         // `options` (reasoning depth) is not translated: this build offers no option
-        // descriptors for Pi models, so none can be chosen. `parentSessionId`,
-        // `operatorQuestions` and `fetchesPages` have nothing to configure on Pi: it asks
-        // nothing of anybody (a question tool is the next slice's) and reads pages with its
-        // shell.
+        // descriptors for Pi models, so none can be chosen. `parentSessionId` and
+        // `fetchesPages` have nothing to configure on Pi: it has no sub-agents and reads
+        // pages with its shell.
         const ref: SessionRef = { id: sessionId };
         handedOut.set(ref, record);
         return ref;
@@ -1673,17 +1849,81 @@ export const piHarness = (
           return record === undefined ? Effect.void : endRecord(record);
         });
 
-      const pendingQuestions: AgentHarness["Service"]["pendingQuestions"] =
-        () => Effect.succeed([]);
-
-      const notPending = (sessionId: string, questionId: string) =>
-        Effect.fail(
-          new QuestionNotPending({
-            questionId,
-            reason: "settled",
-            detail: `Pi is not waiting on question ${questionId} in session ${sessionId}: this build offers Pi sessions no question tool.`,
-          }),
+      const pendingQuestions: AgentHarness["Service"]["pendingQuestions"] = (
+        sessionId,
+      ) =>
+        Effect.sync(() =>
+          [...(sessions.get(sessionId)?.questions.values() ?? [])].map(
+            (held) => held.question,
+          ),
         );
+
+      /**
+       * Writes the operator's decision into the held dialog and lets the question go. The
+       * question is settled only once the answer is written: a process that cannot be
+       * written to took nothing, and the caller says so (`harness_unreachable`).
+       */
+      const decide = (
+        sessionId: string,
+        questionId: string,
+        reply: (held: HeldPiQuestion) => QuestionReply,
+      ): Effect.Effect<void, HarnessFailure | QuestionNotPending> =>
+        Effect.suspend(
+          (): Effect.Effect<void, HarnessFailure | QuestionNotPending> => {
+            const record = sessions.get(sessionId);
+            const held = record?.questions.get(questionId);
+            if (record === undefined || held === undefined) {
+              return Effect.fail(
+                new QuestionNotPending({
+                  questionId,
+                  reason: "settled",
+                  detail: `Pi is not waiting on question ${questionId} in session ${sessionId}: it was answered, dismissed or withdrawn, or this server never held it.`,
+                }),
+              );
+            }
+            const answer = reply(held);
+            if (
+              !dialogResponse(held.rpc, held.dialogId, {
+                value: JSON.stringify(answer),
+              })
+            ) {
+              return Effect.fail(
+                transport(
+                  "pi.extension_ui_response",
+                  `the Pi process holding question ${questionId} could not be written to`,
+                ),
+              );
+            }
+            settleQuestion(record, questionId, answer.outcome);
+            return Effect.void;
+          },
+        );
+
+      const answerQuestion: AgentHarness["Service"]["answerQuestion"] = (
+        sessionId,
+        questionId,
+        answers: QuestionAnswers,
+      ) =>
+        decide(sessionId, questionId, (held) => ({
+          outcome: "answered",
+          text: questionAnswersForAgent(held.question.fields, answers),
+          // By question text, for the call's details: what a reader of the session file sees.
+          answers: Object.fromEntries(
+            held.question.fields.map((field) => [
+              field.question,
+              answers[field.key] ?? [],
+            ]),
+          ),
+        }));
+
+      const dismissQuestion: AgentHarness["Service"]["dismissQuestion"] = (
+        sessionId,
+        questionId,
+      ) =>
+        decide(sessionId, questionId, () => ({
+          outcome: "dismissed",
+          text: QUESTION_DISMISSED_MESSAGE,
+        }));
 
       const sessionEvents: AgentHarness["Service"]["sessionEvents"] = (
         sessionId,
@@ -1717,10 +1957,8 @@ export const piHarness = (
         holding: (sessionId) =>
           Effect.sync(() => (sessions.get(sessionId)?.untaken.length ?? 0) > 0),
         pendingQuestions,
-        answerQuestion: (sessionId, questionId) =>
-          notPending(sessionId, questionId),
-        dismissQuestion: (sessionId, questionId) =>
-          notPending(sessionId, questionId),
+        answerQuestion,
+        dismissQuestion,
         endSession,
         sessionEvents,
       });

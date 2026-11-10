@@ -26,6 +26,7 @@ import {
   type NarrationDetail,
 } from "./agentHarness";
 import { InstanceId } from "./identity";
+import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 import { fakeModelsJson, startFakeModel, type FakeModel } from "./piFakeModel";
 import { piHarness, type PiHarnessOptions } from "./piClient";
 
@@ -756,5 +757,353 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
     expect(alive(pid)).toBe(true);
     await close(f);
     expect(alive(pid)).toBe(false);
+  });
+});
+
+/** A conversation that may ask the operator: what the importer opens (`operatorQuestions`). */
+const openAsking = (harness: AgentHarness["Service"], work: string) =>
+  Effect.runPromise(
+    harness.createSession({
+      title: "bit question session",
+      model: "fake/fake-1",
+      directory: work,
+      sessionId: harness.newSessionId(),
+      multiTurn: true,
+      operatorQuestions: true,
+    }),
+  );
+
+/** Three questions, one of each kind the dock draws. */
+const QUESTION_SET = {
+  questions: [
+    {
+      question: "Which colour should the report use?",
+      header: "Colour",
+      options: [
+        { label: "Blue", description: "The house colour" },
+        { label: "Red" },
+      ],
+    },
+    {
+      question: "Which sizes should it come in?",
+      options: [{ label: "S" }, { label: "M" }, { label: "L" }],
+      multiSelect: true,
+    },
+    { question: "Anything else I should know?" },
+  ],
+};
+
+const askThen = (after: string) =>
+  S([{ tool: "ask_user_question", args: QUESTION_SET }, { text: after }]);
+
+describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
+  test("a question set reaches the dock with its structure, and the answer returns as the tool's result", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("thanks")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      expect(model.requests.at(-1)?.tools).toContain("ask_user_question");
+      const [asked] = details(seen, "question");
+      const question = asked?.question;
+      const call = details(seen, "toolCall")[0];
+      expect(question?.questionId).toBe(call?.callId);
+      expect(question?.callId).toBe(call?.callId);
+      expect(question?.fields).toEqual([
+        {
+          key: "q0",
+          header: "Colour",
+          question: "Which colour should the report use?",
+          kind: "one",
+          options: [
+            { label: "Blue", description: "The house colour" },
+            { label: "Red", description: null },
+          ],
+          custom: true,
+          required: false,
+        },
+        {
+          key: "q1",
+          header: null,
+          question: "Which sizes should it come in?",
+          kind: "any",
+          options: [
+            { label: "S", description: null },
+            { label: "M", description: null },
+            { label: "L", description: null },
+          ],
+          custom: true,
+          required: false,
+        },
+        {
+          key: "q2",
+          header: null,
+          question: "Anything else I should know?",
+          kind: "text",
+          options: [],
+          custom: true,
+          required: false,
+        },
+      ]);
+      const pending = await Effect.runPromise(
+        f.harness.pendingQuestions(ref.id),
+      );
+      expect(pending.map((each) => each.questionId)).toEqual([
+        question?.questionId,
+      ]);
+      // The turn waits on the operator, and says it is running.
+      await Bun.sleep(300);
+      expect(
+        (await Effect.runPromise(f.harness.sessionStatus(ref.id))).activity,
+      ).toBe("running");
+
+      await Effect.runPromise(
+        f.harness.answerQuestion(ref.id, question?.questionId ?? "", {
+          q0: ["Blue"],
+          q1: ["S", "L"],
+          q2: ["Ship it on Friday"],
+        }),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await until(() => outcomes(seen).length > 0, "the turn's end");
+      expect(outcomes(seen)).toEqual(["succeeded"]);
+      expect(
+        details(seen, "questionSettled").map((settled) => settled.settled),
+      ).toEqual(["answered"]);
+      const result = details(seen, "toolResult")[0];
+      expect(result?.failed).toBe(false);
+      const told = [
+        "The operator answered your questions:",
+        "1. [Colour] Which colour should the report use?",
+        "   Chose: Blue",
+        "2. Which sizes should it come in?",
+        "   Chose: S; L",
+        "3. Anything else I should know?",
+        "   In their own words: Ship it on Friday",
+      ].join("\n");
+      expect(result?.output).toBe(told);
+      // The model was given the answer as the call's result.
+      const last = model.requests.at(-1)?.messages ?? [];
+      expect(last.some((message) => message.text === told)).toBe(true);
+      expect(details(seen, "reply").map((reply) => reply.text)).toEqual([
+        "thanks",
+      ]);
+      expect(
+        await Effect.runPromise(f.harness.pendingQuestions(ref.id)),
+      ).toEqual([]);
+      // Answered once: a second answer finds nothing waiting.
+      const again = await Effect.runPromise(
+        Effect.result(
+          f.harness.answerQuestion(ref.id, question?.questionId ?? "", {
+            q0: ["Red"],
+          }),
+        ),
+      );
+      expect(again._tag).toBe("Failure");
+      if (again._tag === "Failure")
+        expect(again.failure._tag).toBe("QuestionNotPending");
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("a dismissal reaches the model as the call's error, and the turn goes on", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("understood")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      const questionId = details(seen, "question")[0]?.question.questionId;
+      await Effect.runPromise(
+        f.harness.dismissQuestion(ref.id, questionId ?? ""),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await until(() => outcomes(seen).length > 0, "the turn's end");
+      expect(outcomes(seen)).toEqual(["succeeded"]);
+      expect(
+        details(seen, "questionSettled").map((settled) => settled.settled),
+      ).toEqual(["dismissed"]);
+      const result = details(seen, "toolResult")[0];
+      expect(result?.failed).toBe(true);
+      expect(result?.output).toContain(QUESTION_DISMISSED_MESSAGE);
+      expect(details(seen, "reply").map((reply) => reply.text)).toEqual([
+        "understood",
+      ]);
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("Stop while a question waits withdraws it and ends the turn interrupted", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      const questionId = details(seen, "question")[0]?.question.questionId;
+      const started = Date.now();
+      expect(await Effect.runPromise(f.harness.interruptSession(ref.id))).toBe(
+        true,
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await until(() => outcomes(seen).length > 0, "the turn's end");
+      expect(outcomes(seen)).toEqual(["interrupted"]);
+      expect(
+        details(seen, "questionSettled").map((settled) => [
+          settled.questionId,
+          settled.settled,
+        ]),
+      ).toEqual([[questionId, "withdrawn"]]);
+      // Withdrawn as its call ends, not only when the run does.
+      const withdrawnAt = seen.findIndex(
+        (entry) => entry.detail._tag === "questionSettled",
+      );
+      const resultAt = seen.findIndex(
+        (entry) => entry.detail._tag === "toolResult",
+      );
+      const endedAt = seen.findIndex((entry) => entry.outcome !== undefined);
+      expect(withdrawnAt).toBeGreaterThan(resultAt);
+      expect(withdrawnAt).toBeLessThan(endedAt);
+      expect(details(seen, "toolResult")[0]?.failed).toBe(true);
+      expect(details(seen, "reply")).toEqual([]);
+      expect(
+        await Effect.runPromise(f.harness.pendingQuestions(ref.id)),
+      ).toEqual([]);
+      const late = await Effect.runPromise(
+        Effect.result(f.harness.dismissQuestion(ref.id, questionId ?? "")),
+      );
+      expect(late._tag).toBe("Failure");
+      // The session carries on: the next message is a new turn.
+      await Effect.runPromise(
+        f.harness.prompt(ref.id, S([{ text: "carried on" }]), {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "m-after",
+        }),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await until(() => outcomes(seen).length === 2, "the next turn");
+      expect(details(seen, "reply").map((reply) => reply.text)).toEqual([
+        "carried on",
+      ]);
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("a Pi process that dies while a question waits withdraws it, and the turn does not hang", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      const questionId = details(seen, "question")[0]?.question.questionId;
+      process.kill(recordedPid(f.records), "SIGKILL");
+      const waited = await Effect.runPromise(
+        Effect.result(f.harness.waitForIdle(ref.id)),
+      );
+      expect(waited._tag).toBe("Failure");
+      await until(
+        () => details(seen, "questionSettled").length > 0,
+        "the withdrawal",
+      );
+      expect(
+        details(seen, "questionSettled").map((settled) => [
+          settled.questionId,
+          settled.settled,
+        ]),
+      ).toEqual([[questionId, "withdrawn"]]);
+      expect(
+        await Effect.runPromise(f.harness.pendingQuestions(ref.id)),
+      ).toEqual([]);
+      const late = await Effect.runPromise(
+        Effect.result(
+          f.harness.answerQuestion(ref.id, questionId ?? "", { q0: ["Blue"] }),
+        ),
+      );
+      expect(late._tag).toBe("Failure");
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("ending a session while a question waits withdraws it", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      const pid = recordedPid(f.records);
+      await Effect.runPromise(f.harness.endSession(ref));
+      expect(alive(pid)).toBe(false);
+      expect(
+        details(seen, "questionSettled").map((settled) => settled.settled),
+      ).toEqual(["withdrawn"]);
+      expect(
+        await Effect.runPromise(f.harness.pendingQuestions(ref.id)),
+      ).toEqual([]);
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("another extension's dialogs are still cancelled, a look-alike title included, and a session that may not ask is not offered the tool", async () => {
+    // An agent folder of its own, with an extension of "the operator's" that opens dialogs.
+    const ownAgent = join(root, "agent-with-dialogs");
+    mkdirSync(join(ownAgent, "extensions"), { recursive: true });
+    writeFileSync(join(ownAgent, "models.json"), fakeModelsJson(model.url));
+    writeFileSync(
+      join(ownAgent, "extensions", "dialogs.ts"),
+      `export default function (pi: any) {
+  pi.registerTool({
+    name: "operator_dialogs",
+    label: "operator dialogs",
+    description: "opens dialogs",
+    parameters: { type: "object", properties: {} },
+    execute: async (_id: string, _params: unknown, signal: AbortSignal, _u: unknown, ctx: any) => {
+      const picked = await ctx.ui.select("Pick one", ["a", "b"], { signal });
+      const typed = await ctx.ui.input("Type something", "here", { signal });
+      const forged = await ctx.ui.input("bit-question:not-the-key", JSON.stringify({ callId: "x", questions: [{ question: "Forged?" }] }), { signal });
+      const ok = await ctx.ui.confirm("Sure?", "really", { signal });
+      return { content: [{ type: "text", text: JSON.stringify({ picked: picked ?? null, typed: typed ?? null, forged: forged ?? null, ok }) }], details: {} };
+    },
+  });
+}
+`,
+    );
+    const f = await fixture({ agentDir: ownAgent });
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(
+        f.harness.prompt(
+          ref.id,
+          S([{ tool: "operator_dialogs", args: {} }, { text: "done" }]),
+        ),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await until(() => outcomes(seen).length > 0, "the turn's end");
+      expect(details(seen, "toolResult")[0]?.output).toBe(
+        JSON.stringify({ picked: null, typed: null, forged: null, ok: false }),
+      );
+      expect(details(seen, "question")).toEqual([]);
+
+      // A conversation opened without operatorQuestions is offered no question tool.
+      const plain = await open(f.harness, f.work, "");
+      await Effect.runPromise(
+        f.harness.prompt(plain.id, S([{ text: "plain" }])),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(plain.id));
+      expect(model.requests.at(-1)?.tools).not.toContain("ask_user_question");
+      expect(model.requests.at(-1)?.tools).toContain("operator_dialogs");
+    } finally {
+      await close(f);
+    }
   });
 });

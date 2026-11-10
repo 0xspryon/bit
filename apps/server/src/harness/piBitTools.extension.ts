@@ -30,6 +30,28 @@
  * pipe leaves nothing to read once it is drained: not in `/proc`, not on disk.
  *
  * `BIT_MCP_URL` names the endpoint and is not a secret. Without both, no tools are offered.
+ *
+ * ## bit's question tool (harness-instances slice 3)
+ *
+ * Pi has no question tool, so a model that needs the operator asks in its reply and ends its
+ * turn, and bit cannot dock the question or raise Needs you. With `BIT_QUESTION_KEY` set,
+ * this also offers `ask_user_question` (Claude Code's `AskUserQuestion` input), which asks
+ * through Pi's own extension-UI channel and returns the operator's answer as its result.
+ *
+ * **How bit tells its question from any other dialog.** In RPC mode a dialog is an
+ * `extension_ui_request` on Pi's stdout, which `piClient.ts` reads. The question is one
+ * `input` dialog whose `title` is `bit-question:<key>` — the key a random string bit gave
+ * this process alone — and whose `placeholder` is the question set as JSON. The driver docks
+ * a dialog only when its title is exactly that, and cancels every other dialog, as it did
+ * before. Not `editor`, though it is meant for longer text: Pi's RPC `editor` takes no
+ * abort signal (1.5.2, `rpc-mode.js`), so a Stop would leave the tool waiting; `input` is
+ * resolved by the tool call's signal. Not `select`/`confirm` per question either: one
+ * dialog carries the whole set, which the dock shows as one set.
+ *
+ * The answer comes back as the dialog's `value`: JSON `{ outcome, text }`, where `text` is
+ * what the model reads, written by bit (`questions.ts`), so its words are tested beside the
+ * dock's. A dismissal is thrown, so Pi stores it as the call's error, which is how the
+ * replay tells a dismissed question from one that was never answered.
  */
 import { closeSync, readFileSync } from "node:fs";
 
@@ -50,17 +72,32 @@ interface CallResult {
   readonly isError?: boolean;
 }
 
+/** The part of a tool call's context this uses (`docs/extensions.md`, `ctx.ui`). */
+interface PiToolContext {
+  readonly ui: {
+    input(
+      title: string,
+      placeholder?: string,
+      options?: { signal?: AbortSignal; timeout?: number },
+    ): Promise<string | undefined>;
+  };
+}
+
 /** The part of Pi's extension API this uses (`docs/extensions.md`, `pi.registerTool`). */
 interface PiExtensionApi {
   registerTool(definition: {
     name: string;
     label: string;
     description: string;
+    promptSnippet?: string;
+    promptGuidelines?: string[];
     parameters: Record<string, unknown>;
     execute: (
       toolCallId: string,
       params: unknown,
       signal: AbortSignal | undefined,
+      onUpdate: unknown,
+      ctx: PiToolContext,
     ) => Promise<{ content: readonly ToolContent[]; details: unknown }>;
   }): void;
 }
@@ -162,7 +199,148 @@ const KEPT = Symbol.for("bit.piBitTools.endpoint");
 type Kept = { readonly url: string; readonly token: string };
 const holder = globalThis as { [KEPT]?: Kept };
 
+/** The question tool's name: `questions.ts`'s `PI_QUESTION_TOOL`, which this cannot import. */
+const QUESTION_TOOL = "ask_user_question";
+
+/** The dialog title's prefix; the key follows it. `piClient.ts`'s `PI_QUESTION_DIALOG`. */
+const QUESTION_DIALOG = "bit-question:";
+
+/**
+ * How long a question waits before Pi resolves its dialog empty: a day, as Claude Code's
+ * question hook does (`claudeCodeClient.ts`, `QUESTION_HOOK_TIMEOUT_SECONDS`).
+ */
+const QUESTION_TIMEOUT_MS = 86_400_000;
+
+const QUESTION_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    questions: {
+      type: "array",
+      minItems: 1,
+      maxItems: 4,
+      description:
+        "The questions to ask, 1 to 4, shown to the operator together.",
+      items: {
+        type: "object",
+        properties: {
+          question: {
+            type: "string",
+            description:
+              "The full question, ending with a question mark: clear on its own.",
+          },
+          header: {
+            type: "string",
+            description:
+              "A short label for the question, at most 12 characters.",
+          },
+          options: {
+            type: "array",
+            maxItems: 4,
+            description:
+              "Two to four choices, when there are clear ones; leave out for an open question. The operator can always answer in their own words instead.",
+            items: {
+              type: "object",
+              properties: {
+                label: {
+                  type: "string",
+                  description: "The choice, in 1 to 5 words.",
+                },
+                description: {
+                  type: "string",
+                  description: "What choosing it means.",
+                },
+              },
+              required: ["label"],
+            },
+          },
+          multiSelect: {
+            type: "boolean",
+            description: "true when the operator may choose several options.",
+          },
+        },
+        required: ["question"],
+      },
+    },
+  },
+  required: ["questions"],
+};
+
+/** The dialog's answer: what the driver writes as the `input` dialog's value. */
+interface QuestionReply {
+  readonly outcome: "answered" | "dismissed";
+  readonly text: string;
+  readonly answers?: unknown;
+}
+
+const replyOf = (value: string): QuestionReply | undefined => {
+  try {
+    const reply = JSON.parse(value) as Partial<QuestionReply> | null;
+    return reply !== null &&
+      (reply.outcome === "answered" || reply.outcome === "dismissed") &&
+      typeof reply.text === "string"
+      ? (reply as QuestionReply)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Kept beside the endpoint, for a Pi `reload`: the variable is gone by then. */
+const QUESTION_KEPT = Symbol.for("bit.piBitTools.questionKey");
+const questionHolder = globalThis as { [QUESTION_KEPT]?: string };
+
+/** Offers `ask_user_question`, asked through the dialog only bit's driver answers. */
+const registerQuestionTool = (pi: PiExtensionApi, key: string): void => {
+  pi.registerTool({
+    name: QUESTION_TOOL,
+    label: "Ask the operator",
+    description:
+      "Ask the operator — the person running this session in bit — one to four questions, and wait for their answers. Use it when you need a decision or information only they have and cannot go on well without it; do not ask what you can find out yourself. Give options when there are clear choices; they can always answer in their own words, or decline and reply in the chat instead.",
+    promptSnippet: "Ask the operator questions and wait for their answers",
+    promptGuidelines: [
+      "When you need the operator's decision or information to continue, call ask_user_question rather than ending your reply with a question.",
+    ],
+    parameters: QUESTION_PARAMETERS,
+    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
+      const questions = (params as { questions?: unknown } | null)?.questions;
+      if (!Array.isArray(questions) || questions.length === 0)
+        throw new Error(
+          `${QUESTION_TOOL} needs at least one question, as { "questions": [{ "question": "…" }] }.`,
+        );
+      const value = await ctx.ui.input(
+        `${QUESTION_DIALOG}${key}`,
+        JSON.stringify({ callId: toolCallId, questions }),
+        {
+          timeout: QUESTION_TIMEOUT_MS,
+          ...(signal === undefined ? {} : { signal }),
+        },
+      );
+      if (signal?.aborted === true)
+        throw new Error(
+          "The questions were withdrawn: the turn was stopped before the operator answered.",
+        );
+      const reply = value === undefined ? undefined : replyOf(value);
+      if (reply === undefined)
+        throw new Error(
+          "No answer came: the questions could not be put to the operator, or went unanswered for a day. Ask in your reply instead.",
+        );
+      if (reply.outcome === "dismissed") throw new Error(reply.text);
+      return {
+        content: [{ type: "text", text: reply.text }],
+        details: { answers: reply.answers ?? {} },
+      };
+    },
+  });
+};
+
 export default async function bitTools(pi: PiExtensionApi): Promise<void> {
+  const givenKey = process.env.BIT_QUESTION_KEY;
+  delete process.env.BIT_QUESTION_KEY;
+  if (givenKey !== undefined && givenKey !== "")
+    questionHolder[QUESTION_KEPT] = givenKey;
+  const questionKey = questionHolder[QUESTION_KEPT];
+  if (questionKey !== undefined) registerQuestionTool(pi, questionKey);
+
   const token = readToken();
   const named = process.env.BIT_MCP_URL;
   delete process.env.BIT_MCP_URL;
