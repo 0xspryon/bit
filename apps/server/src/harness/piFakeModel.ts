@@ -14,6 +14,8 @@
  *   with `delayMs` between them (so a test can Stop mid-reply).
  * - `{ "thinking": "…", "text": "…" }` — a thinking block, then the reply.
  * - `{ "tool": "bash", "args": { … } }` — one tool call.
+ * - `{ "tools": [{ "tool": "bash", "args": { … } }, …] }` — several tool calls in one
+ *   assistant message, as a model that asks two things at once makes them.
  * - `{ "status": 429, "error": "…" }` — the provider refuses this call.
  * - `{ "hang": true }` — never answers: the call stays in flight until the client goes away.
  *
@@ -31,6 +33,12 @@ export type FakeStep =
       readonly delayMs?: number;
     }
   | { readonly tool: string; readonly args: unknown }
+  | {
+      readonly tools: readonly {
+        readonly tool: string;
+        readonly args: unknown;
+      }[];
+    }
   | { readonly status: number; readonly error: string }
   | { readonly hang: true };
 
@@ -160,7 +168,13 @@ export const startFakeModel = (): FakeModel => {
                 return false;
               }
             };
-            if ("tool" in answer) {
+            const toolCalls =
+              "tool" in answer
+                ? [answer]
+                : "tools" in answer
+                  ? answer.tools
+                  : undefined;
+            if (toolCalls !== undefined) {
               send({
                 ...base,
                 choices: [
@@ -169,23 +183,22 @@ export const startFakeModel = (): FakeModel => {
                     delta: {
                       role: "assistant",
                       content: null,
-                      tool_calls: [
-                        {
-                          index: 0,
-                          id: `call_${String(calls)}`,
-                          type: "function",
-                          function: {
-                            name: answer.tool,
-                            arguments: JSON.stringify(answer.args),
-                          },
+                      tool_calls: toolCalls.map((call, index) => ({
+                        index,
+                        // One id per call, so a test can tell them apart.
+                        id: `call_${String(calls)}${index === 0 ? "" : `_${String(index)}`}`,
+                        type: "function",
+                        function: {
+                          name: call.tool,
+                          arguments: JSON.stringify(call.args),
                         },
-                      ],
+                      })),
                     },
                     finish_reason: null,
                   },
                 ],
               });
-            } else {
+            } else if ("text" in answer) {
               if (answer.thinking !== undefined) {
                 send({
                   ...base,
@@ -228,7 +241,8 @@ export const startFakeModel = (): FakeModel => {
                 {
                   index: 0,
                   delta: {},
-                  finish_reason: "tool" in answer ? "tool_calls" : "stop",
+                  finish_reason:
+                    toolCalls !== undefined ? "tool_calls" : "stop",
                 },
               ],
             });

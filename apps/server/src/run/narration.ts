@@ -293,8 +293,36 @@ export class RunNarrations extends Context.Service<
           Effect.suspend(() => {
             published += 1;
             activities.record(item.subject, item.entry);
+            const sent = PubSub.publish(pubsub, { ...item, id: published });
+            /*
+             * The next question, said again once one settles (slice 3 fix, M1). A chat docks
+             * one question, the newest it heard of, and an agent can hold two at once
+             * (Claude Code's `AskUserQuestion` twice in one message): settling the newest
+             * left the other waiting with no dock until a reload. So the question the
+             * subject still waits on is published again here, as the replay would offer it
+             * (`questionNow`: the newest still pending), and every open chat docks it. Here
+             * rather than in each driver, so every harness and every chat get it at once,
+             * and rather than a chat reading its replay again on every answer.
+             */
+            const next =
+              item.entry.detail._tag === "questionSettled"
+                ? activities.waiting(item.subject)
+                : undefined;
+            if (next === undefined) return Effect.asVoid(sent);
+            published += 1;
+            const again: RunNarration = {
+              ...item,
+              id: published,
+              entry: {
+                type: "question",
+                sequence: undefined,
+                at: item.entry.at,
+                outcome: undefined,
+                detail: { _tag: "question", question: next },
+              },
+            };
             return Effect.asVoid(
-              PubSub.publish(pubsub, { ...item, id: published }),
+              Effect.andThen(sent, PubSub.publish(pubsub, again)),
             );
           }),
         /**
