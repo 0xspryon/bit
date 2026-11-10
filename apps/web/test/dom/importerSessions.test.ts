@@ -2612,6 +2612,48 @@ describe("A6 U6: Stop when the server says something runs, and Send now", () => 
     ).toBe(sentNowTitle("message_end"));
   });
 
+  test("on Pi, Send now says it is read once the message and its tool calls finish (harness instances, slice 2)", async () => {
+    const sessions = SESSIONS.map((each) =>
+      each.importId === "imp_newest"
+        ? { ...each, harnessInstanceId: "pi" }
+        : each,
+    );
+    const { app, fake } = await continueOn(sessions, [
+      harness("pi", "Pi", "pi"),
+    ]);
+    fake.watch.send(liveOpened({ from: 0, latest: 0 }));
+    await settle();
+    typeInto(composer(), "Read the policy");
+    await settle();
+    composer().focus();
+    press("Enter");
+    await settle();
+    activity(fake, { turn: "running", background: false });
+    await firePolls(app);
+    fake.onSendImporterMessage = (_baseUrl, targetId, importId) =>
+      ok(
+        importerTurnAccepted({
+          targetId,
+          importId,
+          harnessSessionId: "ses_newest",
+          harnessInstanceId: "pi",
+          model: "anthropic/claude-newest",
+          messageId: "msg_now",
+        }),
+      );
+    typeInto(composer(), "Skip the blog");
+    await settle();
+    const now = sendNowButton();
+    if (now === null) throw new Error("no Send now while a turn runs");
+    expect(now.title).toBe(sendNowButtonTitle("step_end"));
+    click(now);
+    await settle();
+    const page = document.querySelector(".importer")?.textContent ?? "";
+    expect(page).toContain(sendingNowNote("step_end"));
+    expect(page).not.toContain("is dropped");
+    expect(page).not.toContain("on OpenCode");
+  });
+
   test("a turn's Stop that stopped the background work beside it takes the pill away at once, with no 'Stop background work' in between (A6 U6 review)", async () => {
     const fake = new FakeServer();
     // A turn runs and a background shell beside it.

@@ -707,6 +707,10 @@ export const queuedNote = (agent: string): string =>
  * no step inside it, and GLM finished a 77 s one in full first. `unknown` is a harness this
  * page cannot name, which is told only what both do.
  *
+ * **Pi** (`streamingBehavior: "steer"`) reads it once the message it is writing **and the
+ * tool calls that message made** have finished, before its next model call (`step_end`,
+ * measured on Pi 1.5.2): nothing in flight is cut short.
+ *
  * Chosen from the harness's `driver`, which `HarnessInstanceView` says is shown and never
  * routed by: this is wording, and the server delivers the same urgency to either.
  *
@@ -717,7 +721,8 @@ export const queuedNote = (agent: string): string =>
  * race between the abort settling and the send landing (an abort that lands after the send
  * would stop the very turn the message opened).
  */
-export type SendNowTiming = "next_step" | "message_end" | "unknown";
+export type SendNowTiming =
+  "next_step" | "message_end" | "step_end" | "unknown";
 
 /** {@link SendNowTiming} for a harness driver (`HarnessInstanceView.driver`). */
 export const sendNowTiming = (driver: string | undefined): SendNowTiming =>
@@ -725,7 +730,9 @@ export const sendNowTiming = (driver: string | undefined): SendNowTiming =>
     ? "next_step"
     : driver === "opencode"
       ? "message_end"
-      : "unknown";
+      : driver === "pi"
+        ? "step_end"
+        : "unknown";
 
 /**
  * What a message sent with "Send now" says while the harness has yet to take it (A6 U6),
@@ -736,7 +743,9 @@ export const sendingNowNote = (timing: SendNowTiming, agent: string): string =>
     ? `Sending now: the ${agent} reads this at its next step, ahead of any queued message. A tool call already running finishes first; the rest of what it was doing is dropped.`
     : timing === "message_end"
       ? `Sending now: on OpenCode the ${agent} reads this once the message it is writing ends, ahead of any queued message. The message in flight is finished, not cut short.`
-      : `Sending now: the ${agent} reads this ahead of any queued message, as soon as its harness lets it in.`;
+      : timing === "step_end"
+        ? `Sending now: on Pi the ${agent} reads this once the message it is writing and any tool calls it made have finished, ahead of any queued message. Nothing in flight is cut short.`
+        : `Sending now: the ${agent} reads this ahead of any queued message, as soon as its harness lets it in.`;
 
 /** What a "Send now" message the harness took says of it, beside its bubble. */
 export const sentNowTitle = (timing: SendNowTiming, agent: string): string =>
@@ -744,7 +753,9 @@ export const sentNowTitle = (timing: SendNowTiming, agent: string): string =>
     ? `Sent now: the ${agent} took this at its next step and dropped the rest of what it was doing.`
     : timing === "message_end"
       ? `Sent now: the ${agent} took this once the message it was writing ended, ahead of any queued message.`
-      : `Sent now: the ${agent} took this ahead of any queued message.`;
+      : timing === "step_end"
+        ? `Sent now: the ${agent} took this once the message it was writing and its tool calls had finished, ahead of any queued message.`
+        : `Sent now: the ${agent} took this ahead of any queued message.`;
 
 /** What the Send now button says it does, on the session's harness. */
 export const sendNowButtonTitle = (
@@ -755,7 +766,9 @@ export const sendNowButtonTitle = (
     ? `Send now: the ${agent} reads this at its next step, ahead of any queued message. A tool call already running finishes first; the rest of what it was doing is dropped.`
     : timing === "message_end"
       ? `Send now: on OpenCode the ${agent} reads this once the message it is writing ends, ahead of any queued message. The message in flight is finished, not cut short.`
-      : `Send now: the ${agent} reads this ahead of any queued message, as soon as its harness lets it in.`;
+      : timing === "step_end"
+        ? `Send now: on Pi the ${agent} reads this once the message it is writing and any tool calls it made have finished, ahead of any queued message. Nothing in flight is cut short.`
+        : `Send now: the ${agent} reads this ahead of any queued message, as soon as its harness lets it in.`;
 
 /**
  * One session's rows: its own, with the importer's narration from the target's live feed
