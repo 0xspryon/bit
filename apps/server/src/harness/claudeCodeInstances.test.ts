@@ -48,7 +48,8 @@ const scriptedSdk = (script: Script = {}) => {
         release = resolve;
       });
       void (async () => {
-        for await (const message of prompt) if (message !== undefined) pulled?.();
+        for await (const message of prompt)
+          if (message !== undefined) pulled?.();
       })();
       const query: HarnessQuery = {
         setMcpServers: async () => ({}),
