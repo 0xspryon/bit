@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   decodeInstanceConfig,
+  modelsWithoutSpelling,
   readInstanceConfig,
   type FolderCheck,
   type InstanceConfigResult,
@@ -227,5 +228,48 @@ describe("each bad field is named", () => {
         ],
       }),
     ).toContain("instances[1].driver: only one opencode instance");
+  });
+});
+
+describe("modelsWithoutSpelling", () => {
+  test("names the models of a configured folder that declare no reportedAs", () => {
+    const result = decode({
+      instances: [
+        { id: "claude-code", driver: "claude-code" },
+        {
+          id: "cc-zai",
+          driver: "claude-code",
+          configDir: ZAI,
+          models: [
+            { id: "opus", reportedAs: "glm-5.3" },
+            { id: "sonnet" },
+            { id: "haiku" },
+          ],
+        },
+        // Models without a folder run on the operator's own login: nothing to say.
+        { id: "cc-plain", driver: "claude-code", models: [{ id: "sonnet" }] },
+      ],
+    });
+    if (result._tag !== "configured")
+      throw new Error(`not configured: ${result._tag}`);
+    expect(modelsWithoutSpelling(result.instances)).toEqual([
+      { id: "cc-zai", models: ["sonnet", "haiku"] },
+    ]);
+  });
+
+  test("says nothing when every model of a folder is spelled", () => {
+    const result = decode({
+      instances: [
+        {
+          id: "cc-zai",
+          driver: "claude-code",
+          configDir: ZAI,
+          models: [{ id: "opus", reportedAs: "glm-5.3" }],
+        },
+      ],
+    });
+    if (result._tag !== "configured")
+      throw new Error(`not configured: ${result._tag}`);
+    expect(modelsWithoutSpelling(result.instances)).toEqual([]);
   });
 });

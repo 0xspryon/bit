@@ -133,6 +133,29 @@ export interface OpenCodeInstanceConfig {
 
 export type InstanceConfig = ClaudeCodeInstanceConfig | OpenCodeInstanceConfig;
 
+/**
+ * The models of a Claude Code instance with its own config folder that name no
+ * `reportedAs`, per instance, for a startup line (slice 1 review, L1).
+ *
+ * Such an instance's settings may map a model to a provider's own name (z.ai answers
+ * `glm-5.3-flash` for `sonnet`). bit learns that from a live session, but a replay after a
+ * restart runs before the session says anything, so its turns show the provider's name
+ * until the session runs again. bit never opens the folder's settings to find out, so all
+ * it can do is say which models it has no spelling for. An instance whose models are the
+ * provider's own names needs none; the line is a prompt to check, not an error.
+ */
+export const modelsWithoutSpelling = (
+  config: readonly InstanceConfig[],
+): readonly { readonly id: string; readonly models: readonly string[] }[] =>
+  config.flatMap((entry) => {
+    if (entry.driver !== "claude-code" || entry.configDir === undefined)
+      return [];
+    const missing = (entry.models ?? [])
+      .filter((model) => model.reportedAs === undefined)
+      .map((model) => model.id);
+    return missing.length === 0 ? [] : [{ id: entry.id, models: missing }];
+  });
+
 /** What reading the file came to: the instances, or one sentence naming what is wrong. */
 export type InstanceConfigResult =
   | {

@@ -128,6 +128,7 @@ import {
 } from "./harness/identity";
 import {
   HARNESS_INSTANCES_SETTING,
+  modelsWithoutSpelling,
   readInstanceConfig,
   type ClaudeCodeInstanceConfig,
   type InstanceConfig,
@@ -1478,6 +1479,11 @@ const program = Effect.gen(function* () {
             : ` — HARNESS='${process.env["HARNESS"]}' is ignored while ${HARNESS_INSTANCES_SETTING} is set`
         }`,
   );
+  for (const { id, models } of modelsWithoutSpelling(INSTANCE_CONFIG ?? [])) {
+    console.log(
+      `    ${id}: no reportedAs for ${models.join(", ")}; if its settings map them to other names, replayed turns show those names after a restart until the session runs again`,
+    );
+  }
   // What an operator actually gets, which is not the same list: a configured instance that
   // would not start is reported here with its reason rather than left to be discovered by
   // a refused run.
