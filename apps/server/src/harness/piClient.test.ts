@@ -5,7 +5,14 @@
  *
  * Skipped when `pi` is not on `PATH`.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
@@ -32,6 +39,13 @@ import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 import { fakeModelsJson, startFakeModel, type FakeModel } from "./piFakeModel";
 import { piHarness, type PiHarnessOptions } from "./piClient";
 import { processExitMessage } from "./processExit";
+
+/**
+ * These tests drive real `pi --mode rpc` processes, several per test when a session is
+ * ended and resumed. Pi takes over a second to start (1.3 s measured, 2026-11-10), so
+ * bun's 5 s default timed out tests that were otherwise passing.
+ */
+setDefaultTimeout(20_000);
 
 const hasPi = spawnSync("pi", ["--version"], { stdio: "ignore" }).status === 0;
 

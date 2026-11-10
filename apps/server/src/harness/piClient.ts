@@ -156,7 +156,12 @@ import {
   withAttachmentLines,
   type MessageAttachment,
 } from "./attachments";
-import { PROCESS_EXIT_ENTRY, withExits, type ProcessExit } from "./processExit";
+import {
+  PROCESS_EXIT_ENTRY,
+  processExitMessage,
+  withExits,
+  type ProcessExit,
+} from "./processExit";
 import {
   HarnessDecodeError,
   HarnessProcessError,
@@ -1161,9 +1166,18 @@ export const piHarness = (
               : `exited (${signal ?? `code ${String(code)}`})${when}.`;
             const exit: ProcessExit = {
               at: Date.now(),
-              message: running
-                ? `The Pi process running this session ${what} What it finished is kept; how the turn would have ended is not known.${lost}`
-                : `The Pi process running this session ${what} What it finished is kept, and the next message carries the conversation on.`,
+              // A plain death mid-turn is said in the words every harness uses
+              // (`processExitMessage`); a memory stop has its own reason to give.
+              message:
+                running && !outOfMemory
+                  ? processExitMessage({
+                      process: "The Pi process",
+                      how: signal ?? `code ${String(code)}`,
+                      untaken: record.untaken.length,
+                    })
+                  : running
+                    ? `The Pi process running this session ${what} What it finished is kept; how the turn would have ended is not known.${lost}`
+                    : `The Pi process running this session ${what} What it finished is kept, and the next message carries the conversation on.`,
             };
             // Kept for the replay (slice 3 fix, L2): Pi's file says nothing of a death, and
             // a thread read again after it would lose the only line saying why the turn
