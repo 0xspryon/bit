@@ -38,6 +38,7 @@ import {
   type ConversationHistory as ImporterHistory,
   historyOf,
   takesUnknownMessage,
+  withoutLost,
   withReplay,
 } from "../src/lib/conversationChat";
 import {
@@ -2196,6 +2197,42 @@ describe("a replay's queued messages, and a replay read again", () => {
       floor: 7,
     });
     expect(kept.history.lost).toBeUndefined();
+  });
+
+  test("slice 3 fix 2, L1: a message carried on under a new period takes the lost one out of the open tab, as the server's replay does", () => {
+    const LOST = "1111";
+    const KEPT = "2222";
+    const installed = withReplay(session(), {
+      view: view({
+        queued: [
+          {
+            messageId: LOST,
+            text: "read this next",
+            acceptedAt: AT + 5_000,
+            taken: false,
+            lost: true,
+          },
+          {
+            messageId: KEPT,
+            text: "and this one ran",
+            acceptedAt: AT + 6_000,
+            taken: true,
+          },
+        ],
+      }),
+      floor: 7,
+    });
+    expect(installed.items.map((item) => item.body).join("|")).toBe(
+      "read this next|and this one ran",
+    );
+    const cleared = withoutLost(installed);
+    expect(cleared.history.lost).toBeUndefined();
+    expect("lost" in cleared.history).toBe(false);
+    expect(cleared.items.map((item) => item.body).join("|")).toBe(
+      "and this one ran",
+    );
+    // Nothing lost: the very same session.
+    expect(withoutLost(cleared)).toBe(cleared);
   });
 
   test("a queued message is a row of its own at the end, waiting, until its take", () => {

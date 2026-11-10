@@ -139,6 +139,8 @@ const world = (
   const forgotten: string[] = [];
   let live: readonly LiveItem[] = [];
   let turn: "idle" | "running" = "idle";
+  /** What a period's replay holds beside the default, by period id. */
+  const replays = new Map<string, Partial<ConversationReplayView>>();
   /** What the next open or send answers instead of `next`, once: a refusal, a lost answer. */
   let scripted: (() => Promise<Call<ProbeTurn, object>>) | undefined;
   const takeScripted = () => {
@@ -182,7 +184,7 @@ const world = (
     },
     history: (id) => {
       calls.push(`history ${id}`);
-      return Promise.resolve(ok(replay(id)));
+      return Promise.resolve(ok(replay(id, replays.get(id))));
     },
     stop: (id) => {
       calls.push(`stop ${id}`);
@@ -280,6 +282,10 @@ const world = (
     },
     answerNext: (turn: ProbeTurn) => {
       next = turn;
+    },
+    /** What a period's replay holds from now on, beside the default. */
+    replayOf: (periodId: string, over: Partial<ConversationReplayView>) => {
+      replays.set(periodId, over);
     },
     /** What the activity route answers from now on: a turn running, or nothing. */
     running: (running: boolean) => {
@@ -488,6 +494,65 @@ describe("the generic chat state through a goal-shaped owner", () => {
     await settle();
     expect(probe.forgotten).toEqual(["gper_1", "gper_2"]);
     expect(probe.state.current?.conversationId).toBe("gper_2");
+  });
+
+  test("slice 3 fix 2, L1: a message carried on under a new period takes the old period's not-delivered message out of the thread", async () => {
+    const probe = world();
+    // The session's process died with a message still queued in it.
+    probe.replayOf("gper_1", {
+      queued: [
+        {
+          messageId: "msg_lost",
+          text: "read this next",
+          acceptedAt: AT + 5,
+          taken: false,
+          lost: true,
+        },
+      ],
+    });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    const bodies = () =>
+      (probe.state.current?.items ?? []).map((item) => item.body).join("|");
+    expect(bodies()).toContain("read this next");
+    expect(probe.state.current?.history.lost).toEqual(["msg_lost"]);
+
+    // The next message finds the session gone and resumes it under a new period.
+    probe.answerNext({
+      periodId: "gper_2",
+      sessionId: "ses_1",
+      conversation: "resumed",
+    });
+    probe.state.draft = "Are you back?";
+    probe.state.send();
+    await settle();
+    expect(probe.state.current?.conversationId).toBe("gper_2");
+    expect(bodies()).toBe("Are you back?");
+    expect(probe.state.current?.history.lost).toBeUndefined();
+  });
+
+  test("a message into the same period keeps a not-delivered message where it is", async () => {
+    const probe = world();
+    probe.replayOf("gper_1", {
+      queued: [
+        {
+          messageId: "msg_lost",
+          text: "read this next",
+          acceptedAt: AT + 5,
+          taken: false,
+          lost: true,
+        },
+      ],
+    });
+    probe.state.begin([listed("ses_1", "gper_1", AT)], probe.server);
+    probe.state.open("ses_1");
+    await settle();
+    probe.state.draft = "Still there?";
+    probe.state.send();
+    await settle();
+    expect(probe.state.current?.conversationId).toBe("gper_1");
+    expect(probe.state.current?.history.lost).toEqual(["msg_lost"]);
   });
 
   test("a binding's connection key is what the app files the owner's frames under", () => {

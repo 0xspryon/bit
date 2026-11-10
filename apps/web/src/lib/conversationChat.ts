@@ -483,6 +483,32 @@ const takenByMessage = (
 export const messagesOf = (item: LiveItem): readonly string[] =>
   item.messageIds ?? [];
 
+/**
+ * The session without its not-delivered messages (slice 3 fix 2, L1): their rows, and the
+ * history's {@link ConversationHistory.lost}.
+ *
+ * For a message the server accepted **into a new period**: the old one was closed, and the
+ * queue that held the lost messages with it, so a replay read now would not have them. The
+ * open tab drops them at the same moment rather than at its next re-read, so the thread
+ * reads the same before a reload as after one, and the note's "this mark goes with your
+ * next message" holds in both.
+ */
+export const withoutLost = <T extends ConversationSession>(session: T): T => {
+  const lost = new Set(session.history.lost ?? []);
+  if (lost.size === 0) return session;
+  const { lost: _dropped, ...history } = session.history;
+  void _dropped;
+  return {
+    ...session,
+    history,
+    items: session.items.filter(
+      (item) =>
+        messagesOf(item).length === 0 ||
+        !messagesOf(item).every((id) => lost.has(id)),
+    ),
+  };
+};
+
 /** The take that took a row's messages, if this session has seen one. */
 const takeOf = (
   row: LiveItem,

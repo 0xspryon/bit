@@ -70,6 +70,7 @@ import {
   conversationFeed,
   sendNowTiming,
   takesUnknownMessage,
+  withoutLost,
   withReplay,
   type ConversationGroup,
   type ConversationReplayView,
@@ -1860,7 +1861,14 @@ export class ConversationSessions<
     const at = turn.acceptedAt;
     // Delivered as a steer while a turn ran: queued until the harness takes it (A6 U4).
     const midTurn = turn.messageId !== undefined && session.working;
-    const landed = (before: S): S => {
+    const landed = (given: S): S => {
+      // Carried on under a new period (a reopen after the session's process died): the
+      // old period's lost messages went with its queue (slice 3 fix 2, L1).
+      const before =
+        given.conversationId !== undefined &&
+        given.conversationId !== turn.conversationId
+          ? withoutLost(given)
+          : given;
       // Past every `operator:<n>` the session holds, rather than a count of them: a replay
       // read again replaces rows (`withReplay`), and a count could then mint an id one of
       // the rows it kept already has.
