@@ -36,6 +36,16 @@ export const CLAUDE_CODE_QUESTION_TOOL = "AskUserQuestion";
 /** OpenCode's question tool, whose request is a form (`metadata.kind: "question"`). */
 export const OPENCODE_QUESTION_TOOL = "question";
 
+/**
+ * bit's question tool for Pi, which has none of its own (harness-instances slice 3): offered
+ * by `piBitTools.extension.ts` and answered through Pi's extension-UI channel (`piClient.ts`).
+ * Its input is Claude Code's `AskUserQuestion` shape, so a model that knows one knows both.
+ */
+export const PI_QUESTION_TOOL = "ask_user_question";
+
+/** Which harness's question tool shape a call is read with. */
+export type QuestionTool = "claude-code" | "opencode" | "pi";
+
 const text = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 
@@ -66,9 +76,13 @@ const nonEmpty = (
  * keys an answer goes back under differ too: Claude Code keys answers by the question's
  * text, OpenCode's form by field position (`q0`, `q1`, …, `toField` in its question tool).
  * Neither has a required flag on the tool, and both always take a written answer.
+ *
+ * bit's Pi tool takes Claude Code's shape (`multiSelect`) and is keyed by position, as
+ * OpenCode is: bit chooses the keys, and position keeps two questions of the same words
+ * apart.
  */
 export const questionFieldsOfInput = (
-  tool: "claude-code" | "opencode",
+  tool: QuestionTool,
   input: unknown,
 ): readonly [QuestionField, ...QuestionField[]] | undefined => {
   const questions =
@@ -89,9 +103,9 @@ export const questionFieldsOfInput = (
       seen.add(key);
       const options = optionsOf(record.options);
       const many =
-        tool === "claude-code"
-          ? record.multiSelect === true
-          : record.multiple === true;
+        tool === "opencode"
+          ? record.multiple === true
+          : record.multiSelect === true;
       const kind: QuestionKind =
         options.length === 0 ? "text" : many ? "any" : "one";
       return [
@@ -110,15 +124,15 @@ export const questionFieldsOfInput = (
   return nonEmpty(fields);
 };
 
-/** Which harness's question tool a tool name is, if either. */
-const questionToolOf = (
-  tool: string | null,
-): "claude-code" | "opencode" | undefined =>
+/** Which harness's question tool a tool name is, if any. */
+const questionToolOf = (tool: string | null): QuestionTool | undefined =>
   tool === CLAUDE_CODE_QUESTION_TOOL
     ? "claude-code"
     : tool === OPENCODE_QUESTION_TOOL
       ? "opencode"
-      : undefined;
+      : tool === PI_QUESTION_TOOL
+        ? "pi"
+        : undefined;
 
 /**
  * The question a transcript ends on without an answer, or `undefined` (A7-Q).
@@ -178,6 +192,35 @@ export const unansweredQuestion = (
     return fields === undefined ? undefined : { callId, fields, at: item.at };
   }
   return undefined;
+};
+
+/**
+ * The operator's answers as bit's Pi question tool returns them to the model: every
+ * question in the agent's order, each with what was chosen, what was written, or that it
+ * was skipped. Claude Code's tool answers `"<question>"="<answer>"` pairs; this says the
+ * same in lines a model reads without unquoting, and says which answers are the operator's
+ * own words rather than one of the offered options.
+ */
+export const questionAnswersForAgent = (
+  fields: readonly QuestionField[],
+  answers: Readonly<Record<string, readonly string[]>>,
+): string => {
+  const lines = fields.flatMap((field, index) => {
+    const given = (answers[field.key] ?? [])
+      .map((value) => value.trim())
+      .filter((value) => value !== "");
+    const labels = new Set(field.options.map((option) => option.label));
+    const chosen = given.filter((value) => labels.has(value));
+    const written = given.filter((value) => !labels.has(value));
+    const head = `${String(index + 1)}. ${field.header === null ? "" : `[${field.header}] `}${field.question}`;
+    if (given.length === 0) return [head, "   Not answered."];
+    return [
+      head,
+      ...(chosen.length === 0 ? [] : [`   Chose: ${chosen.join("; ")}`]),
+      ...written.map((value) => `   In their own words: ${value}`),
+    ];
+  });
+  return ["The operator answered your questions:", ...lines].join("\n");
 };
 
 /** Whose session a question is in, as the contract's ids say it. */

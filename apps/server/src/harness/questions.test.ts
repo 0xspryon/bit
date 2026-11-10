@@ -15,6 +15,7 @@ import { Schema } from "effect";
 
 import {
   QUESTION_DISMISSED_MESSAGE,
+  questionAnswersForAgent,
   questionFieldsOfInput,
   unansweredQuestion,
   waitingWords,
@@ -61,6 +62,28 @@ describe("a question tool's input", () => {
       "q1|any",
       "q2|text",
     ]);
+  });
+
+  test("bit's Pi tool takes Claude Code's shape and OpenCode's keys, so same-worded questions stay apart", () => {
+    const pi = questionFieldsOfInput("pi", ASK);
+    expect(pi?.map((field) => `${field.key}|${field.kind}`)).toEqual([
+      "q0|one",
+      "q1|any",
+      "q2|text",
+    ]);
+    // `multiple` is OpenCode's flag, not this tool's.
+    expect(
+      questionFieldsOfInput("pi", {
+        questions: [
+          { question: "Which?", options: [{ label: "a" }], multiple: true },
+        ],
+      })?.[0].kind,
+    ).toBe("one");
+    expect(
+      questionFieldsOfInput("pi", {
+        questions: [{ question: "Same?" }, { question: "Same?" }],
+      })?.map((field) => field.key),
+    ).toEqual(["q0", "q1"]);
   });
 
   test("nothing to ask is no question: no list, an empty one, or questions without text", () => {
@@ -164,6 +187,25 @@ describe("the question a transcript ends on (the `message` fallback's source)", 
     expect(unansweredQuestion([call("Bash")])).toBeUndefined();
   });
 
+  test("bit's Pi tool is read too: a Stop's withdrawal is unanswered, its dismissal is not", () => {
+    expect(
+      unansweredQuestion([
+        call("ask_user_question", "call_7"),
+        result(
+          "failed",
+          "The questions were withdrawn: the turn was stopped before the operator answered.",
+          "call_7",
+        ),
+      ])?.fields.map((field) => field.key),
+    ).toEqual(["q0", "q1", "q2"]);
+    expect(
+      unansweredQuestion([
+        call("ask_user_question", "call_7"),
+        result("failed", QUESTION_DISMISSED_MESSAGE, "call_7"),
+      ]),
+    ).toBeUndefined();
+  });
+
   test("an input cut by the narration cap cannot be read back, and offers nothing", () => {
     expect(
       unansweredQuestion([
@@ -212,6 +254,27 @@ describe("answers, checked once for the dock and the server", () => {
     expect(
       questionAnswersProblem(fields, { "Anything else?": ["x".repeat(4_001)] }),
     ).toContain("longer than");
+  });
+
+  test("as bit's Pi tool tells the model: every question in order, chosen, written or skipped", () => {
+    const fields = questionFieldsOfInput("pi", ASK) ?? [];
+    expect(
+      questionAnswersForAgent(fields, {
+        q0: ["Red"],
+        q1: ["S", "XL please"],
+      }),
+    ).toBe(
+      [
+        "The operator answered your questions:",
+        "1. [Colour] Which colour?",
+        "   Chose: Red",
+        "2. [Sizes] Which sizes?",
+        "   Chose: S",
+        "   In their own words: XL please",
+        "3. Anything else?",
+        "   Not answered.",
+      ].join("\n"),
+    );
   });
 
   test("as a message: one line per answered question, and a plain no when none was", () => {
