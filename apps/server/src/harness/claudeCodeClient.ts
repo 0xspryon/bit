@@ -458,12 +458,6 @@ export interface ClaudeContextUsage {
 }
 
 /**
- * The three SDK entry points this harness calls, as one injectable seam.
- *
- * Bundled rather than three options because they are one dependency — "the Claude Agent
- * SDK" — and a test that replaced one and forgot another would be testing a chimera.
- */
-/**
  * What a history read is told: the project folder, and the caller's abort signal.
  *
  * The signal matters only where a read is work bit owns: an instance with its own config
@@ -476,6 +470,13 @@ export interface HistoryReadOptions {
   readonly signal?: AbortSignal;
 }
 
+/**
+ * The SDK entry points this harness calls — `query` and the four history readers — as one
+ * injectable seam.
+ *
+ * Bundled rather than separate options because they are one dependency — "the Claude Agent
+ * SDK" — and a test that replaced one and forgot another would be testing a chimera.
+ */
 export interface ClaudeCodeSdk {
   readonly query: (params: {
     readonly prompt: AsyncIterable<SDKUserMessage>;
@@ -540,53 +541,71 @@ interface CallSeen {
 /** How many calls {@link SessionRecord.calls} keeps: `apiUsage` is only ever the last. */
 const CALLS_KEPT = 8;
 
-/** Records one main-thread call's prompt side and model, once per call. */
+/**
+ * Records one main-thread call's prompt side and model, once per call.
+ *
+ * A call is kept even while its prompt side reads 0: z.ai's `message_start` and `assistant`
+ * frames carry `usage: { input_tokens: 0, output_tokens: 0 }` and only the `message_delta`
+ * stream event has the call's figure (measured, slice 1 re-check), which
+ * {@link sawPromptSide} then writes onto it. A known figure is never lowered to 0 by a later
+ * frame of the same call. A call at 0 matches no `apiUsage`, which always has a prompt side.
+ */
 const sawCall = (calls: CallSeen[], envelope: unknown): void => {
   const message = envelope as { id?: unknown; usage?: unknown } | undefined;
   const id = message?.id;
   const model = modelOfMessage(message);
   if (typeof id !== "string" || model === undefined) return;
-  if (message?.usage === undefined || message.usage === null) return;
-  const promptTokens = promptTokensOf(message.usage);
-  if (promptTokens <= 0) return;
+  const seen =
+    message?.usage === undefined || message.usage === null
+      ? 0
+      : promptTokensOf(message.usage);
   const at = calls.findIndex((call) => call.id === id);
+  const known = at === -1 ? 0 : (calls[at]?.promptTokens ?? 0);
   if (at !== -1) calls.splice(at, 1);
-  calls.push({ id, promptTokens, model });
+  calls.push({ id, promptTokens: seen > 0 ? seen : known, model });
   if (calls.length > CALLS_KEPT) calls.splice(0, calls.length - CALLS_KEPT);
 };
 
 /**
+ * A main-thread `message_delta`'s usage, written onto the call its `message_start` named
+ * ({@link SessionRecord.streamed}). Where a provider states the prompt side only here
+ * (z.ai), this is what lets a context read's `apiUsage` — which equals it — be matched.
+ * On Anthropic's API the figure is the one `message_start` already had, or 0, which
+ * changes nothing.
+ */
+const sawPromptSide = (
+  calls: CallSeen[],
+  messageId: string | undefined,
+  usage: unknown,
+): void => {
+  if (messageId === undefined || usage === undefined || usage === null) return;
+  const promptTokens = promptTokensOf(usage);
+  if (promptTokens <= 0) return;
+  const at = calls.findIndex((call) => call.id === messageId);
+  const call = at === -1 ? undefined : calls[at];
+  if (call === undefined) return;
+  calls[at] = { ...call, promptTokens };
+};
+
+/**
  * The model of the call `apiUsage` is the usage of ({@link SessionRecord.calls}), or `null`
- * when it cannot be told.
- *
- * By prompt side: the call whose prompt side equals the figure's, or `null` when two of
- * different models do. On Anthropic's API that is the whole rule: a main-thread call's
- * figure equals its frames' (measured), so a figure no call matches is one this stream did
- * not see — a sub-agent's, or a call from before a resume — and nobody says whose it is.
- *
- * `byRecency` is for a provider behind an Anthropic-compatible endpoint whose context read
- * and frames do not agree on the prompt side (z.ai, slice 1's review: 13,475 in the
- * transcript, 13,517 in the context read, so nothing ever matched). For such an instance,
- * when nothing matches and no turn is open, the figure is the newest main-thread call's:
- * at rest `apiUsage` is the last call's. During a turn the newest call may be one
- * `apiUsage` has not moved to yet ({@link SessionRecord.calls}), so no label is given then.
+ * when no call this stream saw has its prompt side — or two of different models do.
  */
 export const modelOfApiUsage = (
   calls: readonly CallSeen[],
   api: CallUsage,
-  turnOpen: boolean,
-  byRecency: boolean,
 ): string | null => {
   const prompt = promptTokensOf(api);
+  // A call still at 0 is one whose figure has not arrived ({@link sawCall}); a figure of 0
+  // is no call's.
+  if (prompt <= 0) return null;
   const models = new Set(
     calls
       .filter((call) => call.promptTokens === prompt)
       .map((call) => call.model),
   );
   const [only] = models;
-  if (models.size === 1 && only !== undefined) return only;
-  if (!byRecency || models.size > 1 || turnOpen) return null;
-  return calls.at(-1)?.model ?? null;
+  return models.size === 1 && only !== undefined ? only : null;
 };
 
 /** Everything one session is, before and after it is running. */
@@ -859,6 +878,9 @@ interface SessionRecord {
    * it equals, and with nothing when no call seen matches. Recorded from `message_start` and
    * `assistant` frames alike: both carry that call's prompt side under its own model, and the
    * earlier one covers an answer that has moved before this stream has read the frame.
+   * And from the main thread's `message_delta`: a provider behind an Anthropic-compatible
+   * endpoint may state the prompt side only there (z.ai sends zeros on the other two,
+   * measured in slice 1's re-check), and its `apiUsage` equals that figure.
    */
   calls: CallSeen[];
   /**
@@ -2407,6 +2429,15 @@ const narrate = (
     if (message.event.type === "message_start" && !fromSubagent(message)) {
       sawCall(session.calls, message.event.message);
     }
+    // Read before `narrateStreamEvent` moves on: the call this delta closes is the one the
+    // last `message_start` named.
+    if (message.event.type === "message_delta" && !fromSubagent(message)) {
+      sawPromptSide(
+        session.calls,
+        session.streamed.messageId,
+        message.event.usage,
+      );
+    }
     return narrateStreamEvent(message, session.streamed).map(frame);
   }
   // A thinking-progress estimate narrates nothing either, for the same reason: the CLI sends
@@ -3621,13 +3652,6 @@ export const claudeCodeHarness = (
           : (catalogue[0]?.id ?? CLAUDE_CODE_DEFAULT_MODEL));
       /** Frame spellings back to catalogue ids; see `modelSpellings.ts`. */
       const spellings = modelSpellings(options.models ?? catalogue);
-      /**
-       * Whether a context figure no call matches is labelled with the newest call
-       * ({@link modelOfApiUsage}): only off Anthropic's API, where the figures are known
-       * not to agree.
-       */
-      const labelsByRecency =
-        (options.provider ?? CLAUDE_CODE_PROVIDER) !== CLAUDE_CODE_PROVIDER;
       /**
        * What every CLI of this instance is given beyond the server's environment (which
        * `spawnOwnedCli` scrubs of bit's own settings). `undefined` when nothing is, so the
@@ -5311,12 +5335,7 @@ export const claudeCodeHarness = (
               record === undefined
                 ? null
                 : (spellings.toCatalogue(
-                    modelOfApiUsage(
-                      record.calls,
-                      api,
-                      record.turnOpen,
-                      labelsByRecency,
-                    ) ?? undefined,
+                    modelOfApiUsage(record.calls, api) ?? undefined,
                     record.model,
                   ) ?? null),
             ...(model === undefined ? {} : { model }),

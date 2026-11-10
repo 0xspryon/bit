@@ -421,18 +421,52 @@ describe("an aliasing provider's model spellings", () => {
     expect(usage.usedModel).toBe("sonnet");
   });
 
-  test("a live figure whose prompt side matches no call is labelled with the newest call at rest", async () => {
-    // z.ai's context read and its frames disagree on the prompt side (13,517 against
-    // 13,475 in slice 1's review), so no call matches by figure.
-    const { sdk } = scriptedSdk({
-      messages: [init("glm-5.3-flash"), assistant("glm-5.3-flash"), success],
-      contextModel: "glm-5.3-flash",
-      apiUsage: {
-        input_tokens: 52,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-        output_tokens: 1,
+  test("a z.ai call's figure, stated only on message_delta, labels the live context read", async () => {
+    // z.ai's frames as measured (slice 1 re-check): `message_start` and the `assistant`
+    // frame carry zero usage, and only the `message_delta` stream event has the call's
+    // prompt side, which `getContextUsage().apiUsage` equals.
+    const zero = { input_tokens: 0, output_tokens: 0 };
+    const stream = (event: unknown): SDKMessage =>
+      ({
+        type: "stream_event",
+        event,
+        parent_tool_use_id: null,
+        session_id: "s",
+        uuid: "00000000-0000-4000-8000-0000000000aa",
+      }) as unknown as SDKMessage;
+    const zeroAssistant = {
+      ...(assistant("glm-5.3-flash") as unknown as Record<string, unknown>),
+      message: {
+        id: "msg_1",
+        role: "assistant",
+        model: "glm-5.3-flash",
+        content: [{ type: "text", text: "OK" }],
+        usage: zero,
       },
+    } as unknown as SDKMessage;
+    const figure = {
+      input_tokens: 2_208,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 7_424,
+      output_tokens: 5,
+    };
+    const { sdk } = scriptedSdk({
+      messages: [
+        init("glm-5.3-flash"),
+        stream({
+          type: "message_start",
+          message: { id: "msg_1", model: "glm-5.3-flash", usage: zero },
+        }),
+        zeroAssistant,
+        stream({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: figure,
+        }),
+        success,
+      ],
+      contextModel: "glm-5.3-flash",
+      apiUsage: figure,
       stayOpen: true,
     });
     const usage = await withHarness({ ...ZAI, sdk }, (harness) =>
@@ -447,6 +481,7 @@ describe("an aliasing provider's model spellings", () => {
       }),
     );
     expect(usage.reading).toBe("measured");
+    expect(usage.used).toBe(2_208 + 7_424 + 5);
     expect(usage.usedModel).toBe("sonnet");
   });
 
@@ -472,6 +507,47 @@ describe("an aliasing provider's model spellings", () => {
   });
 });
 
+describe("a history read the caller gives up on", () => {
+  // The worker reader kills its child on this signal (`claudeHistory.ts`); this checks that
+  // the client hands each read the signal of the Effect that asked for it.
+  const hanging = () => {
+    const signals: AbortSignal[] = [];
+    const { sdk: base } = scriptedSdk();
+    const remember = (signal: AbortSignal | undefined) => {
+      if (signal !== undefined) signals.push(signal);
+      return new Promise<never>(() => {});
+    };
+    const sdk: ClaudeCodeSdk = {
+      ...base,
+      sessionInfo: (_id, { signal }) => remember(signal),
+      sessionMessages: (_id, { signal }) => remember(signal),
+    };
+    return { sdk, signals };
+  };
+
+  test("a title read past its budget aborts the read", async () => {
+    const { sdk, signals } = hanging();
+    await withHarness({ ...ZAI, sdk }, (harness) =>
+      harness
+        .sessionTitle(newClaudeCodeSessionId())
+        .pipe(Effect.timeout("50 millis"), Effect.ignore),
+    );
+    expect(signals.length).toBe(1);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  test("a transcript read past its budget aborts the read", async () => {
+    const { sdk, signals } = hanging();
+    await withHarness({ ...ZAI, sdk }, (harness) =>
+      harness
+        .messages(newClaudeCodeSessionId())
+        .pipe(Effect.timeout("50 millis"), Effect.ignore),
+    );
+    expect(signals.length).toBe(1);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+});
+
 describe("modelOfApiUsage", () => {
   const calls = [
     { id: "msg_a", promptTokens: 1_000, model: "glm-5.3" },
@@ -479,20 +555,18 @@ describe("modelOfApiUsage", () => {
   ];
   const usage = (input: number) => ({ input_tokens: input, output_tokens: 3 });
 
-  test("a figure equal to a call's prompt side is that call's, open turn or not", () => {
-    expect(modelOfApiUsage(calls, usage(1_000), false, true)).toBe("glm-5.3");
-    expect(modelOfApiUsage(calls, usage(1_000), true, true)).toBe("glm-5.3");
+  test("a figure equal to a call's prompt side is that call's", () => {
+    expect(modelOfApiUsage(calls, usage(1_000))).toBe("glm-5.3");
   });
 
-  test("at rest, a figure matching no call is the newest call's", () => {
-    expect(modelOfApiUsage(calls, usage(2_042), false, true)).toBe(
-      "glm-5.3-flash",
-    );
+  test("a figure matching no call is nobody's", () => {
+    // A call this stream did not see: a sub-agent's, or one from before a resume.
+    expect(modelOfApiUsage(calls, usage(2_042))).toBeNull();
   });
 
-  test("during a turn, a figure matching no call is unlabelled", () => {
-    // The newest call may have started before `apiUsage` moved to it.
-    expect(modelOfApiUsage(calls, usage(2_042), true, true)).toBeNull();
+  test("a call whose figure is still 0 matches nothing", () => {
+    const pending = [{ id: "msg_c", promptTokens: 0, model: "glm-5.3" }];
+    expect(modelOfApiUsage(pending, usage(0))).toBeNull();
   });
 
   test("two calls of different models with the figure's prompt side leave it unlabelled", () => {
@@ -500,17 +574,6 @@ describe("modelOfApiUsage", () => {
       { id: "msg_a", promptTokens: 1_000, model: "glm-5.3" },
       { id: "msg_b", promptTokens: 1_000, model: "glm-5.3-flash" },
     ];
-    expect(modelOfApiUsage(tied, usage(1_000), false, true)).toBeNull();
-  });
-
-  test("on Anthropic's API a figure matching no call is nobody's, even at rest", () => {
-    // Its figures equal its calls' (measured), so a mismatch is a call this stream did not
-    // see: a sub-agent's, or one from before a resume.
-    expect(modelOfApiUsage(calls, usage(2_042), false, false)).toBeNull();
-    expect(modelOfApiUsage(calls, usage(1_000), false, false)).toBe("glm-5.3");
-  });
-
-  test("no call seen leaves it unlabelled", () => {
-    expect(modelOfApiUsage([], usage(1_000), false, true)).toBeNull();
+    expect(modelOfApiUsage(tied, usage(1_000))).toBeNull();
   });
 });
