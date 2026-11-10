@@ -80,6 +80,9 @@ export const OPENCODE_DRIVER: DriverKind = DriverKind.make("opencode");
 /** The Claude Agent SDK (`harness/claudeCodeClient.ts`). */
 export const CLAUDE_CODE_DRIVER: DriverKind = DriverKind.make("claude-code");
 
+/** `pi --mode rpc`, one process per session (`harness/piClient.ts`). */
+export const PI_DRIVER: DriverKind = DriverKind.make("pi");
+
 /**
  * The instance id a driver's one stock configuration gets: the driver slug itself.
  *

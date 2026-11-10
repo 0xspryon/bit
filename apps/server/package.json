@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/main.ts",
-    "build": "bun build src/main.ts src/harness/claudeHistoryWorker.ts --target=bun --packages=external --outdir=dist --entry-naming=[name].[ext]",
+    "build": "bun build src/main.ts src/harness/claudeHistoryWorker.ts src/harness/piBitTools.extension.ts --target=bun --packages=external --outdir=dist --entry-naming=[name].[ext]",
     "start": "bun dist/main.js",
     "typecheck": "tsc -p tsconfig.json",
     "test": "bun test",

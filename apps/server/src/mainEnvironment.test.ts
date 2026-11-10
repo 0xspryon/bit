@@ -31,10 +31,12 @@
  * `bun run dev` as one read here, so the enumeration is over the modules rather than over
  * one file, and what the test guarantees now matches what its name claims.
  *
- * Two kinds of file are left out, both deliberately and both named in code below: a
- * `*.test.ts` (a suite's own environment is not this server's configuration) and anything
+ * Three kinds of file are left out, all deliberately and all named in code below: a
+ * `*.test.ts` (a suite's own environment is not this server's configuration), anything
  * under `spike/` (run by hand, never by `bun run dev` — DECISIONS.md §24 records what each
- * one measured).
+ * one measured), and a `*.extension.ts` (an agent harness's extension, loaded by the harness
+ * inside its own process: `harness/piBitTools.extension.ts` reads what `piClient.ts` gives
+ * the Pi process it starts, never this server's environment).
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
@@ -71,6 +73,9 @@ const serverModules = (): readonly { path: string; source: string }[] => {
       // `ANTHROPIC_API_KEY` to prove it is *not* inherited, and that is not configuration
       // an operator passes in.
       if (entry.name.endsWith(".test.ts")) continue;
+      // A harness extension runs in the harness's process, not this one: what it reads is
+      // what the driver that starts that process sets, never an operator's setting.
+      if (entry.name.endsWith(".extension.ts")) continue;
       found.push({ path, source: readFileSync(path, "utf8") });
     }
   };
