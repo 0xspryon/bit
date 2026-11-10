@@ -18,7 +18,7 @@
  * What an owner supplies is its words ({@link ConversationChatWords}): every sentence that
  * names its agent or its own pages. The importer's are in `ImporterChat.svelte`.
  */
-import type { LiveConnection } from "@bit/contracts";
+import type { LiveConnection, LiveRetry } from "@bit/contracts";
 
 import type {
   ChatQuestion,
@@ -28,7 +28,7 @@ import type {
   OpenChatComposer,
   ThreadTurn,
 } from "./chatShell";
-import { connectionNote } from "./chat";
+import { connectionNote, retryNote } from "./chat";
 import type { LoadedFile } from "./attachmentFiles";
 import type { ConversationSession, SendNowTiming } from "./conversationChat";
 import type { ConversationSessions } from "./conversationSessions.svelte";
@@ -71,6 +71,8 @@ export interface ChatSessionInput<S extends ConversationSession> {
   readonly endedReason: string;
   /** The server's last word on one period's narration connection, if any. */
   readonly connection: (conversationId: string) => LiveConnection | undefined;
+  /** A provider's refusal the period's harness is retrying, if any (`LiveRetry`). */
+  readonly retry?: (conversationId: string) => LiveRetry | undefined;
   /**
    * The note and the placeholder for an owner nothing can be sent to at all — the
    * importer's "no model to run on". Read only while the state says so
@@ -245,6 +247,10 @@ export const chatSessionOf = <S extends ConversationSession>(
       return connectionNote(
         id === undefined ? undefined : input.connection(id),
       );
+    },
+    get status() {
+      const id = session()?.conversationId;
+      return retryNote(id === undefined ? undefined : input.retry?.(id));
     },
     get turn() {
       const current = session();

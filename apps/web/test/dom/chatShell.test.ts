@@ -44,6 +44,7 @@ interface Options {
   readonly fields?: readonly QuestionField[];
   readonly answerability?: QuestionAnswerability;
   readonly canMessage?: boolean;
+  readonly status?: string;
 }
 
 /** The fake chat, mounted; `calls` is what the shell asked the adapter to do. */
@@ -447,5 +448,19 @@ describe("files", () => {
     await settle();
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
     expect(document.activeElement === plus).toBe(true);
+  });
+});
+
+describe("a passing status line (harness instances, slice 1)", () => {
+  test("a provider's retry is said over the thread as a status, and nothing without one", async () => {
+    const { root } = await shell({
+      status: "The provider refused (429). Retrying, attempt 3 of 10, in 2 s.",
+    });
+    const line = root.querySelector('p.status[role="status"]');
+    expect(line?.textContent).toBe(
+      "The provider refused (429). Retrying, attempt 3 of 10, in 2 s.",
+    );
+    const quiet = await shell();
+    expect(quiet.root.querySelector("p.status")).toBeNull();
   });
 });

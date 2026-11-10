@@ -50,6 +50,7 @@ import {
   type ImporterSessionView,
   type IntentView,
   type LiveConnection,
+  type LiveRetry,
   type LiveFrame,
   type LiveItem,
   type LiveUsage,
@@ -1533,6 +1534,15 @@ export class App {
   liveConnection = $state<Record<string, LiveConnection>>({});
 
   /**
+   * A provider's refusal each session's harness is retrying, keyed by {@link usageScope}: the
+   * last {@link LiveRetry} for it. A chat shows `retryNote` of its own session's as a
+   * passing status line. Gone at the session's next words, call or tool, at its turn's end,
+   * and when the server lets the session go — a retry that worked leaves nothing to say, and
+   * one that did not ends the turn with the provider's error, which is an item.
+   */
+  liveRetry = $state<Record<string, LiveRetry>>({});
+
+  /**
    * The goal whose conversation was read again on a `restored` while its turn ran, so its
    * turn's end reads it once more: a replay read mid-turn may lack the block still being
    * written, as `importerSessions`' `#readMidTurn` records for the importer.
@@ -2802,6 +2812,14 @@ export class App {
    * index row or an `import_ended` replay, and an accepted message that `opened` or
    * `resumed` the session — and each clears the entry here.
    */
+  /** Drops a session's retry status: something newer has happened on it. */
+  #forgetRetry(scope: string | undefined) {
+    if (scope === undefined || !(scope in this.liveRetry)) return;
+    this.liveRetry = Object.fromEntries(
+      Object.entries(this.liveRetry).filter(([key]) => key !== scope),
+    );
+  }
+
   #forgetConnection(scope: string) {
     if (!(scope in this.liveConnection)) return;
     this.liveConnection = Object.fromEntries(
@@ -5587,6 +5605,7 @@ export class App {
       this.liveCursor = 0;
       this.liveUsage = {};
       this.liveConnection = {};
+      this.liveRetry = {};
       this.liveRecoveries = [];
       this.#shown = new Set();
       this.#shownOrder = [];
@@ -5699,6 +5718,7 @@ export class App {
     this.liveItems = [];
     this.liveUsage = {};
     this.liveConnection = {};
+    this.liveRetry = {};
     this.liveCursor = 0;
     this.liveCaughtUp = false;
     this.liveSkipped = 0;
@@ -5825,6 +5845,18 @@ export class App {
       this.liveCaughtUp = frame.caughtUp;
       return;
     }
+    if (frame._tag === "retry") {
+      // The provider refused a call and the harness will ask again: a passing status on
+      // the session's chat until something newer happens on it (`liveRetry`).
+      const scope = usageScope(frame);
+      if (scope !== undefined) {
+        this.liveRetry = { ...this.liveRetry, [scope]: frame };
+      }
+      return;
+    }
+    // Anything else about a session makes its retry status stale: a call that answered,
+    // its words, its turn's end, the server letting it go.
+    this.#forgetRetry(usageScope(frame));
     if (frame._tag === "turnEnded") {
       // A session's turn ended: its row has gone from running to idle, which no item says
       // when the turn's last entry renders nothing (`LiveTurnEnded`, A7 U8b review).

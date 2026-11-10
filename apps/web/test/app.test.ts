@@ -3761,6 +3761,53 @@ describe("the goal conversation", () => {
     await settle();
     expect(fake.countOf("goalConversation")).toBe(asked + 2);
   });
+
+  test("a provider's retry stands until the session says anything else (harness instances, slice 1)", async () => {
+    const [app] = await onGoal();
+    const subject = {
+      attemptId: null,
+      roundId: null,
+      goalId: "goal_1",
+      importId: null,
+      at: Date.now(),
+    };
+    const retry = (attempt: number) => ({
+      _tag: "retry" as const,
+      attempt,
+      maxRetries: 10,
+      delayMs: 2_000,
+      status: 429,
+      error: "rate_limit",
+      ...subject,
+    });
+    app.applyLiveFrame("acme-corp", retry(1));
+    app.applyLiveFrame("acme-corp", retry(2));
+    expect(app.liveRetry["goal:goal_1"]?.attempt).toBe(2);
+    // Another session's frame leaves it standing.
+    app.applyLiveFrame("acme-corp", {
+      _tag: "turnEnded",
+      ...subject,
+      goalId: null,
+      roundId: "rnd_1",
+    });
+    expect(app.liveRetry["goal:goal_1"]?.attempt).toBe(2);
+    // The call answered: its usage clears it.
+    app.applyLiveFrame("acme-corp", {
+      _tag: "usage",
+      callId: "msg_1",
+      promptTokens: 10,
+      outputTokens: null,
+      contextLimit: null,
+      compactionAt: null,
+      model: null,
+      ...subject,
+    });
+    expect(app.liveRetry["goal:goal_1"]).toBeUndefined();
+    // And a turn's end, when the retries ran out.
+    app.applyLiveFrame("acme-corp", retry(1));
+    app.applyLiveFrame("acme-corp", { _tag: "turnEnded", ...subject });
+    expect(app.liveRetry["goal:goal_1"]).toBeUndefined();
+  });
 });
 
 /* ── The context meter ───────────────────────────────────────────────────────── */

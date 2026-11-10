@@ -41,6 +41,7 @@
     answerability = "live",
     canMessage = true,
     floating = false,
+    status = "",
   }: {
     calls: string[];
     closed?: string | undefined;
@@ -63,6 +64,8 @@
     canMessage?: boolean;
     /** The composer floats over the thread (`ChatShell`'s `floating`). */
     floating?: boolean;
+    /** A passing status line (`ChatSession.status`). */
+    status?: string;
   } = $props();
 
   // The page's title bar chips, as `+page.svelte` provides them, drawn in a stand-in bar.
@@ -241,6 +244,9 @@
     },
     note: "",
     connection: "",
+    get status() {
+      return status;
+    },
     get turn() {
       return { working, background: false, stopping, since };
     },

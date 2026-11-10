@@ -40,6 +40,7 @@ import type {
   GoalConversationView,
   GoalNarrationView,
   LiveConnection,
+  LiveRetry,
   LiveItem,
   LiveUsage,
   MessageAttachmentView,
@@ -2004,6 +2005,26 @@ export const connectionNote = (
     : frame.state === "reconnecting"
       ? "The harness's live narration was cut off; reconnecting. What it says meanwhile is read back from its transcript once the connection is up again."
       : "The harness's live narration could not be reconnected, and is still being retried. The agent may be working all the same: reload the page to see what its transcript holds.";
+
+/**
+ * What a chat says while its harness retries a call the provider refused (`LiveRetry`):
+ * "The provider refused (429). Retrying, attempt 3 of 10, in 2 s.", or `""` with no retry
+ * pending. The provider's own words are not in the frame — the harness does not send them on
+ * a retry — so the status code is what there is.
+ */
+export const retryNote = (
+  frame:
+    | Pick<LiveRetry, "attempt" | "maxRetries" | "delayMs" | "status">
+    | undefined,
+): string => {
+  if (frame === undefined) return "";
+  const seconds = Math.max(1, Math.round(frame.delayMs / 1000));
+  const refused =
+    frame.status === null
+      ? "The provider did not answer."
+      : `The provider refused (${String(frame.status)}).`;
+  return `${refused} Retrying, attempt ${String(frame.attempt)} of ${String(frame.maxRetries)}, in ${String(seconds)} s.`;
+};
 
 /** The key a pane asks the usage map for. See {@link usageScope}. */
 export const roundUsageScope = (roundId: string): string => `round:${roundId}`;

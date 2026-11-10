@@ -471,6 +471,7 @@
       composerResting={composerResting(session)}
       note={session.note}
       detail={session.connection}
+      status={session.status ?? ""}
       empty={session.empty}
       separator={separator ?? bubble}
       tail={tail ?? cursor}

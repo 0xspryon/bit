@@ -427,6 +427,8 @@
     endedReason: "import_ended",
     connection: (importId) =>
       app.liveConnection[importer.binding.connectionKey(importId)],
+    retry: (importId) =>
+      app.liveRetry[importer.binding.connectionKey(importId)],
     unavailable: () =>
       noModel
         ? {

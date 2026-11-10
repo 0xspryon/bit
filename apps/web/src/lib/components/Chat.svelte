@@ -71,6 +71,7 @@
     composer,
     meter,
     detail = "",
+    status = "",
     empty,
     layout = "panel",
     floating = false,
@@ -155,6 +156,8 @@
     meter?: Snippet;
     /** A sentence about the whole chat, when something is wrong with reading it. */
     detail?: string;
+    /** A passing status about the session (a provider's refusal being retried), or `""`. */
+    status?: string;
     /** What to say when there is no conversation at all. */
     empty: string;
     /**
@@ -399,6 +402,11 @@
 
   {#if detail !== ""}
     <p class="detail" role="alert">{detail}</p>
+  {/if}
+
+  <!-- A passing status: a provider's refusal the harness is retrying. -->
+  {#if status !== ""}
+    <p class="status" role="status">{status}</p>
   {/if}
 
   <!--
@@ -649,7 +657,8 @@
   .note,
   .empty,
   .footnote,
-  .detail {
+  .detail,
+  .status {
     margin: 0;
     font-size: 11px;
     line-height: var(--lh-compact);
@@ -657,6 +666,9 @@
   }
   .detail {
     color: var(--state-fg-danger);
+  }
+  .status {
+    color: var(--state-fg-warning);
   }
   /*
    * Tall, because during a round this is the screen. Bounded, because the page under it has

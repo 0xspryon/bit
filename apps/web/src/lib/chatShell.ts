@@ -285,6 +285,11 @@ export interface ChatSession<Subject extends ThreadTurn = ThreadTurn> {
    * `connectionNote`), or `""`. Said over the thread as an alert.
    */
   readonly connection: string;
+  /**
+   * A passing status about the session, said over the thread as a status line, or `""`:
+   * the provider refused a call and the harness is retrying it (`retryNote`). Absent: none.
+   */
+  readonly status?: string | undefined;
   readonly turn: ChatTurnState;
   /** Interrupts the running turn or background work. Absent: no Stop. */
   readonly stop?: (() => void) | undefined;

@@ -26,6 +26,7 @@ import {
 import {
   CHAT_ROUNDS_SHOWN,
   OPERATOR_TURN_KIND,
+  retryNote,
   activityOrder,
   buildChat,
   buildGoalConversation,
@@ -1620,5 +1621,21 @@ describe("U4: a turn footer's facts", () => {
     expect(durationLabel(400)).toBe("0s");
     expect(durationLabel(125_000)).toBe("2m 05s");
     expect(durationLabel(3_720_000)).toBe("1h 02m");
+  });
+});
+
+describe("a provider's retry (harness instances, slice 1)", () => {
+  test("names the status, the attempt and the wait", () => {
+    expect(
+      retryNote({ attempt: 3, maxRetries: 10, delayMs: 2_150, status: 429 }),
+    ).toBe("The provider refused (429). Retrying, attempt 3 of 10, in 2 s.");
+  });
+  test("a connection that never answered has no status to name", () => {
+    expect(
+      retryNote({ attempt: 1, maxRetries: 1, delayMs: 300, status: null }),
+    ).toBe("The provider did not answer. Retrying, attempt 1 of 1, in 1 s.");
+  });
+  test("says nothing with no retry pending", () => {
+    expect(retryNote(undefined)).toBe("");
   });
 });
