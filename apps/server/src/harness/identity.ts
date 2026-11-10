@@ -179,6 +179,12 @@ export interface HarnessInstance {
    * second declaration would be a second thing to keep true.
    */
   readonly models: readonly HarnessModelView[];
+  /**
+   * Something the operator should know about a *ready* instance, in a sentence: today, a
+   * Pi instance whose sessions run uncontained because the server could not reach the
+   * systemd user manager (`piClient.ts`). Absent when there is nothing to say.
+   */
+  readonly notice?: string | undefined;
 }
 
 /**

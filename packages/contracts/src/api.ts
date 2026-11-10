@@ -1213,6 +1213,12 @@ export const HarnessInstanceView = Schema.Struct({
    * provider genuinely differ — see `modelOption.ts`.
    */
   models: Schema.Array(HarnessModelView),
+  /**
+   * Something the operator should know about an instance that *is* ready, in a sentence —
+   * a Pi instance whose sessions run without their own cgroup, say. Absent when there is
+   * nothing to say.
+   */
+  notice: Schema.optional(Schema.String),
 });
 export type HarnessInstanceView = typeof HarnessInstanceView.Type;
 

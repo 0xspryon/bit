@@ -298,6 +298,7 @@ describe("a Pi instance", () => {
             { id: "zai/glm-5.3-flash", label: "GLM-5.3 Flash" },
             { id: "zai/glm-5.3" },
           ],
+          memoryMax: "2G",
         },
         { id: "pi", driver: "pi" },
       ],
@@ -315,12 +316,14 @@ describe("a Pi instance", () => {
         { id: "zai/glm-5.3" },
       ],
       defaultModel: "zai/glm-5.3-flash",
+      memoryMax: "2G",
     });
     expect(result.instances[1]).toMatchObject({
       driver: "pi",
       displayName: "Pi",
       models: undefined,
       defaultModel: undefined,
+      memoryMax: undefined,
     });
   });
 
@@ -350,6 +353,20 @@ describe("a Pi instance", () => {
         ],
       }),
     ).toContain("reportedAs");
+  });
+
+  test("a memory limit that is not systemd's whole-number spelling is refused", () => {
+    for (const memoryMax of ["2GB", "1.5G", "0", "-1G", "lots", "50%"]) {
+      expect(
+        refusal({ instances: [{ id: "p", driver: "pi", memoryMax }] }),
+      ).toContain("instances[0].memoryMax");
+    }
+    for (const memoryMax of ["512M", "2G", "1073741824"]) {
+      const result = decode({
+        instances: [{ id: "p", driver: "pi", memoryMax }],
+      });
+      expect(result._tag).toBe("configured");
+    }
   });
 
   test("a default that is not one of its models is refused", () => {

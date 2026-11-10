@@ -68,6 +68,10 @@
  *   labels. Absent: every model Pi lists for the providers it holds credentials for, read
  *   once at startup (`piClient.ts`). Pi's frames name a model the way it was asked for, so
  *   there is no `reportedAs`.
+ * - `memoryMax` (Pi): a cap on each session's systemd scope — Pi and everything it starts —
+ *   in systemd's spelling (`2G`, `512M`: a whole number, then K, M, G or T), with no swap.
+ *   A session over it is stopped whole and ends as a process death that says so
+ *   (`userScopes.ts`). Absent: no cap. Not applied when the server runs without systemd.
  *
  * Unknown keys are refused rather than ignored: a misspelt `configdir` would otherwise run
  * the instance on the operator's default login without a word.
@@ -137,6 +141,14 @@ const PiEntry = Schema.Struct({
   agentDir: Schema.optionalKey(Trimmed),
   models: Schema.optionalKey(Schema.NonEmptyArray(PiModel)),
   defaultModel: Schema.optionalKey(Trimmed),
+  memoryMax: Schema.optionalKey(
+    Trimmed.check(
+      Schema.isPattern(/^[1-9][0-9]*[KMGT]?$/, {
+        message:
+          "a memory limit is a whole number of bytes, or of K, M, G or T, like 2G",
+      }),
+    ),
+  ),
 });
 
 /** The file's outer shape. Entries are decoded one at a time, by driver, for the sentence. */
@@ -173,6 +185,8 @@ export interface PiInstanceConfig {
   readonly agentDir: string | undefined;
   readonly models: readonly PiModel[] | undefined;
   readonly defaultModel: string | undefined;
+  /** The cap on each session's scope (`2G`); `undefined` for none. */
+  readonly memoryMax: string | undefined;
 }
 
 export type InstanceConfig =
@@ -411,6 +425,7 @@ export const decodeInstanceConfig = (
         agentDir: entry.agentDir,
         models,
         defaultModel: entry.defaultModel ?? models?.[0]?.id,
+        memoryMax: entry.memoryMax,
       });
     } else {
       return invalid(
