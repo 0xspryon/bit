@@ -20,8 +20,9 @@
  *   message with `stopReason: "error"` and then a `context_edit` taking it out of the model's
  *   context (measured, a 429 retried three times). Live, those attempts are `retry` status
  *   lines and only the last one's error is a row; the replay keeps that shape.
- * - **An aborted message is the interrupt marker** ({@link PI_INTERRUPT_MARKER_TEXT}), live
- *   and replayed: Pi stores a Stop as an assistant message with `stopReason: "aborted"`.
+ * - **An aborted message is the interrupt marker**: Pi stores a cut turn as an assistant
+ *   message with `stopReason: "aborted"`. Live it reads {@link PI_INTERRUPT_MARKER_TEXT};
+ *   replayed, {@link PI_STOPPED_REPLAY_TEXT}, because the file does not say who cut it.
  *
  * ## The event stream (`docs/json.md`)
  *
@@ -61,6 +62,15 @@ export const piCompactionAt = (contextWindow: number): number | undefined =>
 
 /** The words a Stop leaves in a Pi conversation, live and replayed. */
 export const PI_INTERRUPT_MARKER_TEXT = "The operator stopped this turn.";
+
+/**
+ * The same marker in a replay, where the cause is not known: Pi stores a turn cut by bit's
+ * Stop and a turn cut by its process ending (a server shutdown, or Pi seeing its input
+ * close after a server SIGKILL) the same way, as `stopReason: "aborted"` (slice 2 review,
+ * M2). Only the live stream, where the driver sent the `abort`, can say the operator did.
+ */
+export const PI_STOPPED_REPLAY_TEXT =
+  "This turn was stopped before it finished.";
 
 /** The marker a Stop is drawn as: Claude Code's interrupt marker's (`MessageEntry.marker`). */
 const INTERRUPTED = "interrupted";
@@ -434,7 +444,7 @@ export const piMessageEntries = (
       if (message.stopReason === "aborted") {
         out.push({
           type: "user",
-          text: PI_INTERRUPT_MARKER_TEXT,
+          text: PI_STOPPED_REPLAY_TEXT,
           error: undefined,
           parts: [],
           model: undefined,

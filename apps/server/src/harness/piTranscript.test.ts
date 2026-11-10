@@ -4,6 +4,7 @@ import type { HarnessNarration } from "./agentHarness";
 import { attachmentReader } from "./attachments";
 import {
   PI_INTERRUPT_MARKER_TEXT,
+  PI_STOPPED_REPLAY_TEXT,
   PiNarrator,
   PiTranscriptError,
   lastMeasuredCall,
@@ -188,7 +189,9 @@ describe("piMessageEntries", () => {
       ["user", "interrupted", undefined],
     ]);
     expect(replay[1]?.text).toBe("half a rep");
-    expect(replay[2]?.text).toBe(PI_INTERRUPT_MARKER_TEXT);
+    // The file cannot say who cut the turn, so the replay does not claim the operator did.
+    expect(replay[2]?.text).toBe(PI_STOPPED_REPLAY_TEXT);
+    expect(PI_STOPPED_REPLAY_TEXT).not.toBe(PI_INTERRUPT_MARKER_TEXT);
   });
 
   test("tool calls and results are parts, and a compaction is its summary", () => {
