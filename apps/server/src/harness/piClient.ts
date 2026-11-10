@@ -75,8 +75,13 @@
  * answer or dismissal is written back as the dialog's value and becomes the tool's result.
  * **Every other dialog is still cancelled at once**: nobody is at a terminal to answer an
  * operator's own extension, and Pi would wait on it. The key is how the two are told apart,
- * never the words on the dialog; it is not a secret (an extension of the same process could
- * read it), only an id no other extension would choose.
+ * never the words on the dialog. **It is not a secret**: an extension of the same process can
+ * read it, and so can the agent's own shells, from `/proc/<pid>/environ` (slice 3 review,
+ * measured). It is only an id no other extension would choose. Knowing it does not let a
+ * shell fake a question: a dialog is a record on Pi's stdout, a socket only this driver
+ * reads, and a shell opening `/proc/<pi>/fd/1` to write to it gets ENXIO. An extension the
+ * operator installed can open one, and is trusted as the operator's own code is. A second
+ * dialog for a call already held is cancelled, never put in the first one's place.
  *
  * A held question is withdrawn when its tool call ends without bit's answer (a Stop aborts
  * the tool's signal, which resolves the dialog empty; Pi's own day-long timeout does the
@@ -1017,6 +1022,13 @@ export const piHarness = (
           return;
         }
         const questionId = callId ?? dialogId;
+        // A second dialog for a call already held (an extension of the operator's that
+        // knows the key can open one): cancelled, so the first stays the one the operator
+        // answers and its dialog is not orphaned under a replaced entry.
+        if (record.questions.has(questionId)) {
+          dialogResponse(rpc, dialogId, { cancelled: true });
+          return;
+        }
         const question: HarnessQuestion = {
           questionId,
           fields,

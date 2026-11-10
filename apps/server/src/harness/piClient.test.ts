@@ -1099,6 +1099,205 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
     }
   });
 
+  test("two question calls in one message are docked one after the other, each answered, and the turn completes (slice 3 fix, M1)", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      const one = { questions: [{ question: "Which colour?" }] };
+      const two = { questions: [{ question: "Which size?" }] };
+      await Effect.runPromise(
+        f.harness.prompt(
+          ref.id,
+          S([
+            {
+              tools: [
+                { tool: "ask_user_question", args: one },
+                { tool: "ask_user_question", args: two },
+              ],
+            },
+            { text: "both answered" },
+          ]),
+        ),
+      );
+      await until(() => details(seen, "question").length > 0, "the first");
+      // Both calls are in one message: the model asked them at once.
+      expect(details(seen, "toolCall").map((call) => call.tool)).toEqual([
+        "ask_user_question",
+        "ask_user_question",
+      ]);
+      // One at a time: the second is not asked while the first waits.
+      await Bun.sleep(300);
+      const first = details(seen, "question")[0]?.question;
+      expect(first?.fields[0]?.question).toBe("Which colour?");
+      expect(
+        (await Effect.runPromise(f.harness.pendingQuestions(ref.id))).map(
+          (each) => each.questionId,
+        ),
+      ).toEqual([first?.questionId ?? ""]);
+      await Effect.runPromise(
+        f.harness.answerQuestion(ref.id, first?.questionId ?? "", {
+          q0: ["Blue"],
+        }),
+      );
+      await until(() => details(seen, "question").length > 1, "the second");
+      const second = details(seen, "question")[1]?.question;
+      expect(second?.fields[0]?.question).toBe("Which size?");
+      expect(second?.questionId).not.toBe(first?.questionId);
+      await Effect.runPromise(
+        f.harness.answerQuestion(ref.id, second?.questionId ?? "", {
+          q0: ["Large"],
+        }),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await until(() => outcomes(seen).length > 0, "the turn's end");
+      expect(outcomes(seen)).toEqual(["succeeded"]);
+      expect(
+        details(seen, "questionSettled").map((each) => [
+          each.questionId,
+          each.settled,
+        ]),
+      ).toEqual([
+        [first?.questionId ?? "", "answered"],
+        [second?.questionId ?? "", "answered"],
+      ]);
+      expect(
+        details(seen, "toolResult").map((result) => result.output),
+      ).toEqual([
+        "The operator answered your questions:\n1. Which colour?\n   In their own words: Blue",
+        "The operator answered your questions:\n1. Which size?\n   In their own words: Large",
+      ]);
+      expect(details(seen, "reply").map((reply) => reply.text)).toEqual([
+        "both answered",
+      ]);
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("an answer racing a Stop is refused as not pending, never reported answered and dropped (slice 3 fix, L1)", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      const questionId =
+        details(seen, "question")[0]?.question.questionId ?? "";
+      // The Stop is on its way to Pi, and the answer comes in behind it.
+      const stopping = Effect.runPromise(f.harness.interruptSession(ref.id));
+      const late = await Effect.runPromise(
+        Effect.result(
+          f.harness.answerQuestion(ref.id, questionId, { q0: ["Blue"] }),
+        ),
+      );
+      expect(await stopping).toBe(true);
+      expect(late._tag).toBe("Failure");
+      if (late._tag === "Failure")
+        expect(late.failure._tag).toBe("QuestionNotPending");
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await until(() => outcomes(seen).length > 0, "the turn's end");
+      expect(outcomes(seen)).toEqual(["interrupted"]);
+      expect(
+        details(seen, "questionSettled").map((each) => each.settled),
+      ).toEqual(["withdrawn"]);
+      // The model was told nothing was answered.
+      expect(details(seen, "toolResult")[0]?.failed).toBe(true);
+      expect(details(seen, "toolResult")[0]?.output).not.toContain("Blue");
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("ending a session whose Pi never answers the abort still withdraws its question (review L4)", async () => {
+    const f = await fixture();
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(f.harness.prompt(ref.id, askThen("never")));
+      await until(() => details(seen, "question").length > 0, "the question");
+      const pid = recordedPid(f.records);
+      // Stopped, Pi reads neither the queue clear nor the abort: no call end comes.
+      process.kill(pid, "SIGSTOP");
+      await Effect.runPromise(f.harness.endSession(ref));
+      expect(alive(pid)).toBe(false);
+      await until(
+        () => details(seen, "questionSettled").length > 0,
+        "the withdrawal",
+        3_000,
+      );
+      expect(details(seen, "toolResult")).toEqual([]);
+      expect(
+        details(seen, "questionSettled").map((each) => each.settled),
+      ).toEqual(["withdrawn"]);
+      expect(
+        await Effect.runPromise(f.harness.pendingQuestions(ref.id)),
+      ).toEqual([]);
+    } finally {
+      await close(f);
+    }
+  }, 30_000);
+
+  test("a second dialog for a call already held is cancelled, and the first stays the one answered", async () => {
+    // An extension of the operator's that knows the key: bit's extension keeps it where
+    // any extension of the same process can read it.
+    const ownAgent = join(root, "agent-double-ask");
+    mkdirSync(join(ownAgent, "extensions"), { recursive: true });
+    writeFileSync(join(ownAgent, "models.json"), fakeModelsJson(model.url));
+    writeFileSync(
+      join(ownAgent, "extensions", "double.ts"),
+      `export default function (pi: any) {
+  pi.registerTool({
+    name: "double_ask",
+    label: "double ask",
+    description: "asks twice under one call",
+    parameters: { type: "object", properties: {} },
+    execute: async (_id: string, _params: unknown, signal: AbortSignal, _u: unknown, ctx: any) => {
+      const title = "bit-question:" + (globalThis as any)[Symbol.for("bit.piBitTools.questionKey")];
+      const set = (q: string) => JSON.stringify({ callId: "call_same", questions: [{ question: q }] });
+      const first = ctx.ui.input(title, set("First?"), { signal });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const second = await ctx.ui.input(title, set("Second?"), { signal });
+      return { content: [{ type: "text", text: JSON.stringify({ first: (await first) ?? null, second: second ?? null }) }], details: {} };
+    },
+  });
+}
+`,
+    );
+    const f = await fixture({ agentDir: ownAgent });
+    try {
+      const ref = await openAsking(f.harness, f.work);
+      const seen = listen(f.harness, ref.id, f.scope);
+      await Effect.runPromise(
+        f.harness.prompt(
+          ref.id,
+          S([{ tool: "double_ask", args: {} }, { text: "done" }]),
+        ),
+      );
+      await until(() => details(seen, "question").length > 0, "the question");
+      // Long enough for the second dialog to have come and been cancelled.
+      await Bun.sleep(600);
+      expect(
+        details(seen, "question").map(
+          (each) => each.question.fields[0]?.question,
+        ),
+      ).toEqual(["First?"]);
+      await Effect.runPromise(
+        f.harness.answerQuestion(ref.id, "call_same", { q0: ["one"] }),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      const output = JSON.parse(
+        details(seen, "toolResult")[0]?.output ?? "{}",
+      ) as { first: string | null; second: string | null };
+      expect(output.second).toBeNull();
+      expect(JSON.parse(output.first ?? "{}")).toMatchObject({
+        outcome: "answered",
+      });
+    } finally {
+      await close(f);
+    }
+  }, 30_000);
+
   test("another extension's dialogs are still cancelled, a look-alike title included, and a session that may not ask is not offered the tool", async () => {
     // An agent folder of its own, with an extension of "the operator's" that opens dialogs.
     const ownAgent = join(root, "agent-with-dialogs");
