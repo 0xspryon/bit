@@ -610,7 +610,9 @@ export const makeConversations = <
           Effect.andThen(
             // What the session held queued went with it, and is not this process's to
             // replay. Not on the narrator's exit: a narration stream can end while the
-            // session lives on.
+            // session lives on. A message held as `lost` goes too: the close after a dead
+            // process is the next message's, and the web's note says the mark lasts until
+            // then (slice 3 fix 2, L1).
             Effect.sync(() => {
               steers.delete(entry.id);
               deliveries.delete(entry.id);

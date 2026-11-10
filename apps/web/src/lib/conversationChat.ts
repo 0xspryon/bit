@@ -170,18 +170,28 @@ export const CARRIED_NOTE =
   "Went on with the next message: the harness sent the two on together.";
 
 /**
+ * What a message the harness never took says under it (slice 3 fix): its process ended
+ * with the message still queued in it, so it was not delivered and will not be.
+ *
+ * **The mark lasts until the next message, and says so** (slice 3 fix 2, L1). The server
+ * holds a lost message with the dead period's queue, in memory, and the next message —
+ * which finds the session gone and carries the conversation on under a new period — closes
+ * that period and the queue with it, so the lost message leaves the thread. Carrying it into
+ * the new period would draw it in the wrong place: a held message is drawn after everything
+ * the replay holds (`queuedRows`), and the new period's replay holds the next message and
+ * its reply. Drawing it where it was sent needs the server to splice it into the replay,
+ * which the app-owned queue the V2 note on `ConversationQueuedMessage.lost` points at would
+ * bring; until then the note tells the operator how long they have.
+ */
+export const undeliveredNote = (agent: string): string =>
+  `Not delivered: the ${agent}'s process ended before it read this message. Send it again if it still matters; this mark goes with your next message.`;
+
+/**
  * The note on a turn a Stop ended before the importer wrote anything in it (A6 U6 review 3):
  * the turn holds only the harness's interrupt marker ({@link isInterruptMarker}), live as
  * after a reload, in place of "not answered yet" — which a turn that is over never is — or
  * the marker's bare `[Request interrupted by user]`.
  */
-/**
- * What a message the harness never took says under it (slice 3 fix): its process ended
- * with the message still queued in it, so it was not delivered and will not be.
- */
-export const undeliveredNote = (agent: string): string =>
-  `Not delivered: the ${agent}'s process ended before it read this message. Send it again if it still matters.`;
-
 export const stoppedNote = (agent: string): string =>
   `Stopped before the ${agent} wrote anything in reply.`;
 

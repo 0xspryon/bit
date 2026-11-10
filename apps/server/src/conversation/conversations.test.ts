@@ -1155,12 +1155,35 @@ describe("the conversation core through a non-importer owner", () => {
             after = yield* replayQueued(probe, entry.id);
             if (after[0]?.[2] === true) break;
           }
-          return { before, after };
+          // The next message finds the session gone and carries the conversation on under a
+          // new period: the dead period closes, and the lost mark goes with it, as the
+          // web's note says (slice 3 fix 2, L1).
+          probe.steerRefusal.now = new HarnessTransportError({
+            operation: "stub.prompt",
+            status: 404,
+            tag: SESSION_NOT_FOUND_TAG,
+            detail: "the stub's process is gone",
+            cause: undefined,
+          });
+          const next = yield* probe.send({
+            conversationId: entry.id,
+            text: "are you back?",
+          });
+          return {
+            before,
+            after,
+            next: next.probeId,
+            old: yield* replayQueued(probe, entry.id),
+            fresh: yield* replayQueued(probe, next.probeId),
+          };
         }),
       { dyingTurns: true },
     );
     expect(gone.before).toEqual([["read this next", false, undefined]]);
     expect(gone.after).toEqual([["read this next", false, true]]);
+    expect(gone.next).not.toBe("prb_1");
+    expect(gone.old).toEqual([]);
+    expect(gone.fresh).toEqual([]);
 
     const broken = await run(
       (probe) =>

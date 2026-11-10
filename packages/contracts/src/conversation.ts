@@ -216,6 +216,11 @@ export const ConversationQueuedMessage = Schema.Struct({
    * The harness's process ended before it took the message (harness-instances slice 3
    * fix): it lived in that process's queue and **was never delivered**, nor will it be. A
    * chat draws it as not delivered, never as sent. Absent on every other message.
+   *
+   * Held with its period's queue, so only until that period is closed — which the next
+   * message does, since it finds the session gone and carries the conversation on under a
+   * new period (slice 3 fix 2, L1). V2(chat): kept and placed where it was sent once the
+   * app-owned queue (`LiveAgentSessions.deliver`) holds messages beside the replay.
    */
   lost: Schema.optionalKey(Schema.Literal(true)),
 });

@@ -2176,7 +2176,9 @@ describe("a replay's queued messages, and a replay read again", () => {
       ]).toEqual([true, false, false]);
       expect(lost?.prose).toEqual({
         _tag: "none",
-        note: "Not delivered: the importer's process ended before it read this message. Send it again if it still matters.",
+        // It says how long the mark lasts (slice 3 fix 2, L1): the next message closes the
+        // dead period, and the server's queue that held it goes with it.
+        note: "Not delivered: the importer's process ended before it read this message. Send it again if it still matters; this mark goes with your next message.",
       });
     }
     // A message not lost keeps its marks.
