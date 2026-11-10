@@ -30,7 +30,9 @@
  *     "models": [ { "id": "opus", "label": "GLM-5.3", "reportedAs": "glm-5.3" },
  *                 { "id": "sonnet", "label": "GLM-5.3 Flash", "reportedAs": "glm-5.3-flash" } ],
  *     "defaultModel": "sonnet", "maxRetries": 1 },
- *   { "id": "opencode", "driver": "opencode" }
+ *   { "id": "opencode", "driver": "opencode" },
+ *   { "id": "pi-zai", "driver": "pi", "displayName": "Pi · z.ai",
+ *     "models": [ { "id": "zai/glm-5.3-flash", "label": "GLM-5.3 Flash" } ] }
  * ] }
  * ```
  *
@@ -58,6 +60,15 @@
  *   that refuses with a 429 (z.ai's code 1113, no balance) is otherwise retried ten times
  *   over three minutes and more before the turn fails.
  *
+ * - `agentDir` (Pi): an absolute path to an existing folder, handed to Pi as
+ *   `PI_CODING_AGENT_DIR` — its `auth.json`, `models.json` and settings. Absent: the
+ *   operator's own `~/.pi/agent`, as for Claude Code's `configDir`. bit never opens it.
+ * - `binary` (Pi): the `pi` command to run; `pi` on the server's `PATH` when absent.
+ * - `models` (Pi): `provider/model` ids as Pi names them (`zai/glm-5.3-flash`), with
+ *   labels. Absent: every model Pi lists for the providers it holds credentials for, read
+ *   once at startup (`piClient.ts`). Pi's frames name a model the way it was asked for, so
+ *   there is no `reportedAs`.
+ *
  * Unknown keys are refused rather than ignored: a misspelt `configdir` would otherwise run
  * the instance on the operator's default login without a word.
  */
@@ -70,6 +81,7 @@ import {
   CLAUDE_CODE_DRIVER,
   InstanceId,
   OPENCODE_DRIVER,
+  PI_DRIVER,
   type DriverKind,
 } from "./identity";
 
@@ -106,6 +118,27 @@ const OpenCodeEntry = Schema.Struct({
   defaultModel: Schema.optionalKey(Trimmed),
 });
 
+/** A Pi model: `provider/model`, as Pi's `--model` takes it. */
+const PiModel = Schema.Struct({
+  id: Trimmed.check(
+    Schema.isPattern(/^[^/\s]+\/\S+$/, {
+      message: "a Pi model is named provider/model, like zai/glm-5.3-flash",
+    }),
+  ),
+  label: Schema.optionalKey(Trimmed),
+});
+export type PiModel = typeof PiModel.Type;
+
+const PiEntry = Schema.Struct({
+  id: InstanceId,
+  driver: Schema.Literal("pi"),
+  displayName: Schema.optionalKey(Trimmed),
+  binary: Schema.optionalKey(Trimmed),
+  agentDir: Schema.optionalKey(Trimmed),
+  models: Schema.optionalKey(Schema.NonEmptyArray(PiModel)),
+  defaultModel: Schema.optionalKey(Trimmed),
+});
+
 /** The file's outer shape. Entries are decoded one at a time, by driver, for the sentence. */
 const InstancesFile = Schema.Struct({
   instances: Schema.Array(Schema.Unknown),
@@ -131,7 +164,19 @@ export interface OpenCodeInstanceConfig {
   readonly defaultModel: string | undefined;
 }
 
-export type InstanceConfig = ClaudeCodeInstanceConfig | OpenCodeInstanceConfig;
+/** A Pi instance, as configured. Any number: each session is its own process. */
+export interface PiInstanceConfig {
+  readonly driver: "pi";
+  readonly id: InstanceId;
+  readonly displayName: string;
+  readonly binary: string | undefined;
+  readonly agentDir: string | undefined;
+  readonly models: readonly PiModel[] | undefined;
+  readonly defaultModel: string | undefined;
+}
+
+export type InstanceConfig =
+  ClaudeCodeInstanceConfig | OpenCodeInstanceConfig | PiInstanceConfig;
 
 /**
  * The models of a Claude Code instance with its own config folder that name no
@@ -181,6 +226,7 @@ const liveFolderCheck: FolderCheck = (path) => {
 const DRIVER_NAMES: ReadonlyMap<string, string> = new Map([
   [CLAUDE_CODE_DRIVER, "Claude Code"],
   [OPENCODE_DRIVER, "OpenCode"],
+  [PI_DRIVER, "Pi"],
 ]);
 
 /**
@@ -207,6 +253,7 @@ const schemaSentence = (prefix: string, error: unknown): string => {
 const decodeFile = Schema.decodeUnknownSync(InstancesFile);
 const decodeClaudeCode = Schema.decodeUnknownSync(ClaudeCodeEntry);
 const decodeOpenCode = Schema.decodeUnknownSync(OpenCodeEntry);
+const decodePi = Schema.decodeUnknownSync(PiEntry);
 const STRICT = { onExcessProperty: "error" } as const;
 
 /**
@@ -317,6 +364,53 @@ export const decodeInstanceConfig = (
         displayName:
           entry.displayName ?? defaultDisplayName(entry.id, entry.driver),
         defaultModel: entry.defaultModel,
+      });
+    } else if (driver === PI_DRIVER) {
+      let entry: typeof PiEntry.Type;
+      try {
+        entry = decodePi(raw, STRICT);
+      } catch (error) {
+        return invalid(schemaSentence(at, error));
+      }
+      if (entry.agentDir !== undefined) {
+        if (!isAbsolute(entry.agentDir)) {
+          return invalid(
+            `${at}.agentDir: '${entry.agentDir}' is not an absolute path`,
+          );
+        }
+        const found = folder(entry.agentDir);
+        if (found !== "folder") {
+          return invalid(
+            `${at}.agentDir: '${entry.agentDir}' ${found === "missing" ? "does not exist" : "is not a folder"}`,
+          );
+        }
+      }
+      const models = entry.models;
+      if (models !== undefined) {
+        const seen = new Set<string>();
+        for (const [position, model] of models.entries()) {
+          if (seen.has(model.id)) {
+            return invalid(
+              `${at}.models[${String(position)}].id: '${model.id}' is listed twice`,
+            );
+          }
+          seen.add(model.id);
+        }
+        if (entry.defaultModel !== undefined && !seen.has(entry.defaultModel)) {
+          return invalid(
+            `${at}.defaultModel: '${entry.defaultModel}' is not one of the instance's models (${[...seen].join(", ")})`,
+          );
+        }
+      }
+      instances.push({
+        driver: "pi",
+        id: entry.id,
+        displayName:
+          entry.displayName ?? defaultDisplayName(entry.id, entry.driver),
+        binary: entry.binary,
+        agentDir: entry.agentDir,
+        models,
+        defaultModel: entry.defaultModel ?? models?.[0]?.id,
       });
     } else {
       return invalid(

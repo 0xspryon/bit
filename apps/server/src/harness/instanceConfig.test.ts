@@ -179,8 +179,8 @@ describe("each bad field is named", () => {
       "instances[0].defaultModel: 'haiku' is not one of the instance's models (opus, sonnet)",
     ],
     [
-      withZai({ driver: "pi" }),
-      "instances[0].driver: 'pi' is not a driver this build has",
+      withZai({ driver: "codex" }),
+      "instances[0].driver: 'codex' is not a driver this build has",
     ],
     [{ instances: [{ id: "x" }] }, "instances[0].driver: missing"],
     [
@@ -282,5 +282,88 @@ describe("modelsWithoutSpelling", () => {
     if (result._tag !== "configured")
       throw new Error(`not configured: ${result._tag}`);
     expect(modelsWithoutSpelling(result.instances)).toEqual([]);
+  });
+});
+
+describe("a Pi instance", () => {
+  test("is read with its agent folder, binary and labelled models, the first model the default", () => {
+    const result = decode({
+      instances: [
+        {
+          id: "pi-zai",
+          driver: "pi",
+          agentDir: ZAI,
+          binary: "/opt/pi/bin/pi",
+          models: [
+            { id: "zai/glm-5.3-flash", label: "GLM-5.3 Flash" },
+            { id: "zai/glm-5.3" },
+          ],
+        },
+        { id: "pi", driver: "pi" },
+      ],
+    });
+    expect(result._tag).toBe("configured");
+    if (result._tag !== "configured") return;
+    expect(result.instances[0]).toEqual({
+      driver: "pi",
+      id: "pi-zai" as never,
+      displayName: "Pi (pi-zai)",
+      binary: "/opt/pi/bin/pi",
+      agentDir: ZAI,
+      models: [
+        { id: "zai/glm-5.3-flash", label: "GLM-5.3 Flash" },
+        { id: "zai/glm-5.3" },
+      ],
+      defaultModel: "zai/glm-5.3-flash",
+    });
+    expect(result.instances[1]).toMatchObject({
+      driver: "pi",
+      displayName: "Pi",
+      models: undefined,
+      defaultModel: undefined,
+    });
+  });
+
+  test("an agent folder that is not there, or relative, is refused", () => {
+    expect(
+      refusal({ instances: [{ id: "p", driver: "pi", agentDir: "/nope" }] }),
+    ).toContain("instances[0].agentDir: '/nope' does not exist");
+    expect(
+      refusal({ instances: [{ id: "p", driver: "pi", agentDir: "pi" }] }),
+    ).toContain("instances[0].agentDir: 'pi' is not an absolute path");
+  });
+
+  test("a model not named provider/model, or a reportedAs, is refused", () => {
+    expect(
+      refusal({
+        instances: [{ id: "p", driver: "pi", models: [{ id: "glm-5.3" }] }],
+      }),
+    ).toContain("instances[0].models[0].id");
+    expect(
+      refusal({
+        instances: [
+          {
+            id: "p",
+            driver: "pi",
+            models: [{ id: "zai/glm-5.3", reportedAs: "glm-5.3" }],
+          },
+        ],
+      }),
+    ).toContain("reportedAs");
+  });
+
+  test("a default that is not one of its models is refused", () => {
+    expect(
+      refusal({
+        instances: [
+          {
+            id: "p",
+            driver: "pi",
+            models: [{ id: "zai/glm-5.3" }],
+            defaultModel: "zai/glm-5.3-flash",
+          },
+        ],
+      }),
+    ).toContain("instances[0].defaultModel: 'zai/glm-5.3-flash' is not one of");
   });
 });

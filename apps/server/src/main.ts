@@ -123,6 +123,7 @@ import {
 import {
   CLAUDE_CODE_DRIVER,
   OPENCODE_DRIVER,
+  PI_DRIVER,
   defaultInstanceIdForDriver,
   type InstanceId,
 } from "./harness/identity";
@@ -132,12 +133,14 @@ import {
   readInstanceConfig,
   type ClaudeCodeInstanceConfig,
   type InstanceConfig,
+  type PiInstanceConfig,
 } from "./harness/instanceConfig";
 import {
   OPENCODE_DEFAULT_MODEL,
   openCodeHarness,
 } from "./harness/openCodeClient";
 import { OpenCodeServer } from "./harness/openCodeServer";
+import { piHarness } from "./harness/piClient";
 import {
   ownedProcessDirectory,
   reapNeedsAttention,
@@ -700,6 +703,57 @@ const claudeCodeCandidate = (
 };
 
 /**
+ * One Pi instance: a `pi --mode rpc` per session, started by this process.
+ *
+ * **Only from the instance file**, never from `HARNESS`: an unset `HARNESS` means every
+ * driver this build has, and starting Pi's catalogue read on every default boot would add a
+ * harness nobody configured. Its sessions are kept under the fleet root, one folder per
+ * instance (`harness/pi-sessions/<id>`), not in the operator's `~/.pi/agent/sessions`: bit's
+ * sessions are bit's runtime data, and the operator opens one with
+ * `pi --session <id> --session-dir <that folder>` when bit is not running it.
+ */
+const piCandidate = (config: PiInstanceConfig): HarnessCandidate => {
+  const defaultModel = config.defaultModel ?? config.models?.[0]?.id;
+  return {
+    driver: PI_DRIVER,
+    displayName: config.displayName,
+    layer: Layer.suspend(() =>
+      piHarness({
+        instanceId: config.id,
+        displayName: config.displayName,
+        sessionDir: join(HUNT_ROOT, "harness", "pi-sessions", config.id),
+        recordDirectory: OWNED_PROCESSES,
+        ...(config.binary === undefined ? {} : { binary: config.binary }),
+        ...(config.agentDir === undefined ? {} : { agentDir: config.agentDir }),
+        ...(config.models === undefined ? {} : { models: config.models }),
+        ...(defaultModel === undefined ? {} : { defaultModel }),
+      }),
+    ),
+    setup:
+      config.agentDir === undefined
+        ? "Install pi-coding-agent so `pi` is on this server's PATH (or name it in the instance's `binary`), and log into a provider once with `pi` and `/login`, or add one to ~/.pi/agent/models.json."
+        : `Install pi-coding-agent so \`pi\` is on this server's PATH (or name it in the instance's \`binary\`), and make sure ${config.agentDir} holds a provider login (auth.json) or a models.json (run \`PI_CODING_AGENT_DIR=${config.agentDir} pi\` once).`,
+    placeholder: {
+      instanceId: config.id,
+      driver: PI_DRIVER,
+      displayName: config.displayName,
+      version: "unknown",
+      installed: false,
+      auth: "unknown",
+      defaultModel: defaultModel ?? "unknown",
+      models: (config.models ?? [{ id: defaultModel ?? "unknown" }]).map(
+        (model) => ({
+          id: model.id,
+          ...("label" in model && model.label !== undefined
+            ? { label: model.label }
+            : {}),
+        }),
+      ),
+    },
+  };
+};
+
+/**
  * Everything this build can be asked to drive, as resolver candidates.
  *
  * **This is the only place in the process where a driver is named.** The resolver takes
@@ -723,7 +777,9 @@ const CANDIDATES: readonly HarnessCandidate[] = [
 const candidateOf = (config: InstanceConfig): HarnessCandidate =>
   config.driver === "claude-code"
     ? claudeCodeCandidate({ ...config, instanceId: config.id })
-    : openCodeCandidate({ ...config, instanceId: config.id });
+    : config.driver === "pi"
+      ? piCandidate(config)
+      : openCodeCandidate({ ...config, instanceId: config.id });
 
 /** The candidates the file, or else `HARNESS`, asked for, in the order it asked for them. */
 const configured: readonly HarnessCandidate[] =
