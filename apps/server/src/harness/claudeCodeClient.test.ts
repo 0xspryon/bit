@@ -52,9 +52,11 @@ import {
   REPLY_FIELD_MAX,
   NARRATION_TRUNCATED_MARK,
   SESSION_NOT_FOUND_TAG,
+  SESSION_PROCESS_GONE_TAG,
   type HarnessNarration,
   type SubagentState,
 } from "./agentHarness";
+import { PROCESS_EXIT_ENTRY, processExitMessage } from "./processExit";
 import { narrateCoalesced } from "../run/streamingCoalescer";
 import type { LiveInterrupt } from "./liveAgentSessions";
 import { turnStopped } from "./turnStop";
@@ -10098,4 +10100,251 @@ describe("sub-agent cards: lines, activity, count and Stop (A7-S)", () => {
     ]);
     expect(last?.calls).toBe(1);
   });
+});
+
+/* ── A CLI that dies mid-turn, said as Pi says it (slice 3 fix 2, M1) ─────────────── */
+
+describe("a CLI that dies mid-turn is said in the thread, live and replayed (slice 3 fix 2, M1)", () => {
+  const DIED = "44444444-0000-4000-8000-000000000001";
+  const STEER = "eeeeeeeeffffffff0000000011111111";
+  const exited = (entries: readonly HarnessNarration[]) =>
+    entries.filter((entry) => entry.type === PROCESS_EXIT_ENTRY);
+
+  /** A conversation on the turn-driven fake, its first turn running and a steer queued. */
+  const running = (
+    harness: AgentHarness["Service"],
+    driver: ReturnType<typeof turnDrivenSdk>,
+  ) =>
+    Effect.gen(function* () {
+      const ref = yield* harness.createSession({
+        title: "conversation",
+        model: "claude-sonnet-5",
+        directory: "/tmp/goal",
+        sessionId: DIED,
+        multiTurn: true,
+      });
+      const heard = yield* Effect.forkChild(
+        Stream.runCollect(harness.sessionEvents(DIED)),
+      );
+      yield* harness.prompt(DIED, "write a long essay");
+      yield* Effect.promise(() => driver.pulled(1));
+      yield* harness.prompt(DIED, "and then this", {
+        _tag: "steer",
+        urgency: "queued",
+        messageId: STEER,
+      });
+      yield* Effect.promise(() => driver.pulled(2));
+      driver.transcript.push({
+        type: "user",
+        uuid: driver.seen.uuids[0] ?? "opening",
+        session_id: DIED,
+        message: { role: "user", content: "write a long essay" },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        timestamp: new Date(Date.now() - 1_000).toISOString(),
+      } as unknown as SessionMessage);
+      return { heard, ref };
+    });
+
+  test("the exit is narrated as the harness's error, kept for the replay after what was stored, and the wait fails as the process gone", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        const { heard } = yield* running(harness, driver);
+        driver.failStream(
+          new Error("Claude Code process terminated by signal SIGKILL"),
+        );
+        const waited = yield* Effect.flip(harness.waitForIdle(DIED));
+        const narration = [...(yield* Fiber.join(heard))];
+        return {
+          waited,
+          narration,
+          replay: yield* harness.messages(DIED),
+        };
+      }),
+    );
+    expect(outcome.waited._tag).toBe("HarnessTransportError");
+    if (outcome.waited._tag === "HarnessTransportError") {
+      expect(outcome.waited.tag).toBe(SESSION_PROCESS_GONE_TAG);
+    }
+    // Pi's sentence, word for word, with Claude Code's name in it.
+    const said = processExitMessage({
+      process: "The Claude Code process",
+      how: "SIGKILL",
+      untaken: 1,
+    });
+    expect(said).toBe(
+      "The Claude Code process running this session exited (SIGKILL) while a turn was in flight. What it finished is kept; how the turn would have ended is not known. A message sent while it ran had not been read yet, and went with it.",
+    );
+    const exits = exited(outcome.narration);
+    expect(exits.map((entry) => [entry.detail, entry.outcome])).toEqual([
+      [{ _tag: "error", message: said }, undefined],
+    ]);
+    // The last thing said before the narration ended.
+    expect(outcome.narration.at(-1)?.type).toBe(PROCESS_EXIT_ENTRY);
+    // After the stored message, as the live stream said it.
+    expect(outcome.replay.map((entry) => [entry.type, entry.error])).toEqual([
+      ["user", undefined],
+      [PROCESS_EXIT_ENTRY, said],
+    ]);
+    // And drawn the same way live as replayed: the same item, but for its id and time.
+    const subject = { _tag: "import", importId: "imp_1" } as const;
+    const live = exits.flatMap((entry, id) => {
+      const frame = projectNarration({
+        id,
+        targetId: "acme",
+        subject,
+        harnessSessionId: DIED,
+        entry,
+      });
+      return frame?._tag === "item" ? [frame] : [];
+    });
+    const replayed = projectReplay({
+      entries: outcome.replay,
+      subject,
+      harnessSessionId: DIED,
+      users: "operator",
+      fallbackAt: 0,
+    }).items;
+    const shape = (item: LiveItem) =>
+      Object.fromEntries(
+        Object.entries(item).filter(([key]) => key !== "id" && key !== "at"),
+      );
+    expect(live).toHaveLength(1);
+    expect(
+      replayed.filter((item) => item.kind !== "turn.operator").map(shape),
+    ).toEqual(live.map(shape));
+  });
+
+  test("between turns, after an End, and on a clean exit, nothing is said", async () => {
+    const between = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        const { heard } = yield* running(harness, driver);
+        // Both accepted messages answered: the conversation is idle.
+        driver.emitResult();
+        driver.emitResult();
+        yield* harness.waitForIdle(DIED);
+        driver.failStream(new Error("Claude Code process exited with code 1"));
+        const narration = [...(yield* Fiber.join(heard))];
+        return {
+          said: exited(narration),
+          replay: yield* harness.messages(DIED),
+        };
+      }),
+    );
+    expect(between.said).toEqual([]);
+    expect(between.replay.map((entry) => entry.type)).toEqual(["user"]);
+
+    const ended = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        const { heard, ref } = yield* running(harness, driver);
+        yield* harness.endSession(ref);
+        driver.failStream(new Error("Claude Code process exited with code 1"));
+        // The narration ended with the End, so nothing waits on the pump: give it the
+        // failure's turn before the replay is read.
+        yield* Effect.sleep("100 millis");
+        return {
+          said: exited([...(yield* Fiber.join(heard))]),
+          replay: yield* harness.messages(DIED),
+        };
+      }),
+    );
+    expect(ended.said).toEqual([]);
+    expect(ended.replay.map((entry) => entry.type)).toEqual(["user"]);
+
+    const clean = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        const { heard } = yield* running(harness, driver);
+        driver.endStream();
+        return exited([...(yield* Fiber.join(heard))]);
+      }),
+    );
+    expect(clean).toEqual([]);
+  });
+
+  test("a real CLI killed by its pid: the signal is read from its exit, whatever the stream's failure says", async () => {
+    let pid: number | undefined;
+    const sdk: ClaudeCodeSdk = {
+      query: ({ prompt, options }) => {
+        const spawn = options.spawnClaudeCodeProcess;
+        if (spawn === undefined)
+          throw new Error("the harness spawned nothing itself");
+        const child = spawn({
+          command: "sh",
+          args: ["-c", "sleep 30"],
+          env: { PATH: process.env["PATH"] },
+          signal: new AbortController().signal,
+        });
+        pid = (child as unknown as { pid?: number }).pid;
+        const gone = new Promise<void>((resolve) => {
+          (child as unknown as NodeJS.EventEmitter).once("exit", () => {
+            resolve();
+          });
+        });
+        void (async () => {
+          for await (const _message of prompt) void _message;
+        })();
+        const query: HarnessQuery = {
+          setMcpServers: async () => ({}),
+          interrupt: async () => undefined,
+          stopTask: async () => undefined,
+          getContextUsage: async () => ({}),
+          setModel: async () => undefined,
+          applyFlagSettings: async () => undefined,
+          close: () => undefined,
+          // A failure that names no signal: the exit itself is what says SIGKILL.
+          [Symbol.asyncIterator]: async function* () {
+            await gone;
+            yield* [] as SDKMessage[];
+            throw new Error("the stream broke");
+          },
+        };
+        return query;
+      },
+      sessionMessages: () => Promise.resolve([]),
+      sessionInfo: () => Promise.resolve(undefined),
+      subagentMessages: () => Promise.resolve([]),
+      listSubagents: () => Promise.resolve([]),
+    };
+    const said = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(AgentHarness, (harness) =>
+          Effect.gen(function* () {
+            yield* harness.createSession({
+              title: "conversation",
+              model: "claude-sonnet-5",
+              directory: "/tmp/goal",
+              sessionId: DIED,
+              multiTurn: true,
+            });
+            const heard = yield* Effect.forkChild(
+              Stream.runCollect(harness.sessionEvents(DIED)),
+            );
+            yield* harness.prompt(DIED, "go");
+            for (let tries = 0; pid === undefined; tries += 1) {
+              if (tries > 400) throw new Error("the CLI never started");
+              yield* Effect.sleep("5 millis");
+            }
+            process.kill(pid, "SIGKILL");
+            yield* Effect.flip(harness.waitForIdle(DIED));
+            return exited([...(yield* Fiber.join(heard))]);
+          }),
+        ).pipe(
+          Effect.provide(
+            claudeCodeHarness({ sdk, controlTimeout: "2 seconds" }),
+          ),
+          Effect.orDie,
+        ),
+      ),
+    );
+    expect(said.map((entry) => entry.detail)).toEqual([
+      {
+        _tag: "error",
+        message: processExitMessage({
+          process: "The Claude Code process",
+          how: "SIGKILL",
+          untaken: 0,
+        }),
+      },
+    ]);
+  }, 10_000);
 });

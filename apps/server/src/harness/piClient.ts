@@ -126,7 +126,6 @@ import {
   type HarnessNarration,
   type HarnessQuestion,
   type McpRegistration,
-  type MessageEntry,
   type SessionRef,
   type SessionStatus,
   type SessionTitle,
@@ -138,6 +137,7 @@ import {
   withAttachmentLines,
   type MessageAttachment,
 } from "./attachments";
+import { PROCESS_EXIT_ENTRY, withExits, type ProcessExit } from "./processExit";
 import {
   HarnessDecodeError,
   HarnessProcessError,
@@ -609,39 +609,6 @@ interface HeldPiQuestion {
   /** The process that asked: an answer goes to it or nowhere. */
   readonly rpc: RpcProcess;
 }
-
-/** One process exit seen mid-turn, as the thread says it. */
-interface ProcessExit {
-  readonly at: number;
-  readonly message: string;
-}
-
-/** The entry type of a process exit, live and replayed. */
-const PROCESS_EXIT_ENTRY = "bit.process.exited";
-
-/**
- * A replay with the process exits put where they happened: after every entry Pi stored
- * before the exit. Drawn as the harness's error, as the live narration drew it.
- */
-const withExits = (
-  entries: readonly MessageEntry[],
-  exits: readonly ProcessExit[],
-): MessageEntry[] => {
-  const out = [...entries];
-  for (const exit of exits) {
-    let at = out.length;
-    while (at > 0 && (out[at - 1]?.at ?? -Infinity) > exit.at) at -= 1;
-    out.splice(at, 0, {
-      type: PROCESS_EXIT_ENTRY,
-      text: "",
-      error: exit.message,
-      parts: [],
-      model: undefined,
-      at: exit.at,
-    });
-  }
-  return out;
-};
 
 /** What the extension reads from the dialog's value (`piBitTools.extension.ts`). */
 type QuestionReply =

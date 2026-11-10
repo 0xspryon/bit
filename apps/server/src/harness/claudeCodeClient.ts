@@ -213,6 +213,12 @@ import {
   type ModelProvenance,
 } from "./identity";
 import { modelSpellings, type ModelSpellings } from "./modelSpellings";
+import {
+  exitNarration,
+  processExitMessage,
+  withExits,
+  type ProcessExit,
+} from "./processExit";
 
 /**
  * The model a Claude Code worker runs on when nothing names one.
@@ -1017,6 +1023,11 @@ interface SessionRecord {
   stderrTail: string;
   /** The CLI exited with a non-zero code of its own; the stream's failure carries the tail. */
   cliFailed: boolean;
+  /**
+   * How the CLI exited — its signal, or `code N` — once it has, for the line a death
+   * mid-turn puts in the thread ({@link processExitMessage}). Undefined while it runs.
+   */
+  cliExit: string | undefined;
 }
 
 /**
@@ -3727,6 +3738,16 @@ export const claudeCodeHarness = (
       const sessions = new Map<string, SessionRecord>();
 
       /**
+       * The CLI deaths seen mid-turn, by session id (slice 3 fix 2, M1): drawn in the
+       * session's replay where they happened, as Pi's driver draws its process exits. The
+       * transcript says nothing of a death, and without this a thread read again after one
+       * showed the turn's message with no reply and no reason. Outlives the record, so a
+       * resumed session still shows its earlier death; memory only, so a restarted server
+       * shows none. One entry per death.
+       */
+      const exits = new Map<string, readonly ProcessExit[]>();
+
+      /**
        * The record each {@link SessionRef} `createSession` handed out stands for.
        *
        * What `endSession` resolves, rather than {@link sessions}: a resume creates a record
@@ -3916,6 +3937,7 @@ export const claudeCodeHarness = (
                 }, cliTreeRefresh);
           watch?.unref();
           record.stderrTail = "";
+          record.cliExit = undefined;
           child.stderr.setEncoding("utf8");
           child.stderr.on("data", (data: string) => {
             record.stderrTail = (record.stderrTail + data).slice(-STDERR_TAIL);
@@ -3931,6 +3953,9 @@ export const claudeCodeHarness = (
           child.stderr.on("error", () => undefined);
           child.once("exit", (code, signal) => {
             clearInterval(watch);
+            // Registered before the SDK's own listener (the SDK is handed the child after
+            // this), so a stream failing on this exit finds it here.
+            record.cliExit = signal ?? `code ${String(code)}`;
             if (cli !== undefined) {
               /*
                * Straight after the runtime reaped it, while its group's id cannot have been
@@ -4072,6 +4097,46 @@ export const claudeCodeHarness = (
         });
       };
 
+      /**
+       * The stream failed with a turn in flight and nobody here closing it: the CLI died
+       * (crashed, was killed, ran out of memory) or the SDK lost it. Said in the thread as Pi
+       * says its process exiting (slice 3 fix 2, M1) — live, before the narration ends, and
+       * kept for the replay ({@link exits}), since the transcript holds what was finished
+       * and nothing about why the turn stopped. Between turns nothing is said, as on Pi: no
+       * turn was cut, and the next message resumes the session.
+       *
+       * The partial reply the turn was streaming is not kept, as on Pi: a block no harness
+       * stored is only ever drawn while its turn runs, and this one has stopped.
+       */
+      const diedMidTurn = (
+        record: SessionRecord,
+        failure: HarnessTransportError,
+      ): void => {
+        if (record.closed) return;
+        if (!record.turnOpen && record.unanswered.size === 0) return;
+        // The CLI's own exit, or else what the SDK's failure says of it.
+        const said = /terminated by signal (\w+)|exited with code (-?\d+)/.exec(
+          failure.message,
+        );
+        const how =
+          record.cliExit ??
+          said?.[1] ??
+          (said?.[2] === undefined ? undefined : `code ${said[2]}`);
+        const exit: ProcessExit = {
+          at: Date.now(),
+          message: processExitMessage({
+            process: "The Claude Code process",
+            how,
+            untaken: record.untaken.size,
+          }),
+        };
+        exits.set(record.sessionId, [
+          ...(exits.get(record.sessionId) ?? []),
+          exit,
+        ]);
+        Queue.offerUnsafe(record.narration, exitNarration(exit));
+      };
+
       const pump = (record: SessionRecord): Effect.Effect<void> =>
         Effect.gen(function* () {
           const live = record.query;
@@ -4204,6 +4269,7 @@ export const claudeCodeHarness = (
                 ),
             }),
           );
+          if (drained._tag === "Failure") diedMidTurn(record, drained.failure);
           // The `for await` is over however it ended — an error, the single-turn `break`, or
           // a conversation's stream finishing because the CLI exited cleanly — and the
           // query with it: there is nothing left to prompt, and `closeSession` follows.
@@ -4594,6 +4660,7 @@ export const claudeCodeHarness = (
           cli: undefined,
           stderrTail: "",
           cliFailed: false,
+          cliExit: undefined,
         };
         sessions.set(sessionId, record);
         records.add(record);
@@ -5377,9 +5444,10 @@ export const claudeCodeHarness = (
         };
       });
 
-      const messages: AgentHarness["Service"]["messages"] = Effect.fn(
-        "claudeCodeHarness.messages",
-      )(function* (sessionId, read) {
+      const transcriptOf = Effect.fn("claudeCodeHarness.messages")(function* (
+        sessionId: string,
+        read: Parameters<AgentHarness["Service"]["messages"]>[1],
+      ) {
         const record = sessions.get(sessionId);
         const directory = record?.directory;
         const entries = yield* Effect.tryPromise({
@@ -5445,6 +5513,15 @@ export const claudeCodeHarness = (
           );
         });
       });
+
+      /**
+       * A session's replay: its transcript ({@link transcriptOf}), with the CLI deaths this
+       * process saw mid-turn put where they happened (slice 3 fix 2, M1).
+       */
+      const messages: AgentHarness["Service"]["messages"] = (sessionId, read) =>
+        Effect.map(transcriptOf(sessionId, read), (entries) =>
+          withExits(entries, exits.get(sessionId) ?? []),
+        );
 
       /**
        * Whether the CLI this process runs for the session now is the one running a

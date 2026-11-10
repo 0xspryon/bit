@@ -31,6 +31,7 @@ import { InstanceId } from "./identity";
 import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 import { fakeModelsJson, startFakeModel, type FakeModel } from "./piFakeModel";
 import { piHarness, type PiHarnessOptions } from "./piClient";
+import { processExitMessage } from "./processExit";
 
 const hasPi = spawnSync("pi", ["--version"], { stdio: "ignore" }).status === 0;
 
@@ -603,9 +604,13 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       await until(() => details(seen, "error").length > 0, "the exit's error");
       expect(outcomes(seen)).toEqual([]);
       const said = details(seen, "error")[0]?.message ?? "";
-      expect(said).toContain("exited");
-      expect(said).toContain(
-        "A message sent while it ran had not been read yet",
+      // Said as Claude Code says its CLI dying (slice 3 fix 2, M1): one sentence for both.
+      expect(said).toBe(
+        processExitMessage({
+          process: "The Pi process",
+          how: "SIGKILL",
+          untaken: 1,
+        }),
       );
       const status = await Effect.runPromise(f.harness.sessionStatus(ref.id));
       expect(status).toEqual({ activity: "idle", outcome: undefined });
