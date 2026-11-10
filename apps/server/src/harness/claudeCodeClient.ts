@@ -5611,6 +5611,14 @@ export const claudeCodeHarness = (
             record.interrupted = true;
             // A Stop of its own, whatever a moved one said: see `stopHolds`.
             record.interruptMoved = false;
+            /*
+             * Its questions are withdrawn **before** `interrupt()` is sent (slice 3 fix, L1):
+             * an answer arriving between the two was settled into a hook the interrupt then
+             * aborted, and reported delivered while the CLI dropped it (2/3 live). Withdrawn
+             * first, a late answer finds nothing pending and is refused, and the page offers
+             * it as a message; the interrupt then ends each hook's wait.
+             */
+            for (const held of [...record.questions.values()]) held.retract();
           }
           const live = record.query;
           const asked = yield* Effect.result(
@@ -5946,6 +5954,13 @@ interface HeldQuestion {
   readonly question: HarnessQuestion;
   /** Ends the wait, once: the first decision wins and the rest are ignored. */
   readonly settle: (decision: QuestionDecision) => void;
+  /**
+   * Stops offering the question, said as `withdrawn`, **without** ending the hook's wait
+   * (slice 3 fix, L1): a Stop is about to abort the hook's signal, which ends it as the CLI
+   * expects. Answering the hook here instead would let the CLI run on to its next step in
+   * the moment before the interrupt lands. A later {@link settle} only ends the wait.
+   */
+  readonly retract: () => void;
 }
 
 /**
@@ -6096,11 +6111,12 @@ const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
       if (fields === undefined || record.closed) return Promise.resolve({});
       return new Promise((resolve) => {
         let settled = false;
-        const settle = (decision: QuestionDecision): void => {
-          if (settled) return;
-          settled = true;
+        let said = false;
+        /** Takes the question off the record and says how it stopped waiting, once. */
+        const say = (how: QuestionDecision["_tag"]): void => {
+          if (said) return;
+          said = true;
           record.questions.delete(id);
-          signal.removeEventListener("abort", withdraw);
           Queue.offerUnsafe(record.narration, {
             type: "question",
             sequence: undefined,
@@ -6109,9 +6125,15 @@ const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
             detail: {
               _tag: "questionSettled",
               questionId: id,
-              settled: decision._tag,
+              settled: how,
             },
           });
+        };
+        const settle = (decision: QuestionDecision): void => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", withdraw);
+          say(decision._tag);
           resolve(answerHookOutput(decision, input));
         };
         const withdraw = (): void => settle({ _tag: "withdrawn" });
@@ -6121,7 +6143,11 @@ const answerHook = (record: SessionRecord): HookCallbackMatcher => ({
           askedAt: Date.now(),
           callId: id,
         };
-        record.questions.set(id, { question, settle });
+        record.questions.set(id, {
+          question,
+          settle,
+          retract: () => say("withdrawn"),
+        });
         Queue.offerUnsafe(record.narration, {
           type: "question",
           sequence: undefined,

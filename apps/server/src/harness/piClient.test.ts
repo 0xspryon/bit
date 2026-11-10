@@ -967,7 +967,7 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
           settled.settled,
         ]),
       ).toEqual([[questionId, "withdrawn"]]);
-      // Withdrawn as its call ends, not only when the run does.
+      // Withdrawn as the Stop is sent (slice 3 fix, L1), before Pi ends the call.
       const withdrawnAt = seen.findIndex(
         (entry) => entry.detail._tag === "questionSettled",
       );
@@ -975,7 +975,8 @@ describe.skipIf(!hasPi)("bit's question tool on a real pi --mode rpc", () => {
         (entry) => entry.detail._tag === "toolResult",
       );
       const endedAt = seen.findIndex((entry) => entry.outcome !== undefined);
-      expect(withdrawnAt).toBeGreaterThan(resultAt);
+      expect(withdrawnAt).toBeGreaterThanOrEqual(0);
+      expect(withdrawnAt).toBeLessThan(resultAt);
       expect(withdrawnAt).toBeLessThan(endedAt);
       expect(details(seen, "toolResult")[0]?.failed).toBe(true);
       expect(details(seen, "reply")).toEqual([]);

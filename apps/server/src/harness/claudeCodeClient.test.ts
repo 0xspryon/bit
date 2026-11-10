@@ -9044,6 +9044,105 @@ describe("the question dock's Claude Code half: AskUserQuestion (A7-Q)", () => {
     expect(outcome.narrated).toEqual(["asked toolu_3", "withdrawn toolu_3"]);
   });
 
+  test("slice 3 fix, L1: a Stop withdraws the question before the interrupt is sent, so an answer racing it is refused, not lost", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const narrated = yield* Effect.forkChild(questionEntries(harness, 2));
+        const { answer, abort } = askVia(driver, "toolu_r");
+        let settledBy: string | undefined;
+        void answer.then(() => {
+          settledBy ??= "answer";
+        });
+        // The Stop is sent, and the CLI has not yet aborted the hook — the window an answer
+        // could land in. The fake's interrupt aborts nothing, so the window stays open.
+        const stopped = yield* harness.interruptSession(ASKS);
+        const late = yield* Effect.result(
+          harness.answerQuestion(ASKS, "toolu_r", {
+            "Which colour do you prefer?": ["Blue"],
+          }),
+        );
+        const pending = yield* harness.pendingQuestions(ASKS);
+        // The hook still waits for the CLI, which ends it as an interrupt does.
+        yield* Effect.sleep("20 millis");
+        const beforeAbort = settledBy;
+        abort.abort();
+        return {
+          stopped,
+          late,
+          pending,
+          beforeAbort,
+          interrupts: driver.seen.interrupts,
+          output: yield* Effect.promise(() => answer),
+          narrated: yield* Fiber.join(narrated),
+        };
+      }),
+    );
+    expect(outcome.stopped).toBe(true);
+    expect(outcome.interrupts).toBe(1);
+    expect(outcome.late).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "QuestionNotPending", reason: "settled" },
+    });
+    expect(outcome.pending).toEqual([]);
+    expect(outcome.beforeAbort).toBeUndefined();
+    // Nothing the CLI could run with: no decision, as any withdrawal.
+    expect(outcome.output).toEqual({});
+    expect(outcome.narrated).toEqual(["asked toolu_r", "withdrawn toolu_r"]);
+  });
+
+  test("slice 3 fix, M1: two questions held at once are both pending, each answered on its own, newest first as the dock offers it", async () => {
+    const outcome = await withTurnDriven((harness, driver) =>
+      Effect.gen(function* () {
+        yield* asking(harness, driver);
+        const narrated = yield* Effect.forkChild(questionEntries(harness, 4));
+        const first = askVia(driver, "toolu_a");
+        const second = askVia(driver, "toolu_b");
+        const both = (yield* harness.pendingQuestions(ASKS)).map(
+          (question) => question.questionId,
+        );
+        yield* harness.answerQuestion(ASKS, "toolu_b", {
+          "Which colour do you prefer?": ["Red"],
+        });
+        const left = (yield* harness.pendingQuestions(ASKS)).map(
+          (question) => question.questionId,
+        );
+        yield* harness.answerQuestion(ASKS, "toolu_a", {
+          "Which colour do you prefer?": ["Blue"],
+        });
+        return {
+          both,
+          left,
+          a: yield* Effect.promise(() => first.answer),
+          b: yield* Effect.promise(() => second.answer),
+          narrated: yield* Fiber.join(narrated),
+        };
+      }),
+    );
+    expect(outcome.both).toEqual(["toolu_a", "toolu_b"]);
+    expect(outcome.left).toEqual(["toolu_a"]);
+    const answered = (output: unknown) =>
+      JSON.stringify(
+        (
+          output as {
+            hookSpecificOutput?: { updatedInput?: { answers?: unknown } };
+          }
+        ).hookSpecificOutput?.updatedInput?.answers,
+      );
+    expect(answered(outcome.a)).toBe(
+      JSON.stringify({ "Which colour do you prefer?": "Blue" }),
+    );
+    expect(answered(outcome.b)).toBe(
+      JSON.stringify({ "Which colour do you prefer?": "Red" }),
+    );
+    expect(outcome.narrated).toEqual([
+      "asked toolu_a",
+      "asked toolu_b",
+      "answered toolu_b",
+      "answered toolu_a",
+    ]);
+  });
+
   test("ending the session withdraws what it still waits on, and a call with no questions is left to the CLI", async () => {
     const outcome = await withTurnDriven((harness, driver) =>
       Effect.gen(function* () {

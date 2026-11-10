@@ -1820,6 +1820,16 @@ export const piHarness = (
             return false;
           }
           if (!record.busy && record.pendingPrompts === 0) return false;
+          /*
+           * The questions it holds are withdrawn **before** the `abort` is written (slice 3
+           * review, L1). Pi resolves a held dialog empty on `abort` and drops a value written
+           * after it, so an answer arriving between the two was reported delivered and
+           * lost. Withdrawn first, an answer either was written ahead of the `abort` (Pi
+           * reads its input in order, so the tool gets it) or finds nothing pending and is
+           * refused (`QuestionNotPending`), and the page offers it as a message, as after
+           * any withdrawal.
+           */
+          withdrawQuestions(record);
           // `abort` answers once Pi is idle, after its `agent_settled` (measured).
           const asked = yield* Effect.result(
             command(rpc, { type: "abort" }, interruptTimeout),
