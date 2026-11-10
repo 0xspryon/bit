@@ -150,7 +150,10 @@ export const modelsWithoutSpelling = (
   config.flatMap((entry) => {
     if (entry.driver !== "claude-code" || entry.configDir === undefined)
       return [];
-    const missing = (entry.models ?? [])
+    // No `models` at all: the stock catalogue, which declares no spellings either. Said as
+    // an empty list, for the caller to word.
+    if (entry.models === undefined) return [{ id: entry.id, models: [] }];
+    const missing = entry.models
       .filter((model) => model.reportedAs === undefined)
       .map((model) => model.id);
     return missing.length === 0 ? [] : [{ id: entry.id, models: missing }];

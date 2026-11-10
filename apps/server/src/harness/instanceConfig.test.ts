@@ -257,6 +257,17 @@ describe("modelsWithoutSpelling", () => {
     ]);
   });
 
+  test("a folder with no models list is named with an empty list", () => {
+    const result = decode({
+      instances: [{ id: "cc-zai", driver: "claude-code", configDir: ZAI }],
+    });
+    if (result._tag !== "configured")
+      throw new Error(`not configured: ${result._tag}`);
+    expect(modelsWithoutSpelling(result.instances)).toEqual([
+      { id: "cc-zai", models: [] },
+    ]);
+  });
+
   test("says nothing when every model of a folder is spelled", () => {
     const result = decode({
       instances: [
