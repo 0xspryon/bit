@@ -224,6 +224,8 @@ const runWorker = async (
   }, MEMORY_POLL_MILLIS);
   const onAbort = () => kill("interrupted");
   signal?.addEventListener("abort", onAbort, { once: true });
+  // A caller that gave up before the child started has no abort event left to send.
+  if (signal?.aborted === true) kill("interrupted");
 
   let stdout: string;
   let stderr: string;
@@ -321,17 +323,19 @@ export const workerHistorySdk = (
   const read = async <A>(
     request: HistoryRequest,
     decode: (value: unknown) => A,
+    signal: AbortSignal | undefined,
   ): Promise<A> =>
-    decodeValue(request, decode, await runWorker(request, options));
+    decodeValue(request, decode, await runWorker(request, options, signal));
   return {
     query: base.query,
-    sessionInfo: (sessionId, { dir }) =>
+    sessionInfo: (sessionId, { dir, signal }) =>
       read(
         { op: "sessionInfo", sessionId, ...(dir === undefined ? {} : { dir }) },
         (value) =>
           (decodeInfo(value) ?? undefined) as SDKSessionInfo | undefined,
+        signal,
       ),
-    sessionMessages: (sessionId, { dir }) =>
+    sessionMessages: (sessionId, { dir, signal }) =>
       read(
         {
           op: "sessionMessages",
@@ -339,8 +343,9 @@ export const workerHistorySdk = (
           ...(dir === undefined ? {} : { dir }),
         },
         (value) => decodeMessages(value) as readonly SessionMessage[],
+        signal,
       ),
-    subagentMessages: (sessionId, agentId, { dir }) =>
+    subagentMessages: (sessionId, agentId, { dir, signal }) =>
       read(
         {
           op: "subagentMessages",
@@ -349,8 +354,9 @@ export const workerHistorySdk = (
           ...(dir === undefined ? {} : { dir }),
         },
         (value) => decodeMessages(value) as readonly SessionMessage[],
+        signal,
       ),
-    listSubagents: (sessionId, { dir }) =>
+    listSubagents: (sessionId, { dir, signal }) =>
       read(
         {
           op: "listSubagents",
@@ -358,6 +364,7 @@ export const workerHistorySdk = (
           ...(dir === undefined ? {} : { dir }),
         },
         decodeIds,
+        signal,
       ),
   };
 };
