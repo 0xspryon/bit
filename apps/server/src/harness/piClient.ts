@@ -26,10 +26,29 @@
  * **One process per session, started at the session's first prompt**, not at
  * `createSession`, for the reason the Claude Code driver holds its query until then: the
  * MCP credential is minted between the two (`liveAgentSessions.ts`), and it reaches Pi only
- * when the process starts. Each process is its own process group (`detached`), so ending a
- * session stops Pi and every shell it started ({@link stopOwnedChild}); each is recorded in
- * the owned-process directory, so a server that dies without its finalizers (`bun --watch`)
- * has the orphan reaped on its next boot. Measured RSS: 110–140 MB per process.
+ * when the process starts. Each process is recorded in the owned-process directory, so a
+ * server that dies without its finalizers (`bun --watch`) has the orphan reaped on its next
+ * boot. Measured RSS: 110–140 MB per process.
+ *
+ * ## Containment: one systemd user scope per process
+ *
+ * Pi runs every bash call as a `bash -c` in a session of its own, so a job the agent puts in
+ * the background (`nohup sleep 777 &`) is reparented to the user's systemd at once and was
+ * out of reach of the process-tree tracker: it survived End, shutdown and the reaper (slice
+ * 2 review, M1). So, when the user manager can be reached ({@link PiHarnessOptions.containment},
+ * probed once at startup), **each process starts in a scope of its own** through
+ * `systemd-run --user --scope` (`userScopes.ts`, which says why that and not D-Bus): a
+ * cgroup holding Pi and everything it ever starts, detached or not. Ending the session —
+ * End, a Stop that ends it, the process dying, the server shutting down — stops the whole
+ * cgroup (`SIGTERM`, then `cgroup.kill` after the grace); a scope a killed server left is
+ * stopped by the next boot (`reapUserScopes`, `main.ts`). A Stop of a turn is still Pi's
+ * `abort`, which ends the running call's process group and leaves the session's background
+ * jobs alone, as before. An instance's `memoryMax` caps the scope; a scope killed for memory
+ * ends the session as a process death that says so.
+ *
+ * Without a user manager, each process is its own process group (`detached`) and its tree
+ * is followed through `/proc` ({@link stopOwnedChild}), as before, and the instance's
+ * notice says what that leaves uncovered.
  *
  * ## bit's tools: an extension, and the credential on a pipe
  *
@@ -152,6 +171,13 @@ import {
   type ModelProvenance,
 } from "./identity";
 import {
+  scopeHandle,
+  scopeUnitFor,
+  scopedCommand,
+  type ScopeAvailability,
+  type ScopeHandle,
+} from "./userScopes";
+import {
   forgetOwnedProcess,
   leadsOwnGroup,
   recordOwnedProcess,
@@ -216,6 +242,17 @@ export interface PiHarnessOptions {
   /** How long a Stop may take to be acknowledged before the process is killed. */
   readonly interruptTimeout?: Duration.Input | undefined;
   readonly stopBounds?: StopBounds | undefined;
+  /**
+   * Whether each process starts in a systemd user scope of its own (`userScopes.ts`), as
+   * the server's startup probe found it. Absent: no scope, and nothing said about it — for
+   * tests of the uncontained path; `main.ts` always passes the probe's answer.
+   */
+  readonly containment?: ScopeAvailability | undefined;
+  /**
+   * The cap on one session's scope, Pi and everything it started (systemd's syntax: `2G`),
+   * with no swap. Absent: no cap. Applied only when {@link containment} is available.
+   */
+  readonly memoryMax?: string | undefined;
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration.Input = "30 seconds";
@@ -293,6 +330,8 @@ type Response = {
 interface RpcProcess {
   readonly child: ChildProcess;
   readonly tree: ProcessTree | undefined;
+  /** The process's systemd scope; `undefined` when it runs uncontained. */
+  readonly scope: ScopeHandle | undefined;
   readonly record: string | undefined;
   readonly pending: Map<string, (response: Response) => void>;
   next: number;
@@ -714,6 +753,20 @@ export const piHarness = (
       const stopBounds = options.stopBounds ?? DEFAULT_STOP_BOUNDS;
       const extensionPath = options.extensionPath ?? defaultExtensionPath();
       const sessionDir = options.sessionDir;
+      const memoryMax = options.memoryMax;
+      const scopes =
+        options.containment?._tag === "available"
+          ? options.containment.scopes
+          : undefined;
+      /** What the operator is told once, at startup and on the instance's row. */
+      const notice =
+        options.containment?._tag === "unavailable"
+          ? `Pi sessions run without a cgroup of their own (${options.containment.reason}), so a job an agent leaves running in the background can outlive its session${memoryMax === undefined ? "" : `, and memoryMax ${memoryMax} is not applied`}.`
+          : scopes !== undefined &&
+              memoryMax !== undefined &&
+              !scopes.memoryController
+            ? `memoryMax ${memoryMax} is not enforced: the systemd user manager has no memory controller to give a session's scope.`
+            : undefined;
       /** Pi's environment: the server's, without bit's own settings, and the agent folder. */
       const environment = (): Record<string, string | undefined> => ({
         ...agentEnvironment(process.env),
@@ -799,6 +852,7 @@ export const piHarness = (
             view(defaultModel, undefined),
           ...catalogue.filter((model) => model.id !== defaultModel),
         ],
+        ...(notice === undefined ? {} : { notice }),
       };
 
       const sessions = new Map<string, SessionRecord>();
@@ -1097,6 +1151,7 @@ export const piHarness = (
         rpc: RpcProcess,
         code: number | null,
         signal: string | null,
+        outOfMemory: boolean,
       ) => {
         for (const [, resolve] of rpc.pending)
           resolve({ success: false, error: "the Pi process exited" });
@@ -1106,18 +1161,42 @@ export const piHarness = (
           record.closed = true;
           record.busy = false;
           void Effect.runPromise(
-            Effect.logWarning("a Pi process exited on its own", {
-              sessionId: record.sessionId,
-              code,
-              signal,
-              running,
-              stderr: rpc.stderrTail,
-            }),
+            Effect.logWarning(
+              outOfMemory
+                ? "a Pi session's scope was killed for memory"
+                : "a Pi process exited on its own",
+              {
+                sessionId: record.sessionId,
+                code,
+                signal,
+                running,
+                unit: rpc.scope?.unit,
+                memoryMax,
+                stderr: rpc.stderrTail,
+              },
+            ),
           ).catch(() => undefined);
-          if (running) {
+          const lost =
+            record.untaken.length === 0
+              ? ""
+              : ` ${record.untaken.length === 1 ? "A message" : `${String(record.untaken.length)} messages`} sent while it ran had not been read yet, and went with it.`;
+          // Said even between turns when it was memory: the session ended for a reason the
+          // operator can act on, and nothing else would tell them (a crash between turns is
+          // only noticed by the next message, which resumes the session).
+          if (running || outOfMemory) {
+            const when = running ? " while a turn was in flight" : "";
+            const what = outOfMemory
+              ? `was stopped${when}: ${
+                  memoryMax === undefined
+                    ? "the machine ran out of memory and the kernel killed a process of this session"
+                    : `the session ran out of its memory limit (${memoryMax})`
+                }, and everything it had started was stopped with it.`
+              : `exited (${signal ?? `code ${String(code)}`})${when}.`;
             const exit: ProcessExit = {
               at: Date.now(),
-              message: `The Pi process running this session exited (${signal ?? `code ${String(code)}`}) while a turn was in flight. What it finished is kept; how the turn would have ended is not known.${record.untaken.length === 0 ? "" : ` ${record.untaken.length === 1 ? "A message" : `${String(record.untaken.length)} messages`} sent while it ran had not been read yet, and went with it.`}`,
+              message: running
+                ? `The Pi process running this session ${what} What it finished is kept; how the turn would have ended is not known.${lost}`
+                : `The Pi process running this session ${what} What it finished is kept, and the next message carries the conversation on.`,
             };
             // Kept for the replay (slice 3 fix, L2): Pi's file says nothing of a death, and
             // a thread read again after it would lose the only line saying why the turn
@@ -1143,7 +1222,9 @@ export const piHarness = (
               ? Effect.fail(
                   transport(
                     "pi.process",
-                    `the Pi process exited (${signal ?? `code ${String(code)}`}) mid-turn; the turn's outcome is not known`,
+                    outOfMemory
+                      ? `the Pi session ran out of ${memoryMax === undefined ? "memory" : `its memory limit (${memoryMax})`} mid-turn and was stopped; the turn's outcome is not known`
+                      : `the Pi process exited (${signal ?? `code ${String(code)}`}) mid-turn; the turn's outcome is not known`,
                     // What was queued in it is gone with it (`SESSION_PROCESS_GONE_TAG`).
                     { tag: SESSION_PROCESS_GONE_TAG },
                   ),
@@ -1176,9 +1257,24 @@ export const piHarness = (
             extensionPath,
           ];
           const mcp = record.mcp;
+          // In a scope of its own when the user manager can give one: `systemd-run`
+          // execs Pi in place, so the pid, the pipes and fd 3 below are Pi's own.
+          const unit =
+            scopes === undefined
+              ? undefined
+              : scopeUnitFor(scopes, record.sessionId);
+          const launched =
+            unit === undefined
+              ? { file: binary, args }
+              : scopedCommand(unit, {
+                  description: `bit Pi session ${record.sessionId}`,
+                  memoryMax,
+                  file: binary,
+                  args,
+                });
           let child: ChildProcess;
           try {
-            child = spawn(binary, args, {
+            child = spawn(launched.file, launched.args, {
               cwd: record.directory,
               env: {
                 ...environment(),
@@ -1213,10 +1309,19 @@ export const piHarness = (
           }
           const pid = child.pid;
           const ownsGroup = pid !== undefined && leadsOwnGroup(pid);
+          const scope =
+            unit === undefined || scopes === undefined || pid === undefined
+              ? undefined
+              : scopeHandle(scopes, unit);
           const rpc: RpcProcess = {
             child,
+            scope,
+            // The scope holds everything Pi starts; the tracker is the fallback without it.
             tree:
-              pid === undefined ? undefined : trackProcessTree(pid, ownsGroup),
+              scope ??
+              (pid === undefined
+                ? undefined
+                : trackProcessTree(pid, ownsGroup)),
             record:
               pid === undefined || options.recordDirectory === undefined
                 ? undefined
@@ -1255,12 +1360,22 @@ export const piHarness = (
             rpc.exited = true;
             rpc.tree?.adoptOrphanedGroup();
             if (rpc.stopping === undefined) {
-              died(record, rpc, code, signal);
-              // Whatever it left running in its group goes too.
-              void Effect.runPromise(stopRpc(rpc)).catch(() => undefined);
+              void Effect.runPromise(
+                Effect.gen(function* () {
+                  // Asked before the scope is stopped: its own count says whether the
+                  // kernel killed anything in it for memory.
+                  const outOfMemory =
+                    rpc.scope === undefined
+                      ? false
+                      : yield* rpc.scope.outOfMemory;
+                  died(record, rpc, code, signal, outOfMemory);
+                  // Whatever it left running — in its scope, or in its group — goes too.
+                  yield* stopRpc(rpc);
+                }),
+              ).catch(() => undefined);
             }
           });
-          if (pid !== undefined && !ownsGroup) {
+          if (pid !== undefined && !ownsGroup && scope === undefined) {
             yield* Effect.logWarning(
               "could not verify a Pi process leads its own process group; ending its session stops Pi only, not the shells it started",
               { sessionId: record.sessionId, pid },
@@ -1410,11 +1525,14 @@ export const piHarness = (
             if (outcome === "survived") {
               yield* Effect.logError(
                 "an ended Pi session's process survived SIGKILL; it may still be running",
-                { pid: rpc.child.pid },
+                { pid: rpc.child.pid, unit: rpc.scope?.unit },
               );
             } else if (rpc.record !== undefined) {
               forgetOwnedProcess(rpc.record);
             }
+            // An emptied scope unloads by itself; one that ended `failed` (killed for
+            // memory) stays listed until it is cleared.
+            if (rpc.scope !== undefined) yield* rpc.scope.release;
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => Deferred.doneUnsafe(stopping, Effect.void)),

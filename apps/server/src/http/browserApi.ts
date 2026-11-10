@@ -1932,6 +1932,9 @@ const fleetHandlers = HttpApiBuilder.group(
             isDefault: listing.isDefault,
             defaultModel: listing.instance.defaultModel,
             models: listing.instance.models,
+            ...(listing.instance.notice === undefined
+              ? {}
+              : { notice: listing.instance.notice }),
           })),
         ),
 

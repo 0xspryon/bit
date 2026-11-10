@@ -152,6 +152,14 @@ import {
   harnessResolverLayer,
   type HarnessCandidate,
 } from "./harness/resolver";
+import {
+  piScopePrefix,
+  probeUserScopes,
+  reapUserScopes,
+  renderScopeReapOutcome,
+  serverScopeId,
+  type ScopeAvailability,
+} from "./harness/userScopes";
 import { ScopeImportProgress } from "./import/progress";
 import { ScopeImporter } from "./import/scopeImporter";
 import { McpCredentials } from "./mcp/credentials";
@@ -404,6 +412,13 @@ const fleet = FleetStore.layer(HUNT_ROOT);
 const OWNED_PROCESSES = ownedProcessDirectory(HUNT_ROOT);
 
 /**
+ * Every Pi scope this installation starts is named `bit-pi-<id>-…`, `<id>` a hash of the
+ * fleet root (`harness/userScopes.ts`): the reaper below stops only these, never another
+ * bit server's on this machine.
+ */
+const PI_SCOPES = piScopePrefix(serverScopeId(HUNT_ROOT));
+
+/**
  * Ends `opencode serve` processes a previous run of this process left behind.
  *
  * It exists because of one measured fact: `bun --watch` restarts us *in place*, reusing
@@ -426,15 +441,50 @@ const OWNED_PROCESSES = ownedProcessDirectory(HUNT_ROOT);
  */
 const reapOrphanedHarnesses = Effect.gen(function* () {
   const outcomes = yield* reapOwnedProcesses(OWNED_PROCESSES);
-  if (outcomes.length === 0) return;
-  console.log(
-    `harness processes: ${String(outcomes.length)} record(s) left by a previous run of this process`,
-  );
-  for (const outcome of outcomes) {
-    const line = `  ${renderReapOutcome(outcome)}`;
-    if (reapNeedsAttention(outcome)) console.error(line);
-    else console.log(line);
+  if (outcomes.length > 0) {
+    console.log(
+      `harness processes: ${String(outcomes.length)} record(s) left by a previous run of this process`,
+    );
+    for (const outcome of outcomes) {
+      const line = `  ${renderReapOutcome(outcome)}`;
+      if (reapNeedsAttention(outcome)) console.error(line);
+      else console.log(line);
+    }
   }
+  // The Pi scopes a killed run left, with what its agents had running in the background.
+  // Looked for whether or not Pi is configured now: an instance removed from the file after
+  // a crash still left its scopes behind.
+  const scopes = yield* reapUserScopes(PI_SCOPES);
+  if (scopes.length > 0) {
+    console.log(
+      `pi scopes: ${String(scopes.length)} left by a previous run of this process`,
+    );
+    for (const outcome of scopes) {
+      const line = `  ${renderScopeReapOutcome(outcome)}`;
+      if (outcome.state === "survived") console.error(line);
+      else console.log(line);
+    }
+  }
+});
+
+/**
+ * Whether Pi sessions get a systemd user scope each, probed once, after the reap and
+ * before any harness layer is built (`piCandidate` reads it as its layer is built, which
+ * the boot's order puts after this). Not probed when no Pi instance is configured.
+ */
+let piContainment: ScopeAvailability = {
+  _tag: "unavailable",
+  reason: "the startup check did not run",
+};
+
+const checkPiContainment = Effect.gen(function* () {
+  if (!(INSTANCE_CONFIG ?? []).some((config) => config.driver === "pi")) return;
+  piContainment = yield* probeUserScopes(PI_SCOPES);
+  console.log(
+    piContainment._tag === "available"
+      ? `pi containment: one systemd user scope per session (${PI_SCOPES}*.scope)`
+      : `pi containment: none — ${piContainment.reason}; a job a Pi agent leaves running in the background can outlive its session`,
+  );
 });
 
 /**
@@ -723,6 +773,10 @@ const piCandidate = (config: PiInstanceConfig): HarnessCandidate => {
         displayName: config.displayName,
         sessionDir: join(HUNT_ROOT, "harness", "pi-sessions", config.id),
         recordDirectory: OWNED_PROCESSES,
+        containment: piContainment,
+        ...(config.memoryMax === undefined
+          ? {}
+          : { memoryMax: config.memoryMax }),
         ...(config.binary === undefined ? {} : { binary: config.binary }),
         ...(config.agentDir === undefined ? {} : { agentDir: config.agentDir }),
         ...(config.models === undefined ? {} : { models: config.models }),
@@ -1553,7 +1607,7 @@ const program = Effect.gen(function* () {
     console.log(
       `    ${listing.instance.instanceId}: ${
         listing.status === "ready"
-          ? `ready, ${listing.instance.version}, ${String(listing.instance.models.length)} model(s), default ${listing.instance.defaultModel}${listing.isDefault ? " — this server's default instance" : ""}`
+          ? `ready, ${listing.instance.version}, ${String(listing.instance.models.length)} model(s), default ${listing.instance.defaultModel}${listing.isDefault ? " — this server's default instance" : ""}${listing.instance.notice === undefined ? "" : `. ${listing.instance.notice}`}`
           : `unusable — ${listing.reason ?? "no reason given"}`
       }`,
     );
@@ -1606,7 +1660,7 @@ await Effect.runPromise(
     Effect.raceFirst(
       Effect.andThen(
         Effect.andThen(
-          reapOrphanedHarnesses,
+          Effect.andThen(reapOrphanedHarnesses, checkPiContainment),
           prepareFleet.pipe(Effect.provide(fleet)),
         ),
         program.pipe(
