@@ -555,9 +555,13 @@
     white-space: nowrap;
     text-overflow: ellipsis;
   }
-  /* The id beside a configured label: what a run names, quieter than the name. */
+  /*
+   * The id beside a configured label: what a run names, quieter than the name, and kept
+   * next to it rather than spread to the middle of the row by the default tag.
+   */
   .model-id {
     flex: none;
+    margin-right: auto;
     color: var(--text-muted);
     font-size: 11px;
   }
