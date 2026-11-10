@@ -1,0 +1,439 @@
+/**
+ * Claude Code as one of several configured instances (`instanceConfig.ts`): its identity,
+ * what each CLI it spawns is given, two of them in one process, a provider's retries, and
+ * an aliasing provider's model spellings.
+ *
+ * Over a scripted SDK, like `claudeCodeClient.test.ts`: what is checked is what this harness
+ * does with what the SDK says, and what it asks the SDK for.
+ */
+import { describe, expect, test } from "bun:test";
+
+import type {
+  Options,
+  SDKMessage,
+  SessionMessage,
+} from "@anthropic-ai/claude-agent-sdk";
+import { Context, Effect, Fiber, Layer, Stream } from "effect";
+
+import { AgentHarness } from "./agentHarness";
+import {
+  claudeCodeHarness,
+  newClaudeCodeSessionId,
+  type ClaudeCodeHarnessOptions,
+  type ClaudeCodeSdk,
+  type HarnessQuery,
+} from "./claudeCodeClient";
+import { InstanceId } from "./identity";
+
+interface Script {
+  readonly messages?: readonly SDKMessage[];
+  readonly transcript?: readonly SessionMessage[];
+  readonly contextModel?: string;
+  /** Holds the stream open after the script, as a live conversation's CLI does. */
+  readonly stayOpen?: boolean;
+}
+
+/** A `query()` that yields its script once the prompt is pulled, and the options it got. */
+const scriptedSdk = (script: Script = {}) => {
+  const launched: Options[] = [];
+  const sdk: ClaudeCodeSdk = {
+    query: ({ prompt, options }) => {
+      launched.push(options);
+      let pulled: (() => void) | undefined;
+      const ready = new Promise<void>((resolve) => {
+        pulled = resolve;
+      });
+      let release: (() => void) | undefined;
+      const closed = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      void (async () => {
+        for await (const message of prompt) if (message !== undefined) pulled?.();
+      })();
+      const query: HarnessQuery = {
+        setMcpServers: async () => ({}),
+        interrupt: async () => undefined,
+        stopTask: async () => undefined,
+        getContextUsage: async () => ({
+          maxTokens: 200_000,
+          ...(script.contextModel === undefined
+            ? {}
+            : { model: script.contextModel }),
+          apiUsage: null,
+        }),
+        setModel: async () => undefined,
+        applyFlagSettings: async () => undefined,
+        close: () => release?.(),
+        [Symbol.asyncIterator]: async function* () {
+          await ready;
+          for (const message of script.messages ?? []) yield message;
+          if (script.stayOpen === true) await closed;
+        },
+      };
+      return query;
+    },
+    sessionMessages: () => Promise.resolve(script.transcript ?? []),
+    sessionInfo: () => Promise.resolve(undefined),
+    subagentMessages: () => Promise.resolve([]),
+    listSubagents: () => Promise.resolve([]),
+  };
+  return { sdk, launched };
+};
+
+class Stock extends Context.Service<Stock, AgentHarness["Service"]>()(
+  "test/Stock",
+) {}
+class Zai extends Context.Service<Zai, AgentHarness["Service"]>()("test/Zai") {}
+
+const ZAI: ClaudeCodeHarnessOptions = {
+  instanceId: InstanceId.make("cc-zai"),
+  displayName: "Claude Code · z.ai",
+  configDir: "/cc/zai",
+  provider: "zai",
+  models: [
+    { id: "opus", label: "GLM-5.3" },
+    { id: "sonnet", label: "GLM-5.3 Flash" },
+  ],
+  defaultModel: "sonnet",
+  maxRetries: 1,
+};
+
+const withHarness = <A>(
+  options: ClaudeCodeHarnessOptions,
+  use: (harness: AgentHarness["Service"]) => Effect.Effect<A, unknown>,
+): Promise<A> =>
+  Effect.runPromise(
+    Effect.scoped(
+      Effect.flatMap(AgentHarness, use).pipe(
+        Effect.provide(
+          claudeCodeHarness({ controlTimeout: "2 seconds", ...options }),
+        ),
+        Effect.orDie,
+      ),
+    ),
+  );
+
+/** One turn on `model`, its narration collected. */
+const turn = (
+  harness: AgentHarness["Service"],
+  model: string,
+  multiTurn = false,
+) =>
+  Effect.gen(function* () {
+    const sessionId = newClaudeCodeSessionId();
+    const ref = yield* harness.createSession({
+      title: "bit: t",
+      model,
+      directory: "/tmp/ws",
+      sessionId,
+      ...(multiTurn ? { multiTurn: true } : {}),
+    });
+    const narration = yield* Effect.forkChild(
+      Stream.runCollect(harness.sessionEvents(sessionId)),
+    );
+    yield* harness.prompt(sessionId, "go");
+    yield* harness.waitForIdle(sessionId);
+    if (multiTurn) return { sessionId, ref, narrated: [] };
+    return { sessionId, ref, narrated: [...(yield* Fiber.join(narration))] };
+  });
+
+const init = (model: string): SDKMessage =>
+  ({
+    type: "system",
+    subtype: "init",
+    model,
+    session_id: "s",
+    uuid: "00000000-0000-4000-8000-000000000001",
+  }) as unknown as SDKMessage;
+
+const assistant = (model: string): SDKMessage =>
+  ({
+    type: "assistant",
+    message: {
+      id: "msg_1",
+      role: "assistant",
+      model,
+      content: [{ type: "text", text: "OK" }],
+      usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 1 },
+    },
+    parent_tool_use_id: null,
+    session_id: "s",
+    uuid: "00000000-0000-4000-8000-000000000002",
+  }) as unknown as SDKMessage;
+
+const success = {
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  duration_ms: 1,
+  duration_api_ms: 1,
+  num_turns: 1,
+  result: "OK",
+  total_cost_usd: 0,
+  usage: { input_tokens: 1, output_tokens: 1 },
+  modelUsage: {},
+  permission_denials: [],
+  session_id: "s",
+  uuid: "00000000-0000-4000-8000-00000000ffff",
+} as unknown as SDKMessage;
+
+describe("a configured instance", () => {
+  test("is the instance the file named, with its catalogue and labels", async () => {
+    const { sdk } = scriptedSdk();
+    const instance = await withHarness({ ...ZAI, sdk }, (harness) =>
+      Effect.succeed(harness.instance),
+    );
+    expect(String(instance.instanceId)).toBe("cc-zai");
+    expect(String(instance.driver)).toBe("claude-code");
+    expect(instance.displayName).toBe("Claude Code · z.ai");
+    expect(instance.defaultModel).toBe("sonnet");
+    // The default first, as for the stock list.
+    expect(instance.models).toEqual([
+      { id: "sonnet", label: "GLM-5.3 Flash" },
+      { id: "opus", label: "GLM-5.3" },
+    ]);
+  });
+
+  test("a configured model the stock list knows keeps its reasoning descriptor", async () => {
+    const { sdk } = scriptedSdk();
+    const instance = await withHarness(
+      { sdk, models: [{ id: "claude-sonnet-5", label: "Sonnet" }] },
+      (harness) => Effect.succeed(harness.instance),
+    );
+    expect(instance.defaultModel).toBe("claude-sonnet-5");
+    expect(instance.models[0]?.label).toBe("Sonnet");
+    expect(instance.models[0]?.optionDescriptors?.[0]?.id).toBe("effort");
+  });
+
+  test("provenance records the instance's provider, and the model as asked", async () => {
+    const { sdk } = scriptedSdk();
+    expect(
+      await withHarness({ ...ZAI, sdk }, (harness) =>
+        Effect.succeed(harness.modelProvenance("sonnet")),
+      ),
+    ).toEqual({ providerId: "zai", modelId: "sonnet" });
+    expect(
+      await withHarness({ sdk }, (harness) =>
+        Effect.succeed(harness.modelProvenance("claude-sonnet-5")),
+      ),
+    ).toEqual({ providerId: "anthropic", modelId: "claude-sonnet-5" });
+  });
+});
+
+describe("what each CLI is given", () => {
+  test("the instance's folder and retry bound, on top of this process's environment", async () => {
+    const { sdk, launched } = scriptedSdk({ messages: [success] });
+    await withHarness({ ...ZAI, sdk }, (harness) => turn(harness, "sonnet"));
+    const env = launched[0]?.env;
+    expect(env?.["CLAUDE_CONFIG_DIR"]).toBe("/cc/zai");
+    expect(env?.["CLAUDE_CODE_MAX_RETRIES"]).toBe("1");
+    expect(env?.["PATH"]).toBe(process.env["PATH"]);
+  });
+
+  test("an instance with neither leaves the SDK's default environment alone", async () => {
+    const { sdk, launched } = scriptedSdk({ messages: [success] });
+    await withHarness({ sdk }, (harness) => turn(harness, "claude-sonnet-5"));
+    expect(launched[0]?.env).toBeUndefined();
+  });
+
+  test("two instances in one process each launch on their own folder", async () => {
+    const stock = scriptedSdk({ messages: [success] });
+    const zai = scriptedSdk({ messages: [success] });
+    // Each harness built as its own layer, as the resolver builds each candidate.
+    const both = Layer.mergeAll(
+      Layer.effect(
+        Stock,
+        Effect.map(AgentHarness, (harness) => harness),
+      ).pipe(
+        Layer.provide(
+          claudeCodeHarness({ sdk: stock.sdk, controlTimeout: "2 seconds" }),
+        ),
+      ),
+      Layer.effect(
+        Zai,
+        Effect.map(AgentHarness, (harness) => harness),
+      ).pipe(
+        Layer.provide(
+          claudeCodeHarness({
+            ...ZAI,
+            sdk: zai.sdk,
+            controlTimeout: "2 seconds",
+          }),
+        ),
+      ),
+    );
+    const sessions = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const left = yield* Stock;
+          const right = yield* Zai;
+          const [a, b] = yield* Effect.all(
+            [turn(left, "claude-haiku-4-5"), turn(right, "sonnet")],
+            { concurrency: "unbounded" },
+          );
+          // Each holds its own session and not the other's.
+          const crossed = yield* Effect.result(
+            right.sessionStatus(a.sessionId),
+          );
+          return { a, b, crossed, ids: [left.instance, right.instance] };
+        }).pipe(Effect.provide(both), Effect.orDie),
+      ),
+    );
+    expect(stock.launched[0]?.env).toBeUndefined();
+    expect(zai.launched[0]?.env?.["CLAUDE_CONFIG_DIR"]).toBe("/cc/zai");
+    expect(sessions.ids.map((each) => String(each.instanceId))).toEqual([
+      "claude-code",
+      "cc-zai",
+    ]);
+    expect(sessions.crossed._tag).toBe("Failure");
+  });
+});
+
+describe("a provider's retries", () => {
+  test("each api_retry frame is a retry entry with its counters", async () => {
+    const { sdk } = scriptedSdk({
+      messages: [
+        init("glm-5.3-flash"),
+        {
+          type: "system",
+          subtype: "api_retry",
+          attempt: 3,
+          max_retries: 10,
+          retry_delay_ms: 2_150,
+          error_status: 429,
+          error: "rate_limit",
+          session_id: "s",
+          uuid: "00000000-0000-4000-8000-000000000003",
+        } as unknown as SDKMessage,
+        success,
+      ],
+    });
+    const { narrated } = await withHarness({ ...ZAI, sdk }, (harness) =>
+      turn(harness, "sonnet"),
+    );
+    expect(
+      narrated
+        .map((entry) => entry.detail)
+        .filter((detail) => detail._tag === "retry"),
+    ).toEqual([
+      {
+        _tag: "retry",
+        attempt: 3,
+        maxRetries: 10,
+        delayMs: 2_150,
+        status: 429,
+        error: "rate_limit",
+      },
+    ]);
+  });
+});
+
+describe("an aliasing provider's model spellings", () => {
+  const models = (narrated: readonly { readonly detail: unknown }[]) =>
+    narrated
+      .map((entry) => entry.detail as { _tag: string; model?: string })
+      .filter((detail) => detail.model !== undefined)
+      .map((detail) => `${detail._tag}:${String(detail.model)}`);
+
+  test("a frame's provider name reads as the catalogue model the session was asked for", async () => {
+    const { sdk } = scriptedSdk({
+      messages: [init("glm-5.3-flash"), assistant("glm-5.3-flash"), success],
+    });
+    const { narrated } = await withHarness({ ...ZAI, sdk }, (harness) =>
+      turn(harness, "sonnet"),
+    );
+    expect(models(narrated)).toEqual(["reply:sonnet", "usage:sonnet"]);
+  });
+
+  test("a declared spelling is read before any session said it: a replay after a restart", async () => {
+    const { sdk } = scriptedSdk({
+      transcript: [
+        {
+          type: "assistant",
+          uuid: "u1",
+          session_id: "s",
+          message: {
+            id: "msg_1",
+            model: "glm-5.3",
+            content: [{ type: "text", text: "stored" }],
+            usage: { input_tokens: 5, output_tokens: 1 },
+          },
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+        },
+      ],
+    });
+    const entries = await withHarness(
+      {
+        ...ZAI,
+        sdk,
+        models: [
+          { id: "opus", label: "GLM-5.3", reportedAs: "glm-5.3" },
+          { id: "sonnet", label: "GLM-5.3 Flash" },
+        ],
+      },
+      (harness) => harness.messages(newClaudeCodeSessionId()),
+    );
+    expect(entries.map((entry) => entry.model)).toEqual(["opus"]);
+    expect(
+      entries.flatMap((entry) =>
+        entry.parts.map((part) => (part as { model?: string }).model),
+      ),
+    ).toEqual(["opus"]);
+  });
+
+  test("a context read names the measured call by its catalogue model", async () => {
+    const { sdk } = scriptedSdk({
+      messages: [init("glm-5.3-flash"), assistant("glm-5.3-flash"), success],
+      contextModel: "glm-5.3-flash",
+      transcript: [
+        {
+          type: "assistant",
+          uuid: "u1",
+          session_id: "s",
+          message: {
+            id: "msg_1",
+            model: "glm-5.3-flash",
+            content: [{ type: "text", text: "OK" }],
+            usage: { input_tokens: 10, output_tokens: 1 },
+          },
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+        },
+      ],
+    });
+    const usage = await withHarness({ ...ZAI, sdk }, (harness) =>
+      Effect.gen(function* () {
+        const { sessionId } = yield* turn(harness, "sonnet");
+        return yield* harness.contextUsage(sessionId, {
+          model: "sonnet",
+          breakdown: false,
+        });
+      }),
+    );
+    // The turn closed its single-turn session, so this is the transcript's reading: the
+    // stored call's provider name, in the catalogue's spelling.
+    expect(usage.usedModel).toBe("sonnet");
+  });
+
+  test("a live session's context read names its catalogue model, not the provider's", async () => {
+    const { sdk } = scriptedSdk({
+      messages: [init("glm-5.3-flash"), assistant("glm-5.3-flash"), success],
+      contextModel: "glm-5.3-flash",
+      stayOpen: true,
+    });
+    const usage = await withHarness({ ...ZAI, sdk }, (harness) =>
+      Effect.gen(function* () {
+        const { sessionId, ref } = yield* turn(harness, "sonnet", true);
+        const read = yield* harness.contextUsage(sessionId, {
+          model: "sonnet",
+          breakdown: false,
+        });
+        yield* harness.endSession(ref);
+        return read;
+      }),
+    );
+    expect(usage.model).toBe("sonnet");
+    expect(usage.window).toBe(200_000);
+  });
+});

@@ -145,8 +145,8 @@ import {
   Redacted,
   Semaphore,
   Stream,
+  Duration,
   type Cause,
-  type Duration,
 } from "effect";
 
 import {
@@ -203,12 +203,15 @@ import {
   type ProcessTree,
   type StopBounds,
 } from "./ownedProcesses";
+import { workerHistorySdk } from "./claudeHistory";
 import {
   CLAUDE_CODE_DRIVER,
   defaultInstanceIdForDriver,
   type HarnessInstance,
+  type InstanceId,
   type ModelProvenance,
 } from "./identity";
+import { modelSpellings, type ModelSpellings } from "./modelSpellings";
 
 /**
  * The model a Claude Code worker runs on when nothing names one.
@@ -326,10 +329,17 @@ export const CLAUDE_CODE_MODELS: readonly HarnessModelView[] = [
  */
 const CLAUDE_CODE_PROVIDER = "anthropic";
 
-export const claudeCodeModelProvenance = (model: string): ModelProvenance => ({
-  providerId: CLAUDE_CODE_PROVIDER,
-  modelId: model,
-});
+/**
+ * Provenance for one instance. The provider is the instance's label (a z.ai instance's
+ * `zai`), because the CLI no longer runs on Anthropic's API once its settings point it
+ * elsewhere; the model is the catalogue id the run asked for, as before.
+ */
+export const claudeCodeModelProvenance =
+  (provider: string = CLAUDE_CODE_PROVIDER) =>
+  (model: string): ModelProvenance => ({
+    providerId: provider,
+    modelId: model,
+  });
 
 /**
  * How many narration entries one session holds for a subscriber that is behind.
@@ -548,6 +558,12 @@ const modelOfApiUsage = (
 interface SessionRecord {
   readonly sessionId: string;
   readonly title: string;
+  /**
+   * The instance's model spellings (`modelSpellings.ts`): every model a frame names is
+   * handed through it, preferring {@link model}, so the rest of bit reads the catalogue's
+   * spelling. Shared by every session of one instance, since the mapping is the instance's.
+   */
+  readonly spellings: ModelSpellings;
   /**
    * The model this session runs on: what `launch` starts the query with, and, once it is
    * running, what the last `switchModel` the session acknowledged put it on.
@@ -988,8 +1004,47 @@ interface TrackedTask {
 /** How much of a CLI's stderr is kept, from the end, for the failure it may explain. */
 const STDERR_TAIL = 4_096;
 
+/**
+ * One model of a configured instance's catalogue (`harness/instanceConfig.ts`): the id a
+ * run asks with, what a screen calls it, and how the CLI's frames spell it.
+ */
+export interface ClaudeCodeModelConfig {
+  readonly id: string;
+  readonly label?: string;
+  readonly reportedAs?: string;
+}
+
 /** What a caller may vary about this harness. */
 export interface ClaudeCodeHarnessOptions {
+  /**
+   * The instance this harness is (`harness/instanceConfig.ts`). Absent: the stock
+   * instance, `claude-code`, named "Claude Code" — the only one before instances could be
+   * configured.
+   */
+  readonly instanceId?: InstanceId;
+  /** For the picker and the model chip. Defaults to "Claude Code". */
+  readonly displayName?: string;
+  /**
+   * The instance's `CLAUDE_CONFIG_DIR`: its login or provider settings, and its
+   * transcripts. Set on every CLI this instance spawns, and the reason every history read
+   * runs in a child process ({@link workerHistorySdk}). Absent: the CLI and the in-process
+   * history readers use whatever this server's own environment says, as before.
+   */
+  readonly configDir?: string;
+  /**
+   * The catalogue, when the instance has its own (an aliasing provider's `opus`/`sonnet`).
+   * Absent: {@link CLAUDE_CODE_MODELS}. An entry whose id is in that list keeps its
+   * reasoning descriptor.
+   */
+  readonly models?: readonly ClaudeCodeModelConfig[];
+  /** The label provenance records as the provider. Defaults to `anthropic`. */
+  readonly provider?: string;
+  /**
+   * `CLAUDE_CODE_MAX_RETRIES` for every CLI this instance spawns. Absent: the CLI's own
+   * default (ten, with backoff, measured at over three minutes against a refusing
+   * provider).
+   */
+  readonly maxRetries?: number;
   /** The model a run gets when it names none. */
   readonly defaultModel?: string;
   /** Swapped out by tests. Defaults to {@link liveClaudeCodeSdk}. */
@@ -2237,6 +2292,31 @@ const userParts = (
       : [];
   });
 
+/** A narration entry with its `model`, where it has one, handed through `respell`. */
+const respellDetail = (
+  detail: NarrationDetail,
+  respell: (model: string | undefined) => string | undefined,
+): NarrationDetail => {
+  if (!("model" in detail) || typeof detail.model !== "string") return detail;
+  const model = respell(detail.model);
+  return model === detail.model ? detail : { ...detail, model };
+};
+
+/** A replayed entry's model and its parts' models, handed through `respell`. */
+const respellEntry = (
+  entry: MessageEntry,
+  respell: (model: string | undefined) => string | undefined,
+): MessageEntry => {
+  const model = respell(entry.model);
+  const parts = entry.parts.map(
+    (part) => respellDetail(part, respell) as MessagePart,
+  );
+  return model === entry.model &&
+    parts.every((part, index) => part === entry.parts[index])
+    ? entry
+    : { ...entry, model, parts };
+};
+
 const narrate = (
   message: SDKMessage,
   outcome: TerminalOutcome | undefined,
@@ -2256,6 +2336,8 @@ const narrate = (
     | "streamed"
     | "subagents"
     | "interrupted"
+    | "model"
+    | "spellings"
   >,
 ): readonly HarnessNarration[] => {
   const at = Date.now();
@@ -2264,8 +2346,21 @@ const narrate = (
     sequence: undefined,
     at,
     outcome,
-    detail,
+    // In the catalogue's spelling: see `modelSpellings.ts`.
+    detail: respellDetail(detail, (model) =>
+      session.spellings.toCatalogue(model, session.model),
+    ),
   });
+
+  /*
+   * The CLI's own name for the model this turn runs on, at the turn's start: what the
+   * instance's spelling of the session's catalogue model is (`modelSpellings.ts`). Learned
+   * before anything of the turn is narrated, so its first call already reads as the
+   * catalogue's model. A main-thread frame: a sub-agent's turn has none of its own here.
+   */
+  if (message.type === "system" && message.subtype === "init") {
+    session.spellings.learn(message.model, session.model);
+  }
 
   // A stream frame narrates its delta or nothing — never `opaque`; see this function's
   // header. It carries no outcome: only a `result` does.
@@ -2286,6 +2381,24 @@ const narrate = (
   // (`run/narration.ts`) for entries nothing renders. It carries no outcome.
   if (message.type === "system" && message.subtype === "thinking_tokens") {
     return [];
+  }
+  /*
+   * The provider refused a call and the CLI will retry it after `retry_delay_ms`: a
+   * passing status for the chat (`retry`). The frame names the category of the refusal and
+   * the HTTP status, never the provider's words; those come with the turn's `result` if the
+   * retries run out.
+   */
+  if (message.type === "system" && message.subtype === "api_retry") {
+    return [
+      frame({
+        _tag: "retry",
+        attempt: message.attempt,
+        maxRetries: message.max_retries,
+        delayMs: message.retry_delay_ms,
+        status: message.error_status,
+        error: String(message.error),
+      }),
+    ];
   }
   /*
    * A sub-agent's own frames narrate nothing (A6 U14, decided by the operator): its
@@ -3437,8 +3550,60 @@ export const claudeCodeHarness = (
   Layer.effect(
     AgentHarness,
     Effect.gen(function* () {
-      const sdk = options.sdk ?? liveClaudeCodeSdk;
-      const defaultModel = options.defaultModel ?? CLAUDE_CODE_DEFAULT_MODEL;
+      const configDir = options.configDir;
+      /*
+       * History reads go to a child process started with the instance's folder: the SDK's
+       * readers find transcripts under the `CLAUDE_CONFIG_DIR` of the process they run in
+       * (`claudeHistory.ts`). A test's own `sdk` is taken as it is.
+       */
+      const sdk =
+        options.sdk ??
+        (configDir === undefined
+          ? liveClaudeCodeSdk
+          : workerHistorySdk(liveClaudeCodeSdk, {
+              configDir,
+              timeoutMillis: Duration.toMillis(
+                options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT,
+              ),
+            }));
+      const catalogue: readonly HarnessModelView[] =
+        options.models === undefined
+          ? CLAUDE_CODE_MODELS
+          : options.models.map((model) => {
+              const known = CLAUDE_CODE_MODELS.find(
+                (entry) => entry.id === model.id,
+              );
+              return {
+                ...(known ?? {}),
+                id: model.id,
+                ...(model.label === undefined ? {} : { label: model.label }),
+              };
+            });
+      const defaultModel =
+        options.defaultModel ??
+        (options.models === undefined
+          ? CLAUDE_CODE_DEFAULT_MODEL
+          : (catalogue[0]?.id ?? CLAUDE_CODE_DEFAULT_MODEL));
+      /** Frame spellings back to catalogue ids; see `modelSpellings.ts`. */
+      const spellings = modelSpellings(options.models ?? catalogue);
+      /**
+       * What every CLI of this instance is given beyond the server's environment (which
+       * `spawnOwnedCli` scrubs of bit's own settings). `undefined` when nothing is, so the
+       * SDK's default — this process's environment — is kept exactly as before.
+       */
+      const instanceEnvironment:
+        Record<string, string | undefined> | undefined =
+        configDir === undefined && options.maxRetries === undefined
+          ? undefined
+          : {
+              ...process.env,
+              ...(configDir === undefined
+                ? {}
+                : { CLAUDE_CONFIG_DIR: configDir }),
+              ...(options.maxRetries === undefined
+                ? {}
+                : { CLAUDE_CODE_MAX_RETRIES: String(options.maxRetries) }),
+            };
       const controlTimeout = options.controlTimeout ?? DEFAULT_CONTROL_TIMEOUT;
       const cliStopBounds = options.cliStopBounds ?? DEFAULT_CLI_STOP_BOUNDS;
       const cliTreeRefresh = options.cliTreeRefresh ?? DEFAULT_CLI_TREE_REFRESH;
@@ -3463,9 +3628,10 @@ export const claudeCodeHarness = (
       const version = yield* sdkClaudeCodeVersion;
 
       const instance: HarnessInstance = {
-        instanceId: defaultInstanceIdForDriver(CLAUDE_CODE_DRIVER),
+        instanceId:
+          options.instanceId ?? defaultInstanceIdForDriver(CLAUDE_CODE_DRIVER),
         driver: CLAUDE_CODE_DRIVER,
-        displayName: "Claude Code",
+        displayName: options.displayName ?? "Claude Code",
         version,
         installed: true,
         // See `identity.ts`: `accountInfo()` needs a live session, so probing it here would
@@ -3475,10 +3641,10 @@ export const claudeCodeHarness = (
         // The default first and never twice, so a caller that configured its own default
         // gets a pickable list rather than one that omits the model it will actually use.
         models: [
-          CLAUDE_CODE_MODELS.find((model) => model.id === defaultModel) ?? {
+          catalogue.find((model) => model.id === defaultModel) ?? {
             id: defaultModel,
           },
-          ...CLAUDE_CODE_MODELS.filter((model) => model.id !== defaultModel),
+          ...catalogue.filter((model) => model.id !== defaultModel),
         ],
       };
 
@@ -3996,6 +4162,7 @@ export const claudeCodeHarness = (
       const readContextLimit = (
         record: SessionRecord,
         live: HarnessQuery,
+        asked: string = record.model,
       ): Effect.Effect<void> =>
         Effect.asVoid(
           Effect.forkIn(
@@ -4015,6 +4182,10 @@ export const claudeCodeHarness = (
                   }),
                   (usage) =>
                     Effect.sync(() => {
+                      // Asked at a launch and right after a switch returned, so the model
+                      // it names is the provider's spelling of `asked` (measured:
+                      // `glm-5.3` straight after `setModel("opus")` on z.ai).
+                      spellings.learn(usage.model, asked);
                       const max = usage.maxTokens;
                       record.contextLimit =
                         max !== undefined && Number.isFinite(max)
@@ -4102,6 +4273,12 @@ export const claudeCodeHarness = (
                 options: {
                   cwd: record.directory,
                   model: record.model,
+                  // The instance's folder and retry bound, when it has them. Passed here
+                  // and not only at the spawn, because the SDK reads `CLAUDE_CONFIG_DIR`
+                  // off `env` for its own bookkeeping beside the CLI's.
+                  ...(instanceEnvironment === undefined
+                    ? {}
+                    : { env: instanceEnvironment }),
                   /*
                    * `resume` or `sessionId`, never both.
                    *
@@ -4299,6 +4476,7 @@ export const claudeCodeHarness = (
         const record: SessionRecord = {
           sessionId,
           title: input.title,
+          spellings,
           model: input.model,
           effort: claudeCodeEffortOf(input.options),
           switchUnsettled: false,
@@ -5066,7 +5244,7 @@ export const claudeCodeHarness = (
          */
         const model =
           answer?.model !== undefined && answer.model !== ""
-            ? answer.model
+            ? spellings.toCatalogue(answer.model, record?.model ?? read.model)
             : undefined;
         const breakdown: HarnessContextUsage["breakdown"] =
           live === undefined
@@ -5088,7 +5266,12 @@ export const claudeCodeHarness = (
             // ({@link SessionRecord.calls}). A session held since before its first call has
             // seen every call it made; a resumed one's figure before its first is unlabelled.
             usedModel:
-              record === undefined ? null : modelOfApiUsage(record.calls, api),
+              record === undefined
+                ? null
+                : (spellings.toCatalogue(
+                    modelOfApiUsage(record.calls, api) ?? undefined,
+                    record.model,
+                  ) ?? null),
             ...(model === undefined ? {} : { model }),
             window,
             reading: "measured",
@@ -5108,8 +5291,14 @@ export const claudeCodeHarness = (
               `could not read session ${sessionId}'s transcript: ${String(cause)}`,
             ),
         });
+        const fromTranscript = transcriptContext(stored);
         return {
-          ...transcriptContext(stored),
+          ...fromTranscript,
+          usedModel:
+            spellings.toCatalogue(
+              fromTranscript.usedModel ?? undefined,
+              record?.model ?? read.model,
+            ) ?? null,
           ...(model === undefined ? {} : { model }),
           window,
           breakdown,
@@ -5134,6 +5323,9 @@ export const claudeCodeHarness = (
             ),
         });
         const kept = entries.filter((entry) => !isLocalCommandEntry(entry));
+        // Every model a stored entry names, in the catalogue's spelling.
+        const respell = (model: string | undefined) =>
+          spellings.toCatalogue(model, record?.model);
         const live = record !== undefined && !record.closed;
         const subagents: SubagentCalls = new Map();
         /*
@@ -5152,7 +5344,7 @@ export const claudeCodeHarness = (
             new Set(kept.map((entry) => entry.uuid)),
           ),
           { live, subagents },
-        );
+        ).map((entry) => respellEntry(entry, respell));
         if (subagents.size === 0) return flat;
         yield* readSubagents(sessionId, directory, subagents, record);
         /*
@@ -5630,7 +5822,7 @@ export const claudeCodeHarness = (
       return AgentHarness.of({
         instance,
         newSessionId: newClaudeCodeSessionId,
-        modelProvenance: claudeCodeModelProvenance,
+        modelProvenance: claudeCodeModelProvenance(options.provider),
         /*
          * V2(chat): `installGate: installClaudeCodeGate` was here — bit's `PreToolUse` policy
          * hook, written into each session's `.claude/settings.local.json` with its script
