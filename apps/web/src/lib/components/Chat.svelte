@@ -44,7 +44,7 @@
    * The separator is rendered whatever the prose did, which is what makes a reloaded
    * conversation still legible — decision 16, and why a refresh degrades rather than blanks.
    */
-  import type { Snippet } from "svelte";
+  import { untrack, type Snippet } from "svelte";
 
   import ChatItem from "./ChatItem.svelte";
   import ToolRun from "./ToolRun.svelte";
@@ -73,6 +73,8 @@
     detail = "",
     empty,
     layout = "panel",
+    floating = false,
+    composerResting = true,
     subagent,
     questionLive,
   }: {
@@ -168,6 +170,23 @@
      * the style block for what each does.
      */
     layout?: "panel" | "thread";
+    /**
+     * The composer floats over the log: it sits on a solid surface at the bottom of a log
+     * that fills the space, the log keeps a bottom padding equal to the composer's
+     * **resting** height, and growing — the question dock, a draft of several lines —
+     * covers more of the log and never moves a message. The view follows new messages only
+     * while it is at the bottom; scrolled up, "↓ Latest" brings it back.
+     *
+     * Either layout. A panel puts its footnote above the log; a thread keeps it under the
+     * box, inside the floating surface. An empty thread is its lead with the box under it
+     * as before: nothing floats until there is a log to float over.
+     */
+    floating?: boolean;
+    /**
+     * Whether the composer is at rest now (no dock, a short draft): only a resting height is
+     * taken as the log's bottom padding. Floating only; `true` when absent.
+     */
+    composerResting?: boolean;
     /**
      * Draws a sub-agent's row in place of {@link ChatItem}'s entry (A7-S's cards, E7).
      *
@@ -293,10 +312,60 @@
 
   let anything = $derived(groups.length > 0);
   let thread = $derived(layout === "thread");
+  /**
+   * Whether the composer floats now. The box is drawn in the floating arrangement whenever
+   * `floating` is set, so it is never remounted (and never loses focus) when an empty
+   * thread gets its first turn; it floats once there is a log under it.
+   */
+  let float = $derived(floating && (!thread || anything));
+
+  /** The composer's height now, and at rest: the log's bottom padding. */
+  let composerHeight = $state(0);
+  let restHeight = $state(0);
+  $effect(() => {
+    if (float && composerResting && composerHeight > 0)
+      restHeight = composerHeight;
+  });
+  /*
+   * The resting padding is measured after the first rows are drawn, so a view that was
+   * following is short of the bottom by it once it lands: follow again while pinned.
+   */
+  $effect(() => {
+    const rest = restHeight;
+    if (!float || rest === 0 || list == null) return;
+    if (untrack(() => pinned)) follow();
+  });
+
+  /** The floating composer, for ↓ Latest to hand focus back to. */
+  let floatingComposer = $state<HTMLDivElement | undefined>(undefined);
+  /** The stage, and how far below the chat's own top it starts (its heading, footnote). */
+  let stage = $state<HTMLDivElement | undefined>(undefined);
+  let above = $state(0);
+  $effect(() => {
+    void composerHeight;
+    void composerResting;
+    if (float && stage !== undefined) above = stage.offsetTop;
+  });
+
+  /** "↓ Latest": back to the newest message, following again, focus in the box. */
+  function toLatest(): void {
+    pinned = true;
+    follow();
+    floatingComposer
+      ?.querySelector<HTMLElement>("textarea, section.question-dock")
+      ?.focus();
+  }
 </script>
 
 <section
-  class={["chat", thread && "thread", thread && !anything && "idle"]}
+  class={[
+    "chat",
+    thread && "thread",
+    thread && !anything && "idle",
+    float && "floating",
+    // A question docked over the log: the heading and footnote it covers are hidden.
+    float && !composerResting && "docked",
+  ]}
   aria-label={label}
 >
   {#if !thread}
@@ -338,142 +407,192 @@
     is what this list is. What it must not do is read the payloads out, which is why every
     tool argument and result is in a collapsed `<details>` inside {@link ChatItem}.
   -->
-  <ol
-    bind:this={list}
-    onscroll={trackPinned}
-    class={["groups", !anything && "hollow"]}
-    role="log"
-    aria-label="{label}, oldest first"
-  >
-    {#each groups as group (group.key)}
-      {@const place = thread && footer !== undefined ? lastProse(group) : null}
-      <li class="group" {@attach watchSize}>
-        {#snippet closing()}
-          {@render footer?.(group)}
-        {/snippet}
-        <!--
-          The caller's own heading. Every part of it that survives a reload does so because
-          it comes from a row rather than from narration; this component makes no claim
-          about what is in it.
-        -->
-        <div class="sep">{@render separator(group)}</div>
+  {#if floating && !thread}
+    <!-- A floating panel's footnote goes above the log, which runs under the composer. -->
+    <p class="footnote">{@render footnote()}</p>
+  {/if}
 
-        {#if group.prose._tag === "loading"}
-          <p class="note" role="status">
-            Reading what the harness still has of this…
-          </p>
-        {:else if group.prose._tag === "replayed"}
+  <div
+    bind:this={stage}
+    class={["stage", float && "floating-stage"]}
+    style:--rest="{restHeight}px"
+    style:--above="{above}px"
+  >
+    <ol
+      bind:this={list}
+      onscroll={trackPinned}
+      class={["groups", !anything && "hollow"]}
+      role="log"
+      aria-label="{label}, oldest first"
+    >
+      {#each groups as group (group.key)}
+        {@const place =
+          thread && footer !== undefined ? lastProse(group) : null}
+        <li class="group" {@attach watchSize}>
+          {#snippet closing()}
+            {@render footer?.(group)}
+          {/snippet}
           <!--
-            Replayed, and labelled as such: the harness's own copy, which it may delete. The
-            rows themselves are below with the live ones — the replay is the same items the
-            live stream carries (A6 F10), so a reloaded turn is drawn by `ChatItem` exactly as
-            a watched one was, and only this note says where it came from.
+            The caller's own heading. Every part of it that survives a reload does so because
+            it comes from a row rather than from narration; this component makes no claim
+            about what is in it.
           -->
-          <!-- Said once a thread: a later replayed group carries no sentence. -->
-          {#if group.prose.note !== ""}
-            <p class="note">{group.prose.note}</p>
-          {/if}
-          {#if group.prose.truncated}
-            <p class="note">
-              Shortened: not every message the harness holds is shown.
+          <div class="sep">{@render separator(group)}</div>
+
+          {#if group.prose._tag === "loading"}
+            <p class="note" role="status">
+              Reading what the harness still has of this…
+            </p>
+          {:else if group.prose._tag === "replayed"}
+            <!--
+              Replayed, and labelled as such: the harness's own copy, which it may delete. The
+              rows themselves are below with the live ones — the replay is the same items the
+              live stream carries (A6 F10), so a reloaded turn is drawn by `ChatItem` exactly as
+              a watched one was, and only this note says where it came from.
+            -->
+            <!-- Said once a thread: a later replayed group carries no sentence. -->
+            {#if group.prose.note !== ""}
+              <p class="note">{group.prose.note}</p>
+            {/if}
+            {#if group.prose.truncated}
+              <p class="note">
+                Shortened: not every message the harness holds is shown.
+              </p>
+            {/if}
+          {:else if group.prose._tag !== "live"}
+            <!--
+              The three absences and the budget note, each as its own sentence from the
+              server. `role="status"` only on `pending`, which is the one worth announcing as
+              it changes; "the harness has forgotten this" is a fact about a finished subject
+              and announcing it on arrival would interrupt a reader for no action.
+            -->
+            <p
+              class="note"
+              role={group.prose._tag === "pending" ? "status" : undefined}
+            >
+              {group.prose.note}
             </p>
           {/if}
-        {:else if group.prose._tag !== "live"}
-          <!--
-            The three absences and the budget note, each as its own sentence from the
-            server. `role="status"` only on `pending`, which is the one worth announcing as
-            it changes; "the harness has forgotten this" is a fact about a finished subject
-            and announcing it on arrival would interrupt a reader for no action.
-          -->
-          <p
-            class="note"
-            role={group.prose._tag === "pending" ? "status" : undefined}
-          >
-            {group.prose.note}
-          </p>
-        {/if}
 
-        {#if group.rows.length > 0 && thread}
-          <!--
-            A thread draws a turn as D3 does (A6 U4): the agent's prose full width, and each
-            run of consecutive tool calls folded into one muted line, its calls one click
-            away. The panel's ledger, below, keeps one row per item: its rows carry their
-            kind, time and ids, which is what a panel among other things on a page is for.
-          -->
-          <ol class="items">
-            {#each threadEntries(group.rows, questionLive) as entry (entry.key)}
-              {#if entry._tag === "tools"}
-                <ToolRun rows={entry.rows} summary={entry.summary} />
-              {:else if subagent !== undefined && entry.row.item.kind === SUBAGENT_KIND}
-                <li class="subagent-card" data-origin={entry.row.item.origin}>
-                  {@render subagent(entry.row)}
-                </li>
-              {:else}
-                <ChatItem
-                  item={entry.row.item}
-                  proposedBy={entry.row.proposedBy}
-                  result={entry.row.result}
-                  write={entry.row.write}
-                  summary={entry.row.summary}
-                  stream={entry.row.stream}
-                  narrated
-                  footer={place?._tag === "row" && place.key === entry.key
-                    ? closing
-                    : undefined}
-                />
-              {/if}
-            {/each}
-          </ol>
-          {#if place === null && footer !== undefined}
-            <!-- No prose to hang it under: under the turn's last row instead. -->
-            {@render closing()}
+          {#if group.rows.length > 0 && thread}
+            <!--
+              A thread draws a turn as D3 does (A6 U4): the agent's prose full width, and each
+              run of consecutive tool calls folded into one muted line, its calls one click
+              away. The panel's ledger, below, keeps one row per item: its rows carry their
+              kind, time and ids, which is what a panel among other things on a page is for.
+            -->
+            <ol class="items">
+              {#each threadEntries(group.rows, questionLive) as entry (entry.key)}
+                {#if entry._tag === "tools"}
+                  <ToolRun rows={entry.rows} summary={entry.summary} />
+                {:else if subagent !== undefined && entry.row.item.kind === SUBAGENT_KIND}
+                  <li class="subagent-card" data-origin={entry.row.item.origin}>
+                    {@render subagent(entry.row)}
+                  </li>
+                {:else}
+                  <ChatItem
+                    item={entry.row.item}
+                    proposedBy={entry.row.proposedBy}
+                    result={entry.row.result}
+                    write={entry.row.write}
+                    summary={entry.row.summary}
+                    stream={entry.row.stream}
+                    narrated
+                    footer={place?._tag === "row" && place.key === entry.key
+                      ? closing
+                      : undefined}
+                  />
+                {/if}
+              {/each}
+            </ol>
+            {#if place === null && footer !== undefined}
+              <!-- No prose to hang it under: under the turn's last row instead. -->
+              {@render closing()}
+            {/if}
+          {:else if group.rows.length > 0}
+            <ol class="items">
+              {#each group.rows as row (row.key)}
+                {#if subagent !== undefined && row.item.kind === SUBAGENT_KIND}
+                  <li class="subagent-card" data-origin={row.item.origin}>
+                    {@render subagent(row)}
+                  </li>
+                {:else}
+                  <ChatItem
+                    item={row.item}
+                    proposedBy={row.proposedBy}
+                    result={row.result}
+                    write={row.write}
+                    summary={row.summary}
+                    stream={row.stream}
+                  />
+                {/if}
+              {/each}
+            </ol>
           {/if}
-        {:else if group.rows.length > 0}
-          <ol class="items">
-            {#each group.rows as row (row.key)}
-              {#if subagent !== undefined && row.item.kind === SUBAGENT_KIND}
-                <li class="subagent-card" data-origin={row.item.origin}>
-                  {@render subagent(row)}
-                </li>
-              {:else}
-                <ChatItem
-                  item={row.item}
-                  proposedBy={row.proposedBy}
-                  result={row.result}
-                  write={row.write}
-                  summary={row.summary}
-                  stream={row.stream}
-                />
-              {/if}
-            {/each}
-          </ol>
-        {/if}
 
-        {#if tail !== undefined}
-          {@render tail(group)}
-        {/if}
-      </li>
-    {/each}
-  </ol>
+          {#if tail !== undefined}
+            {@render tail(group)}
+          {/if}
+        </li>
+      {/each}
+    </ol>
 
-  {#if !anything && !thread}
-    <p class="empty" role="status">{empty}</p>
-  {/if}
+    {#if !anything && !thread}
+      <p class="empty" role="status">{empty}</p>
+    {/if}
+
+    {#if floating}
+      {#if float && !pinned && anything && composerResting}
+        <!--
+          Centred just above the composer. Not while a question is docked: the dock covers
+          the log, so there is nothing below it to bring into view.
+        -->
+        <button
+          type="button"
+          class="latest"
+          style:bottom="{composerHeight + 10}px"
+          onclick={toLatest}>↓ Latest</button
+        >
+      {/if}
+      {#if (!readonly && composer !== undefined) || controls !== undefined || (thread && anything)}
+        <div
+          class={[
+            "floating-composer",
+            float && "afloat",
+            float && !composerResting && "grown",
+          ]}
+          bind:this={floatingComposer}
+          bind:clientHeight={composerHeight}
+        >
+          {#if controls !== undefined}
+            <div class="controls">{@render controls()}</div>
+          {/if}
+          {#if !readonly && composer !== undefined}
+            <div class="composer">{@render composer()}</div>
+          {/if}
+          {#if thread && anything}
+            <!-- A thread's footnote stays under the box, on the floating surface. -->
+            <p class="footnote">{@render footnote()}</p>
+          {/if}
+        </div>
+      {/if}
+    {/if}
+  </div>
 
   <!--
     Under the composer on a page, where it reads as a footnote to the whole thread; above it
     in a panel, where the composer is the last thing. The same sentence either way, and
     required either way.
   -->
-  {#if !thread}
+  {#if !thread && !floating}
     <p class="footnote">{@render footnote()}</p>
   {/if}
 
-  {#if controls !== undefined}
+  {#if controls !== undefined && !floating}
     <div class="controls">{@render controls()}</div>
   {/if}
 
-  {#if !readonly && composer !== undefined}
+  {#if !readonly && composer !== undefined && !floating}
     <div class="composer">{@render composer()}</div>
   {/if}
 
@@ -482,7 +601,7 @@
     with no turns has neither: D2 draws the lead, the composer and its starters, and nothing
     under them.
   -->
-  {#if thread && anything}
+  {#if thread && anything && !floating}
     <p class="footnote">{@render footnote()}</p>
   {/if}
 </section>
@@ -606,6 +725,108 @@
     align-items: center;
     gap: 8px;
   }
+  /* Not a box of its own until it floats: the log and composer as before. */
+  .stage {
+    display: contents;
+  }
+  /* The box's own column: its controls, the box, and (in a thread) the footnote. */
+  .floating-composer {
+    display: flex;
+    flex-direction: column;
+    /* Never wrapped into a second column when its height is capped. */
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 8px;
+  }
+  /* A controls row with nothing in it takes no gap above the box or the dock. */
+  .floating-composer > .controls:not(:has(*)) {
+    display: none;
+  }
+
+  /*
+   * ── The floating composer ───────────────────────────────────────────────────
+   *
+   * The log fills the space and scrolls; the composer sits over its bottom edge on a solid
+   * surface. The log's bottom padding is the composer's resting height (`--rest`), so at
+   * the bottom the last message rests just above the box, and a box that grows — the dock,
+   * a long draft — covers more of the log instead of moving it.
+   */
+  .chat.floating {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+  }
+  .floating-stage {
+    position: relative;
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .floating .groups {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    padding-bottom: calc(var(--rest, 0px) + 12px);
+  }
+  .floating-composer.afloat {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    /* Never taller than the log less a strip of it: a long draft scrolls inside. */
+    max-height: calc(100% - 72px);
+    padding-top: 10px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    background: var(--bg-base);
+  }
+  /*
+   * A question docked: the dock may use the whole log, so every choice, the own-words field
+   * and Send show at once, and in a panel the chat's heading and footnote above it too
+   * (`--above`) — never what is above the chat.
+   */
+  .floating-composer.afloat.grown {
+    max-height: calc(100% + var(--above, 0px));
+    padding-top: 0;
+  }
+  /*
+   * What a docked question covers is hidden, not left to peek out under its top edge: the
+   * chat's heading and footnote. Still laid out, so the dock's reach (`--above`) is
+   * unchanged.
+   */
+  .chat.floating.docked > .head,
+  .chat.floating.docked > .footnote {
+    visibility: hidden;
+  }
+  /* Messages running on under the box dissolve just above its top edge. */
+  .floating-composer.afloat::before {
+    content: "";
+    position: absolute;
+    right: 0;
+    bottom: 100%;
+    left: 0;
+    height: 24px;
+    background: linear-gradient(to bottom, transparent, var(--bg-base));
+    pointer-events: none;
+  }
+  .latest {
+    position: absolute;
+    left: 50%;
+    z-index: 1;
+    transform: translateX(-50%);
+    padding: 4px 12px;
+    border: 1px solid var(--border-muted);
+    border-radius: 999px;
+    background: var(--bg-layer-01);
+    color: var(--text-base);
+    font: 500 12px/18px var(--font-sans);
+    cursor: pointer;
+  }
+  .latest:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+  }
 
   /*
    * ── The thread layout ───────────────────────────────────────────────────────
@@ -636,7 +857,8 @@
     gap: 10px;
     padding-top: 28px;
   }
-  .thread > :not(.groups) {
+  .thread > :not(.groups, .stage),
+  .thread > .stage > :not(.groups, .latest) {
     width: min(var(--column), calc(100% - 2 * var(--gutter)));
     margin-inline: auto;
     box-sizing: border-box;
@@ -726,5 +948,20 @@
   .thread .footnote {
     text-align: center;
     padding-bottom: 14px;
+  }
+  /*
+   * A floating thread. The stage spans the page, as the log does, so the log's bar stays on
+   * the window's edge; the floating box is the column, centred over it. Its gaps are the
+   * thread's. What is above a thread's log is its note and the connection alert, never a
+   * heading, so a docked question takes the log and nothing above it.
+   */
+  .thread .floating-composer {
+    gap: 10px;
+  }
+  .thread.floating .groups {
+    padding-bottom: calc(var(--rest, 0px) + 12px);
+  }
+  .thread .floating-composer.afloat.grown {
+    max-height: 100%;
   }
 </style>
