@@ -22,6 +22,8 @@ import { Context, Effect, Exit, Layer, Redacted, Scope, Stream } from "effect";
 
 import {
   AgentHarness,
+  SESSION_NOT_FOUND_TAG,
+  SESSION_PROCESS_GONE_TAG,
   type HarnessNarration,
   type NarrationDetail,
 } from "./agentHarness";
@@ -577,16 +579,37 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       expect(
         (await Effect.runPromise(f.harness.sessionStatus(ref.id))).activity,
       ).toBe("running");
+      // A Send now Pi queues behind the hung call and never takes.
+      await Effect.runPromise(
+        f.harness.prompt(ref.id, "read this next", {
+          _tag: "steer",
+          urgency: "preemptive",
+          messageId: "m-untaken",
+        }),
+      );
       process.kill(pid, "SIGKILL");
       const waited = await Effect.runPromise(
         Effect.result(f.harness.waitForIdle(ref.id)),
       );
       expect(waited._tag).toBe("Failure");
+      // Gone with its queue: a caller marks the untaken message not delivered.
+      if (waited._tag === "Failure") {
+        expect(
+          waited.failure._tag === "HarnessTransportError"
+            ? waited.failure.tag
+            : waited.failure._tag,
+        ).toBe(SESSION_PROCESS_GONE_TAG);
+      }
       await until(() => details(seen, "error").length > 0, "the exit's error");
       expect(outcomes(seen)).toEqual([]);
-      expect(details(seen, "error")[0]?.message).toContain("exited");
+      const said = details(seen, "error")[0]?.message ?? "";
+      expect(said).toContain("exited");
+      expect(said).toContain(
+        "A message sent while it ran had not been read yet",
+      );
       const status = await Effect.runPromise(f.harness.sessionStatus(ref.id));
       expect(status).toEqual({ activity: "idle", outcome: undefined });
+      // Not found, so a conversation opens the session from its file at once (slice 3 fix).
       const refused = await Effect.runPromise(
         Effect.result(
           f.harness.prompt(ref.id, "more", {
@@ -597,9 +620,21 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
         ),
       );
       expect(refused._tag).toBe("Failure");
-      // What was finished is in the file: the message, and no reply.
+      if (refused._tag === "Failure") {
+        expect(
+          refused.failure._tag === "HarnessTransportError"
+            ? refused.failure.tag
+            : refused.failure._tag,
+        ).toBe(SESSION_NOT_FOUND_TAG);
+      }
+      // What was finished is in the file — the message, and no reply — and the exit is
+      // drawn after it, as the live stream said it (slice 3 fix, L2).
       const replay = await Effect.runPromise(f.harness.messages(ref.id));
-      expect(replay.map((entry) => entry.type)).toEqual(["user"]);
+      expect(replay.map((entry) => entry.type)).toEqual([
+        "user",
+        "bit.process.exited",
+      ]);
+      expect(replay[1]?.error).toBe(said);
     } finally {
       await close(f);
     }

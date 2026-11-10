@@ -115,11 +115,13 @@ import {
   AgentHarness,
   OPEN_PROMPT,
   SESSION_NOT_FOUND_TAG,
+  SESSION_PROCESS_GONE_TAG,
   type HarnessContextUsage,
   type HarnessFailure,
   type HarnessNarration,
   type HarnessQuestion,
   type McpRegistration,
+  type MessageEntry,
   type SessionRef,
   type SessionStatus,
   type SessionTitle,
@@ -603,6 +605,39 @@ interface HeldPiQuestion {
   readonly rpc: RpcProcess;
 }
 
+/** One process exit seen mid-turn, as the thread says it. */
+interface ProcessExit {
+  readonly at: number;
+  readonly message: string;
+}
+
+/** The entry type of a process exit, live and replayed. */
+const PROCESS_EXIT_ENTRY = "bit.process.exited";
+
+/**
+ * A replay with the process exits put where they happened: after every entry Pi stored
+ * before the exit. Drawn as the harness's error, as the live narration drew it.
+ */
+const withExits = (
+  entries: readonly MessageEntry[],
+  exits: readonly ProcessExit[],
+): MessageEntry[] => {
+  const out = [...entries];
+  for (const exit of exits) {
+    let at = out.length;
+    while (at > 0 && (out[at - 1]?.at ?? -Infinity) > exit.at) at -= 1;
+    out.splice(at, 0, {
+      type: PROCESS_EXIT_ENTRY,
+      text: "",
+      error: exit.message,
+      parts: [],
+      model: undefined,
+      at: exit.at,
+    });
+  }
+  return out;
+};
+
 /** What the extension reads from the dialog's value (`piBitTools.extension.ts`). */
 type QuestionReply =
   | {
@@ -762,6 +797,12 @@ export const piHarness = (
       };
 
       const sessions = new Map<string, SessionRecord>();
+      /**
+       * The process exits seen mid-turn, by session id: drawn in the session's replay where
+       * they happened. Outlives the record, so a resumed session still shows its earlier
+       * death; memory only, so a restarted server shows none. One entry per death.
+       */
+      const exits = new Map<string, readonly ProcessExit[]>();
       const handedOut = new WeakMap<SessionRef, SessionRecord>();
       const records = new Set<SessionRecord>();
 
@@ -1062,16 +1103,24 @@ export const piHarness = (
             }),
           ).catch(() => undefined);
           if (running) {
+            const exit: ProcessExit = {
+              at: Date.now(),
+              message: `The Pi process running this session exited (${signal ?? `code ${String(code)}`}) while a turn was in flight. What it finished is kept; how the turn would have ended is not known.${record.untaken.length === 0 ? "" : ` ${record.untaken.length === 1 ? "A message" : `${String(record.untaken.length)} messages`} sent while it ran had not been read yet, and went with it.`}`,
+            };
+            // Kept for the replay (slice 3 fix, L2): Pi's file says nothing of a death, and
+            // a thread read again after it would lose the only line saying why the turn
+            // stopped.
+            exits.set(record.sessionId, [
+              ...(exits.get(record.sessionId) ?? []),
+              exit,
+            ]);
             offer(record, [
               {
-                type: "bit.process.exited",
+                type: PROCESS_EXIT_ENTRY,
                 sequence: undefined,
-                at: Date.now(),
+                at: exit.at,
                 outcome: undefined,
-                detail: {
-                  _tag: "error",
-                  message: `The Pi process running this session exited (${signal ?? `code ${String(code)}`}) while a turn was in flight. What it finished is kept; how the turn would have ended is not known.`,
-                },
+                detail: { _tag: "error", message: exit.message },
               },
             ]);
           }
@@ -1083,6 +1132,8 @@ export const piHarness = (
                   transport(
                     "pi.process",
                     `the Pi process exited (${signal ?? `code ${String(code)}`}) mid-turn; the turn's outcome is not known`,
+                    // What was queued in it is gone with it (`SESSION_PROCESS_GONE_TAG`).
+                    { tag: SESSION_PROCESS_GONE_TAG },
                   ),
                 )
               : Effect.void,
@@ -1619,7 +1670,9 @@ export const piHarness = (
         }
         const rpc = record.rpc;
         if (record.closed || rpc === undefined || rpc.exited) {
-          return yield* transport(
+          // Not found (slice 3 fix, L2): no process here holds this session any more, so
+          // the caller opens one from its file — the message is not lost to a refusal.
+          return yield* notFound(
             "pi.prompt",
             `session ${sessionId} has ended or its Pi process is gone, so a message sent now would reach nothing; nothing was delivered`,
           );
@@ -1796,7 +1849,7 @@ export const piHarness = (
         if (file === undefined) return [];
         const record = sessions.get(sessionId);
         const joined = [...(record?.taken ?? [])];
-        return piMessageEntries(file, {
+        const entries = piMessageEntries(file, {
           reader: attachmentReader({ uploadsFolder: read?.uploadsFolder }),
           steerIds: (text) => {
             const at = joined.findIndex((each) => each.text === text);
@@ -1805,6 +1858,7 @@ export const piHarness = (
             return found?.ids;
           },
         });
+        return withExits(entries, exits.get(sessionId) ?? []);
       });
 
       const interruptSession: AgentHarness["Service"]["interruptSession"] =

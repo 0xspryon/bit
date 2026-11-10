@@ -39,9 +39,11 @@ import {
   type ConversationSend,
   type Conversations,
 } from "./conversations";
-import type {
-  HarnessNarration,
-  HarnessQuestion,
+import {
+  SESSION_NOT_FOUND_TAG,
+  SESSION_PROCESS_GONE_TAG,
+  type HarnessNarration,
+  type HarnessQuestion,
 } from "../harness/agentHarness";
 import type { LiveSessionCloseReason } from "../harness/liveAgentSessions";
 import { HarnessTransportError } from "../harness/errors";
@@ -106,6 +108,11 @@ type ProbeCore = Conversations<
 interface WorldOptions {
   /** Every turn runs for ever (the harness never goes idle). */
   readonly holdTurns?: boolean;
+  /**
+   * A turn runs until the test ends its wait in failure (`dieTurn`), as a driver whose
+   * process died says it: tagged {@link SESSION_PROCESS_GONE_TAG}, or untagged.
+   */
+  readonly dyingTurns?: boolean;
   /**
    * A turn runs until the test lets it go idle (`goIdle`) or a Stop interrupts it, which
    * the harness answers as a turn interrupted.
@@ -182,11 +189,31 @@ const world = (options: WorldOptions = {}) =>
     const failing = Deferred.makeUnsafe<void>();
     const fails = Deferred.makeUnsafe<void>();
     const goIdle = Effect.suspend(() => Deferred.succeed(idle, undefined));
+    /** The turn's wait, for `dyingTurns`: failed by `dieTurn`. */
+    const dying = Deferred.makeUnsafe<void, HarnessTransportError>();
+    const dieTurn = (tag: string | undefined) =>
+      Deferred.fail(
+        dying,
+        new HarnessTransportError({
+          operation: "stub.process",
+          status: undefined,
+          tag,
+          detail: "the stub's process exited mid-turn",
+          cause: undefined,
+        }),
+      );
+    /** When set, a steer is refused with it: the harness holds no live session. */
+    const steerRefusal: { now: HarnessTransportError | undefined } = {
+      now: undefined,
+    };
     const harness = stubHarness({
       ...questions.members,
       sessionEvents: () => Stream.fromQueue(events),
       ...(options.holdTurns === true
         ? { waitForIdle: () => Effect.never }
+        : {}),
+      ...(options.dyingTurns === true
+        ? { waitForIdle: () => Deferred.await(dying) }
         : {}),
       ...(options.gateTurns === true
         ? {
@@ -240,12 +267,15 @@ const world = (options: WorldOptions = {}) =>
           }
         : {}),
       prompt: (_sessionId, text, delivery) =>
-        Effect.sync(() => {
-          if (Deferred.isDoneUnsafe(idle)) idle = Deferred.makeUnsafe<void>();
-          prompts.push(text);
-          if (delivery?._tag === "steer") urgencies.push(delivery.urgency);
-          return { delivered: true };
-        }),
+        delivery?._tag === "steer" && steerRefusal.now !== undefined
+          ? Effect.fail(steerRefusal.now)
+          : Effect.sync(() => {
+              if (Deferred.isDoneUnsafe(idle))
+                idle = Deferred.makeUnsafe<void>();
+              prompts.push(text);
+              if (delivery?._tag === "steer") urgencies.push(delivery.urgency);
+              return { delivered: true };
+            }),
     });
     const resolver = HarnessResolver.fromEntries([
       { instance: STUB_INSTANCE, harness },
@@ -504,6 +534,8 @@ const world = (options: WorldOptions = {}) =>
       urgencies,
       interrupts,
       goIdle,
+      dieTurn,
+      steerRefusal,
       letOpen: Deferred.succeed(opens, undefined),
       registering: Deferred.await(registering),
       letRegister: Deferred.succeed(registrations, undefined),
@@ -1041,6 +1073,109 @@ describe("the conversation core through a non-importer owner", () => {
     );
     expect(result.whileRunning).toBe(1);
     expect(result.after).toBe(0);
+  });
+
+  test("slice 3 fix: a message the harness says reaches no session is carried on by a reopen at once, not refused", async () => {
+    const result = await run((probe) =>
+      Effect.gen(function* () {
+        const { entry } = yield* probe.open("first");
+        // The session's process died between turns: the harness holds no live session.
+        probe.steerRefusal.now = new HarnessTransportError({
+          operation: "stub.prompt",
+          status: 404,
+          tag: SESSION_NOT_FOUND_TAG,
+          detail: "the stub's process is gone",
+          cause: undefined,
+        });
+        const sent = yield* probe.send({
+          conversationId: entry.id,
+          text: "are you back?",
+        });
+        const ended = [...probe.ended];
+        // Any other refusal is still a refusal.
+        probe.steerRefusal.now = new HarnessTransportError({
+          operation: "stub.prompt",
+          status: undefined,
+          tag: undefined,
+          detail: "no answer",
+          cause: undefined,
+        });
+        const refused = yield* Effect.flip(
+          probe.send({ conversationId: sent.probeId, text: "and again" }),
+        );
+        return {
+          sent,
+          reopened: probe.reopened,
+          ended,
+          refused,
+        };
+      }),
+    );
+    expect(result.sent.conversation).toBe("resumed");
+    expect(result.sent.probeId).toBe("prb_2");
+    expect(result.reopened).toEqual(["prb_1"]);
+    // Let go as a refused prompt is, and not ended by the operator.
+    expect(result.ended).toEqual([{ id: "prb_1", reason: "refused" }]);
+    expect(result.refused).toMatchObject({
+      _tag: "ProbeRefused",
+      reason: "harness_unreachable",
+    });
+  });
+
+  test("slice 3 fix: a message a dead process never took is held as lost; a wait that failed otherwise loses nothing", async () => {
+    const replayQueued = (
+      probe: Effect.Success<ReturnType<typeof world>>,
+      id: string,
+    ) =>
+      Effect.map(
+        probe.core.replay({
+          id,
+          fromTranscript: () => null,
+          read: (live) =>
+            Effect.succeed({ live: live !== undefined, question: null }),
+        }),
+        (replayed) =>
+          replayed.queued.map((each) => [each.text, each.taken, each.lost]),
+      );
+    const gone = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const { entry } = yield* probe.open("first");
+          yield* probe.send({
+            conversationId: entry.id,
+            text: "read this next",
+            urgency: "preemptive",
+          });
+          const before = yield* replayQueued(probe, entry.id);
+          yield* probe.dieTurn(SESSION_PROCESS_GONE_TAG);
+          let after = before;
+          for (let i = 0; i < 100; i += 1) {
+            yield* Effect.sleep("5 millis");
+            after = yield* replayQueued(probe, entry.id);
+            if (after[0]?.[2] === true) break;
+          }
+          return { before, after };
+        }),
+      { dyingTurns: true },
+    );
+    expect(gone.before).toEqual([["read this next", false, undefined]]);
+    expect(gone.after).toEqual([["read this next", false, true]]);
+
+    const broken = await run(
+      (probe) =>
+        Effect.gen(function* () {
+          const { entry } = yield* probe.open("first");
+          // After the settle's wait began, so the idle rule does not take it as read.
+          yield* Effect.sleep("20 millis");
+          yield* probe.send({ conversationId: entry.id, text: "later" });
+          yield* probe.dieTurn(undefined);
+          yield* Effect.sleep("50 millis");
+          return yield* replayQueued(probe, entry.id);
+        }),
+      { dyingTurns: true },
+    );
+    // Accepted after the wait began, and not lost: whether it runs is not known.
+    expect(broken).toEqual([["later", false, undefined]]);
   });
 
   test("a message to a period still opening waits for the open, then lands in that period", async () => {

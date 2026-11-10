@@ -127,6 +127,18 @@ export type HarnessFailure = HarnessTransportError | HarnessDecodeError;
 export const SESSION_NOT_FOUND_TAG = "SessionNotFoundError";
 
 /**
+ * The tag on a {@link AgentHarness.waitForIdle} failure that means **the process holding the
+ * session is gone** (harness-instances slice 3 fix): a Pi process that exited on its own, a
+ * Claude Code stream that ended in failure, after which the driver closes the session. The
+ * turn's outcome is still uncertain, as any wait failure's is; what this adds is that a
+ * message the driver accepted and the harness had not yet taken **will never run**: it lived
+ * in that process's queue. A conversation marks such a message not delivered rather than
+ * leave it drawn as sent. A harness whose queue outlives a broken wait (OpenCode keeps its
+ * own in its database) never sets it.
+ */
+export const SESSION_PROCESS_GONE_TAG = "SessionProcessGone";
+
+/**
  * The three outcomes a harness may state about a session.
  *
  * `uncertain` is deliberately absent: it is *our* conclusion when nobody stated one, and a

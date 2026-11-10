@@ -153,6 +153,7 @@ import {
   AgentHarness,
   OPEN_PROMPT,
   SESSION_NOT_FOUND_TAG,
+  SESSION_PROCESS_GONE_TAG,
   SUBAGENT_DESCRIPTION_MAX,
   capped,
   firstLine,
@@ -4198,6 +4199,8 @@ export const claudeCodeHarness = (
                       ? ""
                       : `; the CLI's stderr ended: ${record.stderrTail.trim()}`
                   }`,
+                  // The query closes after this: what was queued in the CLI goes with it.
+                  { tag: SESSION_PROCESS_GONE_TAG },
                 ),
             }),
           );
@@ -4929,9 +4932,12 @@ export const claudeCodeHarness = (
           return { delivered: false };
         }
         if (record.settling || record.closed) {
+          // Not found (slice 3 fix): this process holds no query for the session any more,
+          // so a conversation opens one from its transcript rather than refuse the message.
           return yield* transport(
             "session.prompt",
             `session ${sessionId} has already finished the work it accepted, so a message sent now would be new work nothing is supervising; nothing was delivered`,
+            { tag: SESSION_NOT_FOUND_TAG, status: 404 },
           );
         }
         const offer = record.offer;

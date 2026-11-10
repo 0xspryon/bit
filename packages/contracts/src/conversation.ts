@@ -212,6 +212,12 @@ export const ConversationQueuedMessage = Schema.Struct({
    * alone and on one still waiting.
    */
   takenTogether: Schema.optionalKey(Schema.Array(Schema.String)),
+  /**
+   * The harness's process ended before it took the message (harness-instances slice 3
+   * fix): it lived in that process's queue and **was never delivered**, nor will it be. A
+   * chat draws it as not delivered, never as sent. Absent on every other message.
+   */
+  lost: Schema.optionalKey(Schema.Literal(true)),
 });
 export type ConversationQueuedMessage = typeof ConversationQueuedMessage.Type;
 

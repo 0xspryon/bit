@@ -77,6 +77,8 @@ import {
 } from "effect";
 
 import {
+  SESSION_NOT_FOUND_TAG,
+  SESSION_PROCESS_GONE_TAG,
   truncateNarration,
   type AgentHarness,
   type HarnessFailure,
@@ -84,7 +86,10 @@ import {
   type HarnessQuestion,
 } from "../harness/agentHarness";
 import { attachmentView, type MessageAttachment } from "../harness/attachments";
-import type { QuestionNotPending } from "../harness/errors";
+import {
+  HarnessTransportError,
+  type QuestionNotPending,
+} from "../harness/errors";
 import {
   makeLiveAgentSessions,
   type LiveAgentSession,
@@ -474,8 +479,25 @@ export interface Conversations<Meta, NotFound, Refused, Accepted> {
   readonly heldSteers: (id: string) => Effect.Effect<number>;
 }
 
-/** A join attempt that found nothing to join. Never leaves this module. */
+/**
+ * A join attempt that found nothing to join, or a delivery the harness answered with "no
+ * such session here" (a process that died between turns: slice 3 fix). Never leaves this
+ * module: the message is carried on by the reopen path instead.
+ */
 const NOT_LIVE = { _tag: "NotLive" } as const;
+
+const isNotLive = <E>(
+  failure: E | typeof NOT_LIVE,
+): failure is typeof NOT_LIVE =>
+  typeof failure === "object" &&
+  failure !== null &&
+  "_tag" in failure &&
+  (failure as { _tag: unknown })._tag === "NotLive";
+
+/** Whether a harness's refusal of a message says it holds no live session for it. */
+const deliveredToNothing = (failure: { readonly _tag: string }): boolean =>
+  failure instanceof HarnessTransportError &&
+  (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
 
 /** The newer period an id's row points at, when it is not the id itself. */
 const newerRun = (
@@ -737,11 +759,23 @@ export const makeConversations = <
         const mark = { delivered: deliveriesTo(id), at: Date.now() };
         const more = () => deliveriesTo(id) !== mark.delivered;
         const settled = yield* Effect.result(harness.waitForIdle(sessionId));
-        // Idle: whatever was delivered before the wait began has been taken. A message
-        // delivered after may have arrived after the idle point, and is the next pass's.
-        for (const [messageId, message] of steers.get(id)?.queued ?? []) {
-          if (message.acceptedAt <= mark.at) {
-            steers.get(id)?.queued.delete(messageId);
+        /*
+         * The process holding the session is gone (slice 3 fix, L2): a message it had not
+         * taken lived in its queue and will never run, whenever it was sent. Kept, marked
+         * lost, so the replay says it was not delivered rather than draw it as sent.
+         */
+        const gone =
+          settled._tag === "Failure" &&
+          settled.failure._tag === "HarnessTransportError" &&
+          settled.failure.tag === SESSION_PROCESS_GONE_TAG;
+        const held = steers.get(id)?.queued;
+        for (const [messageId, message] of held ?? []) {
+          if (gone && !message.taken) {
+            held?.set(messageId, { ...message, lost: true });
+          } else if (message.acceptedAt <= mark.at) {
+            // Idle: whatever was delivered before the wait began has been taken. A message
+            // delivered after may have arrived after the idle point, and is the next pass's.
+            held?.delete(messageId);
           }
         }
         const ended = settled._tag === "Failure";
@@ -977,6 +1011,16 @@ export const makeConversations = <
         );
       }
       if (delivered._tag === "Failure") {
+        /*
+         * The harness holds no live session for it any more (slice 3 fix, L2): its process
+         * died between the last turn and this message, which the registry has just closed.
+         * Nothing was delivered, so the message is not refused but carried on by a reopen,
+         * as the next one would have been: the operator's first message after a crash
+         * resumes the session at once.
+         */
+        if (deliveredToNothing(delivered.failure)) {
+          return yield* Effect.fail(NOT_LIVE);
+        }
         return yield* Effect.fail(
           binding.refused(
             "harness_unreachable",
@@ -1079,7 +1123,14 @@ export const makeConversations = <
         // The fast path: live, preambled, and this target's.
         const live = sessions.ready(input.conversationId);
         if (live !== undefined && live.targetId === input.targetId) {
-          return yield* deliverTurn(live, input.text, urgency, input.uploads);
+          const delivered = yield* Effect.result(
+            deliverTurn(live, input.text, urgency, input.uploads),
+          );
+          if (delivered._tag === "Success") return delivered.success;
+          // Not live after all: carried on below, by the same path a later message takes.
+          if (!isNotLive(delivered.failure)) {
+            return yield* Effect.fail(delivered.failure);
+          }
         }
         // Still opening: wait until the open is known, then ask again.
         const opening = inFlight.get(input.conversationId);
@@ -1111,13 +1162,8 @@ export const makeConversations = <
           );
           if (joined._tag === "Success") return joined.success;
           const failure = joined.failure;
-          if (
-            typeof failure !== "object" ||
-            failure === null ||
-            !("_tag" in failure) ||
-            failure._tag !== "NotLive"
-          ) {
-            return yield* Effect.fail(failure as Refused);
+          if (!isNotLive(failure)) {
+            return yield* Effect.fail(failure);
           }
         }
         // Not live in this process and not ended by the operator: a fresh period, under a
