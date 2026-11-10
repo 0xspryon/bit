@@ -133,7 +133,7 @@ const StoredSessionInfo = Schema.StructWithRest(
   Schema.Struct({
     sessionId: Schema.String,
     summary: Schema.String,
-    lastModified: Schema.Number,
+    lastModified: Schema.Finite,
   }),
   Rest,
 );
