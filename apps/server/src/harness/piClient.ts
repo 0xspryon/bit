@@ -17,11 +17,23 @@
  * the resume, and a resume must start in the directory the session was created in, which
  * {@link AgentHarness.sessionContinuation} reports from the file's header.
  *
- * **bit's Pi sessions live in their own folder** (`--session-dir`, one per instance, under
- * the fleet root: `main.ts`), not in the operator's `~/.pi/agent/sessions`. Measured: the
- * folder is flat, one `<timestamp>_<id>.jsonl` per session. The operator can open one with
- * `pi --session <id> --session-dir <that folder>` — **never while bit is running it**: Pi
- * does not lock session files, and two processes appending to one would interleave.
+ * **bit's Pi sessions live where Pi keeps them** (follow-ups A): the instance's agent
+ * folder's `sessions/--<cwd>--/`, Pi's own default for the directory the session runs in,
+ * passed explicitly as `--session-dir` (`piSessionFiles.ts` says why). So `pi --resume` in
+ * that directory lists them, `pi --session <id>` opens one, and the operator deletes them
+ * with Pi's own tools; Pi deletes nothing by itself. The operator may open one — **never
+ * while bit is running it**: Pi does not lock session files, and two processes appending to
+ * one would interleave. A file deleted while bit is not running it is a conversation that
+ * is gone: its replay says so and its resume is refused (`sessionContinuation`).
+ *
+ * ## Thinking level
+ *
+ * A model that reasons offers Pi's thinking levels as a model option (`piThinking.ts`): a
+ * chosen level is `--thinking` at the process's start, a resume included (Pi honours it
+ * there, measured), and `set_thinking_level` on a live switch, after any `set_model` (which
+ * keeps the old level, clamped, unless Pi's settings name one for the new model). Nothing
+ * chosen is nothing sent: Pi's default at a start, and on a live switch back from a chosen
+ * level, the level Pi says it would start that model at.
  *
  * **One process per session, started at the session's first prompt**, not at
  * `createSession`, for the reason the Claude Code driver holds its query until then: the
@@ -118,9 +130,8 @@
  * carried on by a resume ({@link AgentHarness.sessionContinuation}), as on Claude Code.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import type { HarnessModelView, QuestionAnswers } from "@bit/contracts";
 import {
@@ -209,6 +220,19 @@ import {
   type PiEvent,
   type PiSessionFile,
 } from "./piTranscript";
+import {
+  findPiSessionFile,
+  piAgentDir,
+  piSessionFolder,
+  piSessionsRoot,
+} from "./piSessionFiles";
+import {
+  isPiThinkingLevel,
+  piThinkingDescriptor,
+  piThinkingLevels,
+  piThinkingOf,
+  type PiThinkingLevel,
+} from "./piThinking";
 
 /** A model of a configured catalogue. */
 export interface PiModelConfig {
@@ -225,11 +249,10 @@ export interface PiHarnessOptions {
   /**
    * Pi's agent folder (`PI_CODING_AGENT_DIR`): its `auth.json`, `models.json`, settings and
    * extensions. Absent: whatever the server's environment says, which is the operator's
-   * `~/.pi/agent`. bit passes it as a path and never opens it.
+   * `~/.pi/agent`. bit passes it as a path and opens nothing in it but its `sessions`
+   * folder, where Pi stores this instance's sessions (`piSessionFiles.ts`).
    */
   readonly agentDir?: string | undefined;
-  /** Where this instance's sessions are stored (`--session-dir`). Created if missing. */
-  readonly sessionDir: string;
   /**
    * The picker's catalogue. Absent: every model Pi lists for the providers it holds
    * credentials for, read once at startup.
@@ -441,6 +464,8 @@ interface ListedModel {
   readonly name: string | undefined;
   readonly contextWindow: number | undefined;
   readonly images: boolean;
+  /** The thinking levels it offers, by Pi's rule (`piThinking.ts`); `[]` for none. */
+  readonly levels: readonly PiThinkingLevel[];
 }
 
 const listedModel = (value: unknown): ListedModel | undefined => {
@@ -456,6 +481,7 @@ const listedModel = (value: unknown): ListedModel | undefined => {
         ? model.contextWindow
         : undefined,
     images: Array.isArray(model.input) && model.input.includes("image"),
+    levels: piThinkingLevels(model),
   };
 };
 
@@ -464,6 +490,8 @@ interface Probe {
   readonly version: string;
   readonly models: readonly ListedModel[];
   readonly defaultModel: string | undefined;
+  /** The thinking level the probe's process started at, for its model. */
+  readonly thinkingLevel: PiThinkingLevel | undefined;
 }
 
 const probeFailure = (detail: string, diagnostics = "") =>
@@ -483,6 +511,8 @@ const probePi = (
   binary: string,
   env: Record<string, string | undefined>,
   timeout: Duration.Input,
+  /** Started on this model, in this directory: what Pi starts that model at there. */
+  on?: { readonly model: string; readonly cwd: string },
 ): Effect.Effect<Probe, HarnessProcessError> =>
   Effect.callback<Probe, HarnessProcessError>((resume) => {
     let child: ChildProcess;
@@ -498,8 +528,9 @@ const probePi = (
           "--no-skills",
           "--no-prompt-templates",
           "--no-context-files",
+          ...(on === undefined ? [] : ["--model", on.model]),
         ],
-        { cwd: tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] },
+        { cwd: on?.cwd ?? tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] },
       );
     } catch (cause) {
       resume(
@@ -566,14 +597,17 @@ const probePi = (
               return model === undefined ? [] : [model];
             })
           : [];
-        const current = listedModel(
-          (answers.state as { model?: unknown } | undefined)?.model,
-        );
+        const state = answers.state as
+          { model?: unknown; thinkingLevel?: unknown } | undefined;
+        const current = listedModel(state?.model);
         finish(
           Effect.succeed({
             version: "unknown",
             models,
             defaultModel: current?.id,
+            thinkingLevel: isPiThinkingLevel(state?.thinkingLevel)
+              ? state.thinkingLevel
+              : undefined,
           }),
         );
       }),
@@ -674,6 +708,8 @@ interface SessionRecord {
   readonly multiTurn: boolean;
   readonly resumed: boolean;
   model: string;
+  /** The thinking level chosen for {@link model}; `undefined` for Pi's default. */
+  thinking: PiThinkingLevel | undefined;
   /** From `createSession`: whether the process is offered bit's question tool. */
   readonly operatorQuestions: boolean;
   /** The key bit's question dialogs carry in their title; see the header. */
@@ -728,7 +764,6 @@ export const piHarness = (
         options.interruptTimeout ?? DEFAULT_INTERRUPT_TIMEOUT;
       const stopBounds = options.stopBounds ?? DEFAULT_STOP_BOUNDS;
       const extensionPath = options.extensionPath ?? defaultExtensionPath();
-      const sessionDir = options.sessionDir;
       const memoryMax = options.memoryMax;
       const scopes =
         options.containment?._tag === "available"
@@ -751,15 +786,10 @@ export const piHarness = (
           : { PI_CODING_AGENT_DIR: options.agentDir }),
       });
 
-      try {
-        mkdirSync(sessionDir, { recursive: true });
-      } catch (cause) {
-        return yield* Effect.fail(
-          probeFailure(
-            `could not create the Pi session folder ${sessionDir}: ${String(cause)}`,
-          ),
-        );
-      }
+      /** Where Pi keeps this instance's sessions: `<agentDir>/sessions`. */
+      const sessionsRoot = piSessionsRoot(
+        options.agentDir ?? piAgentDir(environment()),
+      );
 
       const version = yield* piVersion(binary, environment());
       const probe = yield* probePi(binary, environment(), "30 seconds");
@@ -773,9 +803,11 @@ export const piHarness = (
         const window = known?.contextWindow;
         const compaction =
           window === undefined ? undefined : piCompactionAt(window);
+        const thinking = piThinkingDescriptor(known?.levels ?? []);
         return {
           id,
           ...(name === undefined || name === "" ? {} : { label: name }),
+          ...(thinking === undefined ? {} : { optionDescriptors: [thinking] }),
           ...(window === undefined ? {} : { contextLimit: window }),
           ...(compaction === undefined ? {} : { compactionAt: compaction }),
         };
@@ -812,6 +844,9 @@ export const piHarness = (
       }
       const windowOf = (model: string): number | undefined =>
         listed.get(model)?.contextWindow;
+      /** The levels `model` offers, as Pi's catalogue said at startup. */
+      const levelsOf = (model: string): readonly PiThinkingLevel[] =>
+        listed.get(model)?.levels ?? [];
 
       const instance: HarnessInstance = {
         instanceId: options.instanceId ?? defaultInstanceIdForDriver(PI_DRIVER),
@@ -841,19 +876,28 @@ export const piHarness = (
       const handedOut = new WeakMap<SessionRef, SessionRecord>();
       const records = new Set<SessionRecord>();
 
-      /** The session's file in {@link sessionDir}, the newest when several match. */
-      const findFile = (sessionId: string): string | undefined => {
-        let names: string[];
-        try {
-          names = readdirSync(sessionDir);
-        } catch {
-          return undefined;
-        }
-        const suffix = `_${sessionId}.jsonl`;
-        const found = names.filter((name) => name.endsWith(suffix)).sort();
-        const last = found.at(-1);
-        return last === undefined ? undefined : join(sessionDir, last);
-      };
+      /**
+       * The session's file where Pi keeps it, found by id as Pi finds it; in the folder of
+       * the directory it runs in first, when this process holds it. `undefined`: Pi holds
+       * no such session — never written, or deleted in Pi or by hand.
+       */
+      const findFile = (sessionId: string): string | undefined =>
+        findPiSessionFile(
+          sessionsRoot,
+          sessionId,
+          sessions.get(sessionId)?.directory,
+        );
+
+      /**
+       * Whether a missing file is one Pi has not written yet — a session this process
+       * created and still runs — rather than one Pi no longer has.
+       */
+      const notWrittenYet = (record: SessionRecord | undefined): boolean =>
+        record !== undefined && !record.resumed && !record.closed;
+
+      /** The sentence for a session whose file Pi no longer has. */
+      const goneSentence = (sessionId: string): string =>
+        `Pi no longer has session ${sessionId}: its file is not in ${sessionsRoot}, so it was deleted in Pi (its session picker, Ctrl+D) or by hand, or never written`;
 
       /** Reads and parses one session's file; `undefined` when it has none. */
       const readSession = (
@@ -863,9 +907,15 @@ export const piHarness = (
         Effect.suspend(
           (): Effect.Effect<PiSessionFile | undefined, HarnessFailure> => {
             const record = sessions.get(sessionId);
-            const path = record?.file ?? findFile(sessionId);
-            if (path === undefined) return Effect.succeed(undefined);
+            // The remembered path only while it is still there: the operator may delete the
+            // file in Pi between two reads.
+            const remembered =
+              record?.file !== undefined && existsSync(record.file)
+                ? record.file
+                : undefined;
+            const path = remembered ?? findFile(sessionId);
             if (record !== undefined) record.file = path;
+            if (path === undefined) return Effect.succeed(undefined);
             let text: string;
             try {
               text = readFileSync(path, "utf8");
@@ -1226,15 +1276,44 @@ export const piHarness = (
         delivery: Delivery,
       ): Effect.Effect<void, HarnessFailure> =>
         Effect.gen(function* () {
+          // Pi's own folder for the directory, made as Pi makes it for its default.
+          const folder = piSessionFolder(sessionsRoot, record.directory);
+          if (record.resumed && findFile(record.sessionId) === undefined) {
+            /*
+             * Deleted since the resume was decided (Pi's picker, or by hand). Pi would take
+             * `--session-id` for a new, empty session under the old id and the agent would
+             * answer without its history, so the resume is refused instead.
+             */
+            return yield* Effect.fail(
+              notFound(
+                "pi.spawn",
+                `${goneSentence(record.sessionId)}; there is no conversation to carry on`,
+              ),
+            );
+          }
+          try {
+            mkdirSync(folder, { recursive: true });
+          } catch (cause) {
+            return yield* Effect.fail(
+              transport(
+                "pi.spawn",
+                `could not create Pi's session folder ${folder}: ${String(cause)}`,
+              ),
+            );
+          }
           const args = [
             "--mode",
             "rpc",
             "--session-dir",
-            sessionDir,
+            folder,
             "--session-id",
             record.sessionId,
             "--model",
             record.model,
+            // A resume too: Pi applies the flag over the level the file recorded (measured).
+            ...(record.thinking === undefined
+              ? []
+              : ["--thinking", record.thinking]),
             // A resume keeps the name it was given; naming it again appends another
             // `session_info` entry (measured).
             ...(record.resumed ? [] : ["--name", record.title]),
@@ -1624,6 +1703,7 @@ export const piHarness = (
           multiTurn: input.multiTurn === true,
           resumed: input.resume !== undefined,
           model: input.model,
+          thinking: piThinkingOf(input.options),
           // As on Claude Code: only a conversation draws questions, and only one that says so.
           operatorQuestions:
             input.multiTurn === true && input.operatorQuestions === true,
@@ -1650,18 +1730,53 @@ export const piHarness = (
         holder.record = record;
         sessions.set(sessionId, record);
         records.add(record);
-        // `options` (reasoning depth) is not translated: this build offers no option
-        // descriptors for Pi models, so none can be chosen. `parentSessionId` and
-        // `fetchesPages` have nothing to configure on Pi: it has no sub-agents and reads
-        // pages with its shell.
+        // `options` is the thinking level, applied when the process starts (`launch`).
+        // `parentSessionId` and `fetchesPages` have nothing to configure on Pi: it has no
+        // sub-agents and reads pages with its shell.
         const ref: SessionRef = { id: sessionId };
         handedOut.set(ref, record);
         return ref;
       });
 
+      /**
+       * The level Pi starts `model` at in `directory` when told nothing: a short-lived
+       * process asked, as the startup read is (its settings' level for the model, else its
+       * default, clamped). What "Pi's default" is on a live switch back from a chosen level.
+       */
+      const defaultLevel = (
+        model: string,
+        directory: string,
+      ): Effect.Effect<PiThinkingLevel, HarnessTransportError> =>
+        probePi(binary, environment(), controlTimeout, {
+          model,
+          cwd: directory,
+        }).pipe(
+          Effect.mapError((failure) =>
+            transport("pi.thinking_default", failure.detail),
+          ),
+          Effect.flatMap((probe) =>
+            probe.thinkingLevel === undefined
+              ? Effect.fail(
+                  transport(
+                    "pi.thinking_default",
+                    `Pi did not say which thinking level it starts ${model} at`,
+                  ),
+                )
+              : Effect.succeed(probe.thinkingLevel),
+          ),
+        );
+
+      /**
+       * A model and a thinking level, applied to the live process in Pi's order:
+       * `set_model` first (it carries the old level across, clamped, or applies Pi's
+       * settings' level for the new model), then `set_thinking_level` for a chosen level —
+       * or, back to Pi's default from a chosen one, the level Pi says it would start the
+       * model at. A repeat sends nothing. Not yet started: only the record changes, and the
+       * first prompt starts on it.
+       */
       const switchModel: AgentHarness["Service"]["switchModel"] = Effect.fn(
         "piHarness.switchModel",
-      )(function* (sessionId, model) {
+      )(function* (sessionId, model, options) {
         const record = sessions.get(sessionId);
         if (record === undefined || record.closed) {
           return yield* notFound(
@@ -1669,22 +1784,47 @@ export const piHarness = (
             `this process holds no live Pi session ${sessionId}`,
           );
         }
+        // Resolved against `model`'s descriptor by the caller; a level it does not offer
+        // cannot arrive, but one for a model Pi did not list is not sent either.
+        const chosen = piThinkingOf(options);
+        const thinking =
+          chosen !== undefined && levelsOf(model).includes(chosen)
+            ? chosen
+            : undefined;
         return yield* Semaphore.withPermit(record.switching)(
           Effect.gen(function* () {
-            if (record.model === model) return;
+            if (record.model === model && record.thinking === thinking) return;
             const rpc = record.rpc;
             if (rpc === undefined) {
               record.model = model;
+              record.thinking = thinking;
               return;
             }
-            const { providerId, modelId } = piModelProvenance(model);
-            const response = yield* command(
-              rpc,
-              { type: "set_model", provider: providerId, modelId },
-              controlTimeout,
-            );
-            yield* succeeded("pi.set_model", response);
-            record.model = model;
+            if (record.model !== model) {
+              const { providerId, modelId } = piModelProvenance(model);
+              const response = yield* command(
+                rpc,
+                { type: "set_model", provider: providerId, modelId },
+                controlTimeout,
+              );
+              yield* succeeded("pi.set_model", response);
+              record.model = model;
+            }
+            // Back to the default from a chosen level: Pi keeps the chosen one otherwise.
+            const level =
+              thinking ??
+              (record.thinking !== undefined && levelsOf(model).length > 0
+                ? yield* defaultLevel(model, record.directory)
+                : undefined);
+            if (level !== undefined) {
+              const response = yield* command(
+                rpc,
+                { type: "set_thinking_level", level },
+                controlTimeout,
+              );
+              yield* succeeded("pi.set_thinking_level", response);
+            }
+            record.thinking = thinking;
           }),
         );
       });
@@ -1843,10 +1983,7 @@ export const piHarness = (
           } satisfies SessionStatus;
         }
         if (findFile(sessionId) === undefined) {
-          return yield* notFound(
-            "pi.session",
-            `bit's Pi session folder ${sessionDir} holds no session ${sessionId}`,
-          );
+          return yield* notFound("pi.session", goneSentence(sessionId));
         }
         return { activity: "idle", outcome: undefined } satisfies SessionStatus;
       });
@@ -1869,6 +2006,16 @@ export const piHarness = (
         };
         const file = yield* Effect.result(readSession("pi.context", sessionId));
         if (file._tag === "Failure") {
+          return {
+            used: null,
+            usedModel: null,
+            window,
+            reading: "unread",
+            breakdown,
+          } satisfies HarnessContextUsage;
+        }
+        if (file.success === undefined && !notWrittenYet(record)) {
+          // Gone (deleted in Pi), not "no call yet": nothing can be measured any more.
           return {
             used: null,
             usedModel: null,
@@ -1915,7 +2062,7 @@ export const piHarness = (
           if (file === undefined) {
             return {
               _tag: "unresumable",
-              detail: `bit's Pi session folder holds no file for session ${sessionId}`,
+              detail: `${goneSentence(sessionId)}; there is no conversation to carry on`,
             };
           }
           if (!hasUserMessage(file.entries)) {
@@ -1943,7 +2090,7 @@ export const piHarness = (
         if (file === undefined) {
           return {
             _tag: "forgotten",
-            detail: `bit's Pi session folder holds no file for session ${sessionId}`,
+            detail: goneSentence(sessionId),
           } satisfies SessionTitle;
         }
         const name = sessionName(file.entries);
@@ -1961,8 +2108,14 @@ export const piHarness = (
         "piHarness.messages",
       )(function* (sessionId, read) {
         const file = yield* readSession("pi.messages", sessionId);
-        if (file === undefined) return [];
         const record = sessions.get(sessionId);
+        if (file === undefined) {
+          // A new session of this process's: Pi writes the file once the first reply is
+          // in, so nothing yet. Anything else — one never held here, a resume, an ended
+          // one — had a file, and Pi no longer has it: a replay says the transcript is gone.
+          if (notWrittenYet(record)) return [];
+          return yield* notFound("pi.messages", goneSentence(sessionId));
+        }
         const joined = [...(record?.taken ?? [])];
         const entries = piMessageEntries(file, {
           reader: attachmentReader({ uploadsFolder: read?.uploadsFolder }),

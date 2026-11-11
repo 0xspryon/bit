@@ -38,6 +38,8 @@ import { InstanceId } from "./identity";
 import { QUESTION_DISMISSED_MESSAGE } from "./questions";
 import { fakeModelsJson, startFakeModel, type FakeModel } from "./piFakeModel";
 import { piHarness, type PiHarnessOptions } from "./piClient";
+import { piSessionFolder, piSessionsRoot } from "./piSessionFiles";
+import { PI_THINKING_OPTION } from "./piThinking";
 import { processExitMessage } from "./processExit";
 
 /**
@@ -72,6 +74,7 @@ const S = (steps: readonly unknown[]): string =>
 interface Fixture {
   readonly harness: AgentHarness["Service"];
   readonly scope: Scope.Closeable;
+  /** Where Pi keeps this fixture's sessions: its default folder for {@link work}. */
   readonly sessionDir: string;
   readonly records: string;
   readonly work: string;
@@ -82,13 +85,13 @@ let counter = 0;
 /** A harness layer of its own, on fresh folders; the scope is the test's to close. */
 const fixture = async (
   overrides: Partial<PiHarnessOptions> = {},
-  folders?: { sessionDir: string; records: string; work: string },
+  folders?: { records: string; work: string },
 ): Promise<Fixture> => {
   counter += 1;
   const base = join(root, `f${String(counter)}`);
-  const sessionDir = folders?.sessionDir ?? join(base, "sessions");
   const records = folders?.records ?? join(base, "records");
   const work = folders?.work ?? join(base, "work");
+  const sessionDir = piSessionFolder(piSessionsRoot(agentDir), work);
   mkdirSync(work, { recursive: true });
   const scope = await Effect.runPromise(Scope.make());
   const context = await Effect.runPromise(
@@ -97,7 +100,6 @@ const fixture = async (
         instanceId: InstanceId.make("pi-test"),
         displayName: "Pi test",
         agentDir,
-        sessionDir,
         recordDirectory: records,
         stopBounds: { terminateGrace: 1_000, killGrace: 1_000, poll: 25 },
         ...overrides,
@@ -179,6 +181,39 @@ const alive = (pid: number): boolean => {
   }
 };
 
+/**
+ * Pi itself, asked over RPC with this file's agent folder and nothing else of bit's: the
+ * answers by command id. Synchronous: one short process.
+ */
+const askPi = (
+  args: readonly string[],
+  commands: readonly { readonly id: string; readonly type: string }[],
+  cwd: string = tmpdir(),
+): Record<string, { readonly data?: unknown } | undefined> => {
+  const ran = spawnSync(
+    "pi",
+    ["--mode", "rpc", "--offline", "--no-extensions", ...args],
+    {
+      cwd,
+      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+      input: commands.map((each) => JSON.stringify(each)).join("\n") + "\n",
+      encoding: "utf8",
+      timeout: 15_000,
+    },
+  );
+  const answers: Record<string, { readonly data?: unknown }> = {};
+  for (const line of ran.stdout.split("\n")) {
+    try {
+      const record = JSON.parse(line) as { type?: unknown; id?: unknown };
+      if (record.type === "response" && typeof record.id === "string")
+        answers[record.id] = record as { readonly data?: unknown };
+    } catch {
+      // Not a record.
+    }
+  }
+  return answers;
+};
+
 const open = (
   harness: AgentHarness["Service"],
   work: string,
@@ -219,6 +254,7 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       expect(f.harness.instance.models.map((entry) => entry.id)).toEqual([
         "fake/fake-1",
         "fake/fake-2",
+        "fake/fake-think",
       ]);
       expect(f.harness.instance.models[0]?.label).toBe("Fake One");
       expect(f.harness.instance.models[1]?.contextLimit).toBe(100_000);
@@ -227,6 +263,36 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
         providerId: "zai",
         modelId: "glm-5.3-flash",
       });
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("a model that reasons offers exactly the thinking levels Pi says it has, and one that does not offers none", async () => {
+    const f = await fixture();
+    try {
+      const think = f.harness.instance.models.find(
+        (entry) => entry.id === "fake/fake-think",
+      );
+      expect(think?.optionDescriptors?.map((each) => each.id)).toEqual([
+        PI_THINKING_OPTION,
+      ]);
+      const offered =
+        think?.optionDescriptors?.[0]?.options.map((choice) => choice.id) ??
+        [];
+      expect(offered).toEqual(["default", "low", "high"]);
+      // Pi's own answer for the model, from the process that runs it.
+      const pi = askPi(
+        ["--no-session", "--model", "fake/fake-think"],
+        [{ id: "levels", type: "get_available_thinking_levels" }],
+      );
+      expect(pi.levels?.data).toEqual({ levels: offered.slice(1) });
+      for (const plain of ["fake/fake-1", "fake/fake-2"]) {
+        expect(
+          f.harness.instance.models.find((entry) => entry.id === plain)
+            ?.optionDescriptors,
+        ).toBeUndefined();
+      }
     } finally {
       await close(f);
     }
@@ -319,7 +385,8 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       expect(context.window).toBe(200_000);
       expect(context.usedModel).toBe("fake/fake-1");
 
-      // The session is stored in bit's own folder, named by bit's id and title.
+      // The session is stored where Pi keeps it — its own folder for the directory, under
+      // the agent folder — named by bit's id and title.
       const [file] = readdirSync(f.sessionDir);
       expect(file?.endsWith(`_${ref.id}.jsonl`)).toBe(true);
       const title = await Effect.runPromise(f.harness.sessionTitle(ref.id));
@@ -662,7 +729,6 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
   test("an ended session leaves no Pi process, and a restarted server replays and resumes it from its file", async () => {
     const first = await fixture();
     const folders = {
-      sessionDir: first.sessionDir,
       records: first.records,
       work: first.work,
     };
@@ -744,10 +810,10 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
           .at(-1)
           ?.messages.some((message) => message.text.includes("first reply")),
       ).toBe(true);
-      const files = readdirSync(folders.sessionDir);
+      const files = readdirSync(first.sessionDir);
       expect(files.length).toBe(1);
       const text = readFileSync(
-        join(folders.sessionDir, files[0] ?? ""),
+        join(first.sessionDir, files[0] ?? ""),
         "utf8",
       );
       expect(
@@ -799,6 +865,229 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       ).toEqual(["fake/fake-1", "fake/fake-2"]);
     } finally {
       await close(f);
+    }
+  });
+
+  test("a chosen thinking level runs from the start, moves on a live switch, goes back to Pi's default, and is applied again on a resume", async () => {
+    const first = await fixture();
+    const sessionId = first.harness.newSessionId();
+    try {
+      await Effect.runPromise(
+        first.harness.createSession({
+          title: "bit test session",
+          model: "fake/fake-think",
+          directory: first.work,
+          sessionId,
+          multiTurn: true,
+          options: [{ id: PI_THINKING_OPTION, value: "low" }],
+        }),
+      );
+      await Effect.runPromise(
+        first.harness.prompt(sessionId, S([{ text: "one" }])),
+      );
+      await Effect.runPromise(first.harness.waitForIdle(sessionId));
+      expect(model.requests.at(-1)?.reasoningEffort).toBe("low");
+
+      await Effect.runPromise(
+        first.harness.switchModel(sessionId, "fake/fake-think", [
+          { id: PI_THINKING_OPTION, value: "high" },
+        ]),
+      );
+      const said = async (text: string) => {
+        await Effect.runPromise(
+          first.harness.prompt(sessionId, S([{ text }]), {
+            _tag: "steer",
+            urgency: "queued",
+            messageId: `m-${text}`,
+          }),
+        );
+        await Effect.runPromise(first.harness.waitForIdle(sessionId));
+        return model.requests.at(-1)?.reasoningEffort;
+      };
+      expect(await said("two")).toBe("high");
+      await Effect.runPromise(
+        first.harness.switchModel(sessionId, "fake/fake-think", [
+          { id: PI_THINKING_OPTION, value: "low" },
+        ]),
+      );
+      expect(await said("three")).toBe("low");
+      // Back to the default: what Pi starts this model at here (its `medium`, clamped up
+      // to `high`), not the `low` the session was left at.
+      await Effect.runPromise(
+        first.harness.switchModel(sessionId, "fake/fake-think", [
+          { id: PI_THINKING_OPTION, value: "default" },
+        ]),
+      );
+      expect(await said("four")).toBe("high");
+      // To a model that does not reason: nothing to set, and Pi sends no effort.
+      await Effect.runPromise(
+        first.harness.switchModel(sessionId, "fake/fake-1"),
+      );
+      expect(await said("five")).toBeUndefined();
+      await Effect.runPromise(
+        first.harness.switchModel(sessionId, "fake/fake-think", [
+          { id: PI_THINKING_OPTION, value: "low" },
+        ]),
+      );
+      expect(await said("six")).toBe("low");
+
+      // Pi's own record of it: the levels in its file, in the order they were set.
+      const [name] = readdirSync(first.sessionDir);
+      const entries = readFileSync(join(first.sessionDir, name ?? ""), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(
+        entries
+          .filter((entry) => entry.type === "thinking_level_change")
+          .map((entry) => entry.thinkingLevel),
+      ).toEqual(["low", "high", "low", "high", "off", "low"]);
+      await Effect.runPromise(first.harness.endSession({ id: sessionId }));
+    } finally {
+      await close(first);
+    }
+
+    // A restarted server resumes it at the level its row recorded, over the file's last.
+    const second = await fixture({}, { records: first.records, work: first.work });
+    try {
+      await Effect.runPromise(
+        second.harness.createSession({
+          title: "bit test session",
+          model: "fake/fake-think",
+          directory: first.work,
+          resume: sessionId,
+          multiTurn: true,
+          options: [{ id: PI_THINKING_OPTION, value: "high" }],
+        }),
+      );
+      await Effect.runPromise(
+        second.harness.prompt(sessionId, S([{ text: "seven" }])),
+      );
+      await Effect.runPromise(second.harness.waitForIdle(sessionId));
+      expect(model.requests.at(-1)?.reasoningEffort).toBe("high");
+    } finally {
+      await close(second);
+    }
+  });
+
+  test("a session is stored where Pi keeps it, so Pi itself opens it by id from its own folder", async () => {
+    const f = await fixture();
+    try {
+      const ref = await open(f.harness, f.work, "");
+      await Effect.runPromise(
+        f.harness.prompt(ref.id, S([{ text: "kept by Pi" }])),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      await Effect.runPromise(f.harness.endSession(ref));
+      // `<agentDir>/sessions/--<cwd>--/<ts>_<id>.jsonl`, Pi's default for that directory.
+      const folder = join(
+        agentDir,
+        "sessions",
+        `--${f.work.slice(1).replaceAll("/", "-")}--`,
+      );
+      expect(f.sessionDir).toBe(folder);
+      const [name] = readdirSync(folder);
+      expect(name?.endsWith(`_${ref.id}.jsonl`)).toBe(true);
+      // Pi, started in that directory with nothing but the id, finds and opens it.
+      const pi = askPi(
+        ["--session", ref.id],
+        [{ id: "state", type: "get_state" }],
+        f.work,
+      );
+      const state = pi.state?.data as
+        { sessionId?: unknown; sessionFile?: unknown } | undefined;
+      expect(state?.sessionId).toBe(ref.id);
+      expect(state?.sessionFile).toBe(join(folder, name ?? ""));
+    } finally {
+      await close(f);
+    }
+  });
+
+  test("a session file deleted in Pi replays as gone, is refused as a resume, and a resume racing the delete starts nothing", async () => {
+    const first = await fixture();
+    let sessionId = "";
+    try {
+      const ref = await open(first.harness, first.work, "");
+      sessionId = ref.id;
+      await Effect.runPromise(
+        first.harness.prompt(ref.id, S([{ text: "soon gone" }])),
+      );
+      await Effect.runPromise(first.harness.waitForIdle(ref.id));
+      await Effect.runPromise(first.harness.endSession(ref));
+    } finally {
+      await close(first);
+    }
+    const second = await fixture({}, { records: first.records, work: first.work });
+    try {
+      expect(
+        (
+          await Effect.runPromise(second.harness.sessionContinuation(sessionId))
+        )._tag,
+      ).toBe("resumable");
+      // Deleted, as Pi's session picker deletes one (Ctrl+D) or the operator by hand.
+      for (const name of readdirSync(first.sessionDir)) {
+        rmSync(join(first.sessionDir, name));
+      }
+
+      const continuation = await Effect.runPromise(
+        second.harness.sessionContinuation(sessionId),
+      );
+      expect(continuation._tag).toBe("unresumable");
+      expect(continuation.detail).toContain(
+        `Pi no longer has session ${sessionId}`,
+      );
+      const replay = await Effect.runPromise(
+        Effect.flip(second.harness.messages(sessionId)),
+      );
+      expect(replay._tag === "HarnessTransportError" && replay.tag).toBe(
+        SESSION_NOT_FOUND_TAG,
+      );
+      const status = await Effect.runPromise(
+        Effect.flip(second.harness.sessionStatus(sessionId)),
+      );
+      expect(status._tag === "HarnessTransportError" && status.tag).toBe(
+        SESSION_NOT_FOUND_TAG,
+      );
+      expect(
+        (
+          await Effect.runPromise(
+            second.harness.contextUsage(sessionId, {
+              model: "fake/fake-1",
+              breakdown: false,
+            }),
+          )
+        ).reading,
+      ).toBe("unread");
+      expect(
+        (await Effect.runPromise(second.harness.sessionTitle(sessionId)))._tag,
+      ).toBe("forgotten");
+
+      // A resume decided before the delete (the continuation was read earlier) and sent
+      // after it.
+      await Effect.runPromise(
+        second.harness.createSession({
+          title: "bit test session",
+          model: "fake/fake-1",
+          directory: first.work,
+          resume: sessionId,
+          multiTurn: true,
+        }),
+      );
+      const requests = model.requests.length;
+      const sent = await Effect.runPromise(
+        Effect.flip(
+          second.harness.prompt(sessionId, S([{ text: "into nothing" }])),
+        ),
+      );
+      expect(sent._tag === "HarnessTransportError" && sent.tag).toBe(
+        SESSION_NOT_FOUND_TAG,
+      );
+      // No Pi was started, so no empty session took the old id, and nothing was asked.
+      expect(readdirSync(first.sessionDir)).toEqual([]);
+      expect(readdirSync(first.records)).toEqual([]);
+      expect(model.requests.length).toBe(requests);
+    } finally {
+      await close(second);
     }
   });
 

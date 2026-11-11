@@ -52,6 +52,8 @@ export interface FakeModelRequest {
     readonly role: string;
     readonly text: string;
   }[];
+  /** The request's `reasoning_effort`, where Pi sent one (a thinking level, mapped). */
+  readonly reasoningEffort: string | undefined;
 }
 
 export interface FakeModel {
@@ -92,6 +94,7 @@ export const startFakeModel = (): FakeModel => {
         model?: string;
         messages?: { role: string; content: unknown }[];
         tools?: { function?: { name?: string } }[];
+        reasoning_effort?: unknown;
       };
       const messages = body.messages ?? [];
       requests.push({
@@ -101,6 +104,10 @@ export const startFakeModel = (): FakeModel => {
           role: message.role,
           text: textOf(message.content),
         })),
+        reasoningEffort:
+          typeof body.reasoning_effort === "string"
+            ? body.reasoning_effort
+            : undefined,
       });
       let start = -1;
       for (let index = messages.length - 1; index >= 0; index--) {
@@ -268,7 +275,10 @@ export const startFakeModel = (): FakeModel => {
 
 /**
  * A `models.json` for a temporary `PI_CODING_AGENT_DIR` pointing provider `fake` at a fake
- * model: models `fake-1` (window 200 000) and `fake-2` (window 100 000).
+ * model: models `fake-1` (window 200 000) and `fake-2` (window 100 000), which do not
+ * reason, and `fake-think` (window 100 000), which reasons at `low` and `high` only: its
+ * `thinkingLevelMap` refuses `off`, `minimal` and `medium`, and maps neither `xhigh` nor
+ * `max`, so Pi offers neither (`getSupportedThinkingLevels`, pi-ai 1.5.2).
  */
 export const fakeModelsJson = (url: string): string =>
   JSON.stringify(
@@ -281,6 +291,13 @@ export const fakeModelsJson = (url: string): string =>
           models: [
             { id: "fake-1", name: "Fake One", contextWindow: 200_000 },
             { id: "fake-2", name: "Fake Two", contextWindow: 100_000 },
+            {
+              id: "fake-think",
+              name: "Fake Think",
+              contextWindow: 100_000,
+              reasoning: true,
+              thinkingLevelMap: { off: null, minimal: null, medium: null },
+            },
           ].map((model) => ({
             ...model,
             maxTokens: 8_000,

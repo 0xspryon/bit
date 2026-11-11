@@ -141,7 +141,6 @@ const fixture = async (
         instanceId: InstanceId.make("pi-scope-test"),
         displayName: "Pi scope test",
         agentDir,
-        sessionDir: join(base, "sessions"),
         recordDirectory: records,
         stopBounds: { terminateGrace: 1_000, killGrace: 1_000, poll: 25 },
         containment,

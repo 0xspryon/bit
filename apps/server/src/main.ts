@@ -757,10 +757,11 @@ const claudeCodeCandidate = (
  *
  * **Only from the instance file**, never from `HARNESS`: an unset `HARNESS` means every
  * driver this build has, and starting Pi's catalogue read on every default boot would add a
- * harness nobody configured. Its sessions are kept under the fleet root, one folder per
- * instance (`harness/pi-sessions/<id>`), not in the operator's `~/.pi/agent/sessions`: bit's
- * sessions are bit's runtime data, and the operator opens one with
- * `pi --session <id> --session-dir <that folder>` when bit is not running it.
+ * harness nobody configured. Its sessions are stored where Pi keeps them — the instance's
+ * agent folder's `sessions/--<cwd>--/` (`harness/piSessionFiles.ts`) — so `pi --resume`
+ * lists them and the operator deletes them with Pi's own tools; retention is Pi's. The
+ * folder this server used before (`harness/pi-sessions/<id>` under the fleet root) is no
+ * longer read: a conversation recorded there replays as gone.
  */
 const piCandidate = (config: PiInstanceConfig): HarnessCandidate => {
   const defaultModel = config.defaultModel ?? config.models?.[0]?.id;
@@ -771,7 +772,6 @@ const piCandidate = (config: PiInstanceConfig): HarnessCandidate => {
       piHarness({
         instanceId: config.id,
         displayName: config.displayName,
-        sessionDir: join(HUNT_ROOT, "harness", "pi-sessions", config.id),
         recordDirectory: OWNED_PROCESSES,
         containment: piContainment,
         ...(config.memoryMax === undefined
