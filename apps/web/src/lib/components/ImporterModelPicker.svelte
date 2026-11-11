@@ -51,6 +51,7 @@
   } from "@bit/contracts";
 
   import { withModelOptionPicked, type App } from "../app.svelte";
+  import { modelWithOptions } from "../modelNames";
   import ErrorDialog from "./ErrorDialog.svelte";
   import ModelChip from "./ModelChip.svelte";
   import ModelSelector from "./ModelSelector.svelte";
@@ -321,6 +322,7 @@
     dropped={stagedDropped}
     harness={pinned.harness}
     chipModel={model}
+    chipSelections={pinned?.modelOptions}
     bind:open={sessionOpen}
     bind:query
     bind:trigger
@@ -340,8 +342,12 @@
     {harness}
     {model}
     instance={harness === "" ? undefined : harness}
-    modelLabel={sessionInstance?.models.find((entry) => entry.id === model)
-      ?.label}
+    modelLabel={modelWithOptions(
+      app.harnesses,
+      { instanceId: sessionInstance?.instanceId, harness },
+      model,
+      pinned?.modelOptions,
+    )}
     title="The model this session ran on. Changing harness starts a new session; it never moves this one."
   />
 {/if}

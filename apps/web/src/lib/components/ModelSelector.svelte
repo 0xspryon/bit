@@ -20,6 +20,8 @@
   } from "@bit/contracts";
   import type { Snippet } from "svelte";
 
+  import { modelWithOptions } from "../modelNames";
+
   import HarnessChoice from "./HarnessChoice.svelte";
   import HarnessDialog from "./HarnessDialog.svelte";
   import ModelChip from "./ModelChip.svelte";
@@ -35,6 +37,7 @@
     dropped,
     harness,
     chipModel,
+    chipSelections,
     open = $bindable(false),
     query = $bindable(""),
     onOpen,
@@ -69,6 +72,11 @@
      * while the dialog stages another. {@link model} when absent.
      */
     chipModel?: string;
+    /**
+     * What {@link chipModel} is set to, said beside it on the chip ("GLM-5.3 Flash · High").
+     * {@link selections} when absent, which are {@link model}'s.
+     */
+    chipSelections?: readonly ModelOptionSelection[] | undefined;
     open?: boolean;
     query?: string;
     /** The chip was pressed. Absent: it toggles {@link open}. */
@@ -99,12 +107,20 @@
     trigger?: HTMLButtonElement | null;
   } = $props();
 
-  /** The chip's model, and what its instance's configuration calls it. */
+  /**
+   * The chip's model, and what it says for it: its label (else the provider's name, never
+   * an alias) and what was chosen of it (follow-ups A).
+   */
   let chipModelId = $derived(chipModel ?? model);
   let chipModelLabel = $derived(
-    instances
-      .find((each) => each.displayName === harness)
-      ?.models.find((entry) => entry.id === chipModelId)?.label,
+    chipModelId === ""
+      ? undefined
+      : modelWithOptions(
+          instances,
+          { harness },
+          chipModelId,
+          chipModel === undefined ? selections : chipSelections,
+        ),
   );
 
   const leaves = () => () => {
@@ -117,7 +133,7 @@
     {harness}
     model={chipModelId}
     instance={namesHarness ? harness : undefined}
-    modelLabel={namesHarness ? chipModelLabel : undefined}
+    modelLabel={chipModelLabel}
     expanded={open}
     {switching}
     label={chipLabel}

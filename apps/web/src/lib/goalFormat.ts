@@ -91,10 +91,16 @@ export const intentStatusLabel = (status: IntentStatus): string => {
  */
 export const suggestionText = (
   suggestion: IntentView["suggestion"],
+  /** What a model of an instance is called on screen (`modelNames.ts`); the id when absent. */
+  name: (instanceId: string | null, model: string) => string = (_, model) =>
+    model,
 ): string | null => {
-  const parts = [suggestion.instanceId, suggestion.model].filter(
-    (part): part is string => part !== null,
-  );
+  const parts = [
+    suggestion.instanceId,
+    suggestion.model === null
+      ? null
+      : name(suggestion.instanceId, suggestion.model),
+  ].filter((part): part is string => part !== null);
   return parts.length === 0 ? null : parts.join(" · ");
 };
 

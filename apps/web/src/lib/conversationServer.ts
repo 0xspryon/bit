@@ -73,6 +73,8 @@ export interface ConversationAppHooks {
   };
   readonly harnessName: (instanceId: string) => string;
   readonly harnessDriver: (instanceId: string) => string | undefined;
+  /** What a screen calls a model of an instance; the id when absent (`modelNames.ts`). */
+  readonly modelName?: (instanceId: string | undefined, model: string) => string;
 }
 
 /**
@@ -414,6 +416,7 @@ export const conversationServer = <Turn>(
     parked: app.parked,
     harnessName: app.harnessName,
     harnessDriver: app.harnessDriver,
+    ...(app.modelName === undefined ? {} : { modelName: app.modelName }),
     highWater: app.highWater,
     watchTurn,
     ...(context === undefined

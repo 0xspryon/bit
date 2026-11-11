@@ -390,6 +390,11 @@ export interface ConversationServer {
    */
   readonly harnessDriver: (instanceId: string) => string | undefined;
   /**
+   * What a screen calls a model of an instance (`modelNames.ts`): its label, never an
+   * alias. Absent: the id.
+   */
+  readonly modelName?: (instanceId: string | undefined, model: string) => string;
+  /**
    * The highest activity publish order this tab has seen, or `0` for none. Read when a
    * message is sent, so the importer's answer sorts after it: see
    * `ConversationSession.floors`.
@@ -2459,7 +2464,14 @@ export class ConversationSessions<
     // opening another clears it anyway, so an answer for a session left meanwhile would
     // only take the place of that one's own.
     if (this.currentId === session.id) {
-      const said = { switched, previous: now.model, working: now.working };
+      const name = (model: string) =>
+        server.modelName?.(switched.harnessInstanceId, model) ?? model;
+      const said = {
+        switched,
+        previous: now.model,
+        working: now.working,
+        name,
+      };
       this.switchNotice = {
         sessionId: session.id,
         text: switchedNotice({ ...said, agent: this.#binding.agent }),

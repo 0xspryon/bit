@@ -97,6 +97,7 @@
   } from "../importerChat";
   import { STARTERS, type StarterKey } from "../importerSessions.svelte";
   import { composing } from "../composing";
+  import { modelNameIn } from "../modelNames";
   import {
     panelOverlays,
     railGivesWay,
@@ -444,6 +445,13 @@
     maxChars: IMPORTER_MESSAGE_MAX_CHARS,
     // Attachment chips in this thread ask this target's server for their files (A6 U13).
     loadFile: (path) => app.loadUploadedFile(path),
+    // The footer's models by their labels, never an alias (follow-ups A).
+    modelName: (on, model) =>
+      modelNameIn(
+        app.harnesses,
+        { instanceId: on.harnessInstanceId, harness: on.harness },
+        model,
+      ),
   });
   const chat = built.chat;
   let blocked = $derived(built.blocked());
@@ -560,7 +568,11 @@
       -->
       {#if switchingHere !== undefined}
         <span class="hint" role="status"
-          >Switching to {switchingHere.model}…</span
+          >Switching to {modelNameIn(
+            app.harnesses,
+            { instanceId: session?.harnessInstanceId, harness: session?.harness },
+            switchingHere.model,
+          )}…</span
         >
       {:else}
         <!-- The title is the whole caption, where a long model name ellipses it. -->

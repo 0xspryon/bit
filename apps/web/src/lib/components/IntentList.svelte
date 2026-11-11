@@ -39,6 +39,7 @@
     suggestionText,
   } from "../goalFormat";
   import type { App } from "../app.svelte";
+  import { modelNameIn } from "../modelNames";
 
   let { app }: { app: App } = $props();
 
@@ -183,7 +184,11 @@
     <ul class="rows">
       {#each app.intents as intent (intent.intentId)}
         {@const blocked = notRunnableBecause(intent, goal?.status)}
-        {@const suggested = suggestionText(intent.suggestion)}
+        {@const suggested = suggestionText(
+          intent.suggestion,
+          (instanceId, model) =>
+            modelNameIn(app.harnesses, { instanceId }, model),
+        )}
         <li class={["row", app.runIntentId === intent.intentId && "aimed"]}>
           <div class="top">
             <p class="question">{intent.question}</p>

@@ -41,6 +41,7 @@
   import { whenText } from "../goalFormat";
   import { connectionNote, goalUsageScope, type MeterFact } from "../chat";
   import type { App } from "../app.svelte";
+  import { provenanceModelIn } from "../modelNames";
 
   let { app }: { app: App } = $props();
 
@@ -123,7 +124,12 @@
           { term: "Harness", value: app.goalAgentRuntime.instanceId },
           {
             term: "Model",
-            value: `${app.goalAgentRuntime.providerId}/${app.goalAgentRuntime.modelId}`,
+            value: provenanceModelIn(
+              app.harnesses,
+              app.goalAgentRuntime.instanceId,
+              app.goalAgentRuntime.providerId,
+              app.goalAgentRuntime.modelId,
+            ),
           },
         ]),
     /*

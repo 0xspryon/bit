@@ -98,6 +98,7 @@ import {
   usableRemembered,
   type ModelMemory,
 } from "./modelMemory";
+import { modelNameIn } from "./modelNames";
 import { browserParkedStore, type ParkedStore } from "./conversationParked";
 import {
   ImporterSessions,
@@ -2882,6 +2883,8 @@ export class App {
         harnessDriver: (instanceId) =>
           this.harnesses.find((entry) => entry.instanceId === instanceId)
             ?.driver,
+        modelName: (instanceId, model) =>
+          modelNameIn(this.harnesses, { instanceId }, model),
       },
       this.#importerEndpoints(targetId),
     );

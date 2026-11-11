@@ -35,6 +35,7 @@
   import { countsLine, goalTitle, statusLabel, whenText } from "../goalFormat";
   import { navGlyphs } from "../navGlyphs";
   import { crumbMeter } from "../crumbMeter";
+  import { modelNameIn, modelWithOptions } from "../modelNames";
   import { sessionHover, sessionLabel, sessionWhen } from "../conversationChat";
   import { tallyLine } from "../importerChat";
   import { parkedMark, parkedStart } from "../conversationParked";
@@ -82,10 +83,18 @@
         : app.liveUsage[importer.binding.connectionKey(contextImport)],
     ),
   );
+  /** A listed session's model as the list says it: its label, and what was chosen of it. */
+  const sessionModel = (session: (typeof importer.listed)[number]): string =>
+    modelWithOptions(
+      app.harnesses,
+      { instanceId: session.harnessInstanceId, harness: session.harness },
+      session.model,
+      session.modelOptions,
+    );
   let sessionRows = $derived(
     importer.listed.filter((session) =>
       matches(
-        `${sessionLabel(session, importer.parked[session.id])} ${sessionWhen(session.startedAt, Date.now())} ${session.model} ${importer.parked[session.id]?.text ?? ""}`,
+        `${sessionLabel(session, importer.parked[session.id])} ${sessionWhen(session.startedAt, Date.now())} ${session.model} ${sessionModel(session)} ${importer.parked[session.id]?.text ?? ""}`,
         sessionQuery,
       ),
     ),
@@ -388,6 +397,15 @@
       <CrumbContextMeter
         {meter}
         harness={importer.current?.harness ?? "This harness"}
+        modelName={(model) =>
+          modelNameIn(
+            app.harnesses,
+            {
+              instanceId: importer.current?.harnessInstanceId,
+              harness: importer.current?.harness,
+            },
+            model,
+          )}
         counting={contextImport !== undefined &&
           importer.countingBreakdown.has(contextImport)}
         onopen={() => {
@@ -478,7 +496,7 @@
                   -->
                     {#if session.tally.messages !== 0}
                       <span class="session-model" title={session.model}
-                        >{session.model}</span
+                        >{sessionModel(session)}</span
                       >
                     {/if}
                   </span>

@@ -51,8 +51,15 @@
   import { roundConclusion, roundStatusLabel, whenText } from "../goalFormat";
   import type { MeterFact } from "../chat";
   import type { App } from "../app.svelte";
+  import { provenanceModelIn } from "../modelNames";
 
   let { app }: { app: App } = $props();
+
+  const provenanceModel = (
+    instanceId: string | null,
+    providerId: string | null,
+    modelId: string,
+  ): string => provenanceModelIn(app.harnesses, instanceId, providerId, modelId);
 
   /**
    * A ticking clock, so the elapsed time is live rather than frozen at render.
@@ -152,7 +159,11 @@
             value:
               meterRow.modelId === null
                 ? "not recorded"
-                : `${meterRow.providerId ?? "?"}/${meterRow.modelId}`,
+                : provenanceModel(
+                    meterRow.instanceId,
+                    meterRow.providerId,
+                    meterRow.modelId,
+                  ),
           },
           /*
            * The brief's "message counts", and the value says what it counts.

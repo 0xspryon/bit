@@ -85,6 +85,11 @@ export interface ChatSessionInput<S extends ConversationSession> {
   readonly stoppableSubagents: () => number;
   readonly maxChars: number;
   readonly loadFile: (path: string) => Promise<LoadedFile>;
+  /**
+   * What a model of the session on screen is called (`modelNames.ts`): its label, never an
+   * alias. Absent: the id.
+   */
+  readonly modelName?: (session: S, model: string) => string;
 }
 
 /** What {@link chatSessionOf} builds: the shell's session and what the page reads beside it. */
@@ -313,7 +318,15 @@ export const chatSessionOf = <S extends ConversationSession>(
       return words.shell;
     },
     get footer() {
-      return { agent: agentLabel(), model: session()?.model ?? "" };
+      const current = session();
+      const named = input.modelName;
+      return {
+        agent: agentLabel(),
+        model: current?.model ?? "",
+        ...(named === undefined || current === undefined
+          ? {}
+          : { name: (model: string) => named(current, model) }),
+      };
     },
     get sentNowTitle() {
       return words.sentNow(input.state.sendNow);

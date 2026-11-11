@@ -79,6 +79,7 @@
   import { IconArrowUp, IconPlus } from "../icons";
   import { notRunnableBecause, suggestionText } from "../goalFormat";
   import type { App } from "../app.svelte";
+  import { modelNameIn } from "../modelNames";
 
   let { app }: { app: App } = $props();
 
@@ -146,7 +147,11 @@
       : notRunnableBecause(intent, app.openGoalView?.status),
   );
   let suggested = $derived(
-    intent === undefined ? null : suggestionText(intent.suggestion),
+    intent === undefined
+      ? null
+      : suggestionText(intent.suggestion, (instanceId, model) =>
+          modelNameIn(app.harnesses, { instanceId }, model),
+        ),
   );
   let canSubmit = $derived(
     ready &&

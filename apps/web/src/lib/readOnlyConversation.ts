@@ -21,6 +21,7 @@ import type {
   ChatTurnState,
   ChatWords,
   ThreadTurn,
+  TurnFooterSource,
 } from "./chatShell";
 import {
   LOADING_HISTORY,
@@ -98,7 +99,7 @@ export interface ReadOnlyChatInput {
   /** Stops the session's turn (Stop round, Stop run). Absent: no Stop. */
   readonly stop?: () => void;
   readonly words: ChatWords;
-  readonly footer: () => { readonly agent: string; readonly model: string };
+  readonly footer: () => TurnFooterSource;
   readonly loadFile?: AttachmentLoader;
 }
 

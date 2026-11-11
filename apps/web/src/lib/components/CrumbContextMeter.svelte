@@ -29,6 +29,7 @@
   let {
     meter,
     harness,
+    modelName = (model: string) => model,
     counting = false,
     onopen,
     onclose,
@@ -36,6 +37,11 @@
     meter: CrumbMeter;
     /** The harness's display name, for the line saying it gives no breakdown. */
     harness: string;
+    /**
+     * What a model is called here (`modelNames.ts`): its label, never an alias. The meter
+     * compares ids; only what it says goes through this.
+     */
+    modelName?: (model: string) => string;
     /** Whether the categories are being counted now. */
     counting?: boolean;
     /** Called each time the popover opens: where the caller asks for the categories. */
@@ -157,7 +163,8 @@
       <div class="head">
         <span class="title">Context window</span>
         {#if meter.model !== null && meter.model !== ""}
-          <span class="model" title={meter.model}>{meter.model}</span>
+          <span class="model" title={meter.model}>{modelName(meter.model)}</span
+          >
         {/if}
       </div>
 
@@ -190,8 +197,9 @@
       {/if}
       {#if meter.used !== null && meter.usedModel !== null && meter.model !== null && meter.model !== "" && !sameModel(meter.usedModel, meter.model)}
         <p class="note other-model">
-          Measured on <span class="mono">{meter.usedModel}</span>'s last call.
-          The next call, on {meter.model}, measures it again with that model's
+          Measured on <span class="mono">{modelName(meter.usedModel)}</span>'s
+          last call. The next call, on {modelName(meter.model)}, measures it again
+          with that model's
           own count.
         </p>
       {/if}
@@ -249,7 +257,7 @@
         <p class="note">
           {harness} counts what fills the window only when asked, and has not counted
           it for {meter.model !== null && meter.model !== ""
-            ? meter.model
+            ? modelName(meter.model)
             : "this model"} yet. Close this panel and open it again to count.
         </p>
       {/if}
@@ -263,7 +271,7 @@
 
       {#if meter.at !== null && meter.at > 0}
         <p class="when">
-          {crumbSource(meter)}, {whenText(meter.at)}
+          {crumbSource(meter, modelName)}, {whenText(meter.at)}
         </p>
       {/if}
     </div>

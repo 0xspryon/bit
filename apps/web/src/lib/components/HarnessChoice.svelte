@@ -105,7 +105,8 @@
       : all.filter(
           (entry) =>
             entry.id.toLowerCase().includes(wanted) ||
-            (entry.label?.toLowerCase().includes(wanted) ?? false),
+            (entry.label?.toLowerCase().includes(wanted) ?? false) ||
+            (entry.reportedAs?.toLowerCase().includes(wanted) ?? false),
         );
   });
 
@@ -301,9 +302,15 @@
               onclick={() => onPickModel(entry.id)}
             >
               {#if entry.label !== undefined}
-                <!-- The instance's own name for it, with the id a run names beside it. -->
+                <!--
+                  The instance's own name for it, with the provider's name beside it — or,
+                  where the provider's name is not known, the id a run names.
+                -->
                 <span class="model-name">{entry.label}</span>
-                <span class="model-id mono">{entry.id}</span>
+                <span class="model-id mono">{entry.reportedAs ?? entry.id}</span>
+              {:else if entry.reportedAs !== undefined}
+                <!-- No label: the provider's name, never an alias (follow-ups A). -->
+                <span class="model-name mono">{entry.reportedAs}</span>
               {:else}
                 <span class="model-name mono">{entry.id}</span>
               {/if}

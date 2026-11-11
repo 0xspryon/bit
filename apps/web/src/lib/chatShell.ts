@@ -331,7 +331,7 @@ export interface ChatSession<Subject extends ThreadTurn = ThreadTurn> {
    * The first word of a finished turn's footer, the agent's label (D4's "Importer · …"), and
    * the model said where a turn's items name none.
    */
-  readonly footer: { readonly agent: string; readonly model: string };
+  readonly footer: TurnFooterSource;
   /** The title on a bubble's "sent now" mark: what the harness cut (`sentNowTitle`). */
   readonly sentNowTitle: string;
   /**
@@ -339,6 +339,17 @@ export interface ChatSession<Subject extends ThreadTurn = ThreadTurn> {
    * shell for every chip in the thread.
    */
   readonly loadFile?: AttachmentLoader | undefined;
+}
+
+/**
+ * What a turn's footer is made from: the agent's label, the session's model, and how a
+ * model is worded (`modelNames.ts`: its label, never an alias). Without `name`, a model is
+ * said as its id.
+ */
+export interface TurnFooterSource {
+  readonly agent: string;
+  readonly model: string;
+  readonly name?: ((model: string) => string) | undefined;
 }
 
 /** "18:02": when the operator's message was sent, as D3 sets it under the bubble. */
@@ -363,10 +374,16 @@ export const clockLabel = (at: number): string =>
  */
 export const turnFooterText = (
   group: ChatGroup<ThreadTurn>,
-  footer: { readonly agent: string; readonly model: string },
+  footer: TurnFooterSource,
 ): string => {
   const models = turnModels(group);
-  const model = models.length > 0 ? models.join(" → ") : footer.model;
+  const name = footer.name ?? ((model: string) => model);
+  const model =
+    models.length > 0
+      ? models.map(name).join(" → ")
+      : footer.model === ""
+        ? ""
+        : name(footer.model);
   const ended = turnEndedAt(group);
   const started = group.subject.startedAt;
   const took =

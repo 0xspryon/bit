@@ -181,7 +181,11 @@ export const crumbMeter = (
  * by what made the tab take it, so one taken on opening the meter mid-turn does not claim
  * a turn ended (A6 U9 review).
  */
-export const crumbSource = (meter: CrumbMeter): string => {
+export const crumbSource = (
+  meter: CrumbMeter,
+  /** What a model is called on screen (`modelNames.ts`); the id when absent. */
+  name: (model: string) => string = (model) => model,
+): string => {
   if (meter.source === "live") return "From the latest model call";
   switch (meter.cause) {
     case "turn":
@@ -195,7 +199,7 @@ export const crumbSource = (meter: CrumbMeter): string => {
     case "recount":
       return meter.model === null || meter.model === ""
         ? "Recounted after the model switch"
-        : `Recounted for ${meter.model}`;
+        : `Recounted for ${name(meter.model)}`;
     default:
       return "Read on opening the session";
   }

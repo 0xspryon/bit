@@ -84,7 +84,7 @@ describe("two Claude Code instances (harness instances, slice 1)", () => {
   const instance = (
     instanceId: string,
     displayName: string,
-    models: readonly { id: string; label?: string }[],
+    models: readonly { id: string; label?: string; reportedAs?: string }[],
   ) => ({
     instanceId,
     driver: "claude-code",
@@ -134,10 +134,31 @@ describe("two Claude Code instances (harness instances, slice 1)", () => {
     ]);
   });
 
-  test("a surface that does not ask keeps the glyph and the id", () => {
+  test("a surface that does not name its harness still names the model by its label, never the alias (follow-ups A)", () => {
     mountOn(zai, false);
     const chip = document.querySelector<HTMLElement>("button.chip");
-    expect(chip?.textContent?.replace(/\s+/g, " ").trim()).toBe("c sonnet");
+    expect(chip?.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "c GLM-5.3 Flash",
+    );
+  });
+
+  test("a row says the provider's name beside the label, and alone where there is no label (follow-ups A)", async () => {
+    const named = instance("cc-zai", "Claude Code · z.ai", [
+      { id: "sonnet", label: "GLM-5.3 Flash", reportedAs: "glm-5.3-flash" },
+      { id: "opus", reportedAs: "glm-5.3" },
+    ]);
+    mountOn(named, true);
+    const chip = document.querySelector<HTMLButtonElement>("button.chip");
+    if (chip === null) throw new Error("no chip");
+    click(chip);
+    await settle();
+    const rows = [
+      ...document.querySelectorAll<HTMLElement>("button.model-row"),
+    ].map((row) => row.textContent?.replace(/\s+/g, " ").trim());
+    expect(rows).toEqual([
+      "GLM-5.3 Flash glm-5.3-flash default",
+      "glm-5.3",
+    ]);
   });
 
   test("the picker lists the instance's models by label, with the id a run names", async () => {

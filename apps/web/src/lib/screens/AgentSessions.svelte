@@ -90,6 +90,7 @@
     IconUser,
   } from "../icons";
   import { isolated } from "../conversationChat";
+  import { modelNameIn } from "../modelNames";
   import { applyPlace, pathOf, type Place } from "../place";
   import { routedInApp } from "../placeLink";
 
@@ -296,7 +297,13 @@
     {AGENT_SESSION_AGENT_LABEL[session.kind]}
   </span>
   <span class="model mono" title={session.model ?? "model not recorded"}
-    >{session.model ?? "—"}</span
+    >{session.model === null
+      ? "—"
+      : modelNameIn(
+          app.harnesses,
+          { instanceId: session.harnessInstanceId },
+          session.model,
+        )}</span
   >
   <span class="when mono">
     <span class="time"
