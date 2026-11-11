@@ -27,8 +27,14 @@
  * - the scope is the user manager's, not this server's: it lives in the user's `app.slice`,
  *   **outside the server's own cgroup**. A memory cap on the server's unit no longer covers
  *   the agent (that is what {@link scopedCommand}'s `memoryMax` is for), and stopping the
- *   server's unit no longer kills its agents — the server's finalizers do on a `SIGTERM`, and
- *   the startup reaper ({@link reapUserScopes}) does after a `SIGKILL`.
+ *   server's unit no longer kills its agents — the server's finalizers do on a `SIGTERM`;
+ *   after a `SIGKILL` the agent exits on its stdin's EOF and the scope's own watcher
+ *   ({@link SCOPE_SCRIPT}) ends the rest, and the startup reaper ({@link reapUserScopes})
+ *   is left only a scope whose watcher was itself killed.
+ *
+ * The command `systemd-run` `exec`s is a short `/bin/sh` that starts that watcher and then
+ * `exec`s the agent, so every property above holds of the agent itself
+ * ({@link SCOPE_SCRIPT} says why and how).
  *
  * `--expand-environment=no` is load-bearing: by default `systemd-run` expands `$NAME` in the
  * command line (measured: `$$` became `$`), and an agent's arguments carry operator text.
@@ -286,10 +292,69 @@ export const scopeUnitFor = (scopes: UserScopes, sessionId: string): string =>
   `${scopes.prefix}${sessionId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80)}-${nonce()}.scope`;
 
 /**
- * The command that runs `file args…` in a new scope `unit`. With `memoryMax` (systemd's
- * syntax: `2G`), the scope is capped there with no swap, and **stopped whole** when the
- * kernel kills anything in it for memory (`OOMPolicy=stop`): an agent whose shell was
- * killed under it would otherwise carry on, its tool failing for a reason nobody is told.
+ * How long the scope's watcher gives what is left in it after `SIGTERM`, in seconds, before
+ * `cgroup.kill` ({@link SCOPE_SCRIPT}).
+ */
+const WATCH_GRACE_SECONDS = 1;
+
+/**
+ * The shell every scope runs first: it starts a **watcher** in the scope and then `exec`s
+ * the agent in its own place (follow-ups B, item 3).
+ *
+ * ## Why
+ *
+ * A server that is `SIGKILL`ed runs no finalizer. Pi then exits on its stdin's EOF, but what
+ * its agent left in the background (`nohup sleep &`) stayed in the scope until the next
+ * boot's reaper — possibly never, if the server is not started again. The watcher ends the
+ * scope when the agent ends, **for any reason**, with nobody else's help: it waits for the
+ * agent's pid to go (`tail --pid`, a sleep loop where `tail` has no `--pid`), sends every
+ * other process in the scope `SIGTERM`, gives them {@link WATCH_GRACE_SECONDS}, then kills
+ * the whole cgroup (`cgroup.kill`; one by one before Linux 5.14). The emptied scope unloads.
+ *
+ * ## What it keeps
+ *
+ * The agent is `exec`ed by the shell `systemd-run` itself `exec`s, so it is still **the
+ * process this server spawned**: the same pid (the owned-process record and its start-time
+ * identity), the same stdin/stdout/stderr pipes, the same fd 3 (the credential), its own
+ * process title, and its own exit code or signal. The watcher is a fork of the shell from
+ * before the `exec`, so it is the agent's child, in the scope from its first instruction;
+ * it holds **none** of the agent's descriptors (`</dev/null >/dev/null 2>&1 3>&-`), so the
+ * credential pipe, Pi's stdout and its stderr close when Pi's own copies do.
+ *
+ * The cgroup is read from `/proc/self/cgroup` before anything is forked, so the watcher
+ * kills the scope it was started in and nothing else. A server alive when the agent dies
+ * still stops the scope itself (`stopOwnedChild` over {@link scopeHandle}), as before; the
+ * two converge, and whichever comes second finds less to do. A watcher killed by hand
+ * leaves the scope to the startup reaper ({@link reapUserScopes}), as before.
+ *
+ * `$` is literal here only because every scope is started with `--expand-environment=no`.
+ */
+export const SCOPE_SCRIPT = [
+  'cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)',
+  "main=$$",
+  "(",
+  '  tail --pid="$main" -s 0.5 -f /dev/null 2>/dev/null ||',
+  '    while kill -0 "$main" 2>/dev/null; do sleep 0.5; done',
+  "  self=$(exec sh -c 'echo $PPID')",
+  '  for pid in $(cat "$cg/cgroup.procs" 2>/dev/null); do',
+  '    [ "$pid" = "$self" ] || kill -TERM "$pid" 2>/dev/null',
+  "  done",
+  `  sleep ${String(WATCH_GRACE_SECONDS)}`,
+  '  echo 1 > "$cg/cgroup.kill" 2>/dev/null ||',
+  '    kill -KILL $(cat "$cg/cgroup.procs" 2>/dev/null) 2>/dev/null',
+  ") </dev/null >/dev/null 2>&1 3>&- &",
+  'exec "$@"',
+].join("\n");
+
+/** `$0` of the scope's shell: what `ps` shows for it until it `exec`s the agent. */
+const SCOPE_SHELL_NAME = "bit-scope";
+
+/**
+ * The command that runs `file args…` in a new scope `unit`, under the watcher that ends the
+ * scope when `file` ends ({@link SCOPE_SCRIPT}). With `memoryMax` (systemd's syntax: `2G`),
+ * the scope is capped there with no swap, and **stopped whole** when the kernel kills
+ * anything in it for memory (`OOMPolicy=stop`): an agent whose shell was killed under it
+ * would otherwise carry on, its tool failing for a reason nobody is told.
  */
 export const scopedCommand = (
   unit: string,
@@ -310,6 +375,10 @@ export const scopedCommand = (
         : [`MemoryMax=${input.memoryMax}`, "MemorySwapMax=0", "OOMPolicy=stop"],
     ),
     "--",
+    "/bin/sh",
+    "-c",
+    SCOPE_SCRIPT,
+    SCOPE_SHELL_NAME,
     input.file,
     ...input.args,
   ],
@@ -477,9 +546,12 @@ const properties = (text: string): ReadonlyMap<string, string> =>
 
 /**
  * Stops every scope whose name starts with `prefix` — at startup, all of them were left by
- * an earlier run of this installation (a `SIGKILL`ed server, a `bun --watch` restart): its
- * Pi exited on its stdin's EOF, but what Pi's agent left running in the background is still
- * there. Failed scopes (an OOM kill nobody cleared) are cleared.
+ * an earlier run of this installation (a `SIGKILL`ed server, a `bun --watch` restart). Its
+ * Pi exited on its stdin's EOF and the scope's watcher ({@link SCOPE_SCRIPT}) normally ended
+ * the rest within a second or two; what is left here is a scope whose watcher was killed
+ * too (by the agent, or with the whole user session), still holding what Pi's agent left
+ * running in the background, or one whose processes outlived the watcher's `SIGKILL`.
+ * Failed scopes (an OOM kill nobody cleared) are cleared.
  *
  * **Before anything of this run's is spawned**, as for the owned-process records: a scope
  * of this run's own would be indistinguishable from a leftover.

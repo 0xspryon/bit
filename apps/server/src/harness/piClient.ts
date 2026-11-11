@@ -52,8 +52,11 @@
  * `systemd-run --user --scope` (`userScopes.ts`, which says why that and not D-Bus): a
  * cgroup holding Pi and everything it ever starts, detached or not. Ending the session —
  * End, a Stop that ends it, the process dying, the server shutting down — stops the whole
- * cgroup (`SIGTERM`, then `cgroup.kill` after the grace); a scope a killed server left is
- * stopped by the next boot (`reapUserScopes`, `main.ts`). A Stop of a turn is still Pi's
+ * cgroup (`SIGTERM`, then `cgroup.kill` after the grace). A server killed with `SIGKILL`
+ * runs none of that: Pi exits on its stdin's EOF, and **the scope ends itself when Pi
+ * does** — a watcher started inside it before Pi (`SCOPE_SCRIPT`, follow-ups B) stops what
+ * is left; a scope whose watcher was killed too is stopped by the next boot
+ * (`reapUserScopes`, `main.ts`). A Stop of a turn is still Pi's
  * `abort`, which ends the running call's process group and leaves the session's background
  * jobs alone, as before. An instance's `memoryMax` caps the scope; a scope killed for memory
  * ends the session as a process death that says so.
@@ -485,6 +488,12 @@ const listedModel = (value: unknown): ListedModel | undefined => {
   };
 };
 
+/** A program and its arguments, as `spawn` takes them. */
+interface Command {
+  readonly file: string;
+  readonly args: readonly string[];
+}
+
 /** What the startup read found: Pi's version, its models, and its own default model. */
 interface Probe {
   readonly version: string;
@@ -513,13 +522,15 @@ const probePi = (
   timeout: Duration.Input,
   /** Started on this model, in this directory: what Pi starts that model at there. */
   on?: { readonly model: string; readonly cwd: string },
+  /** How the command is started: in a scope of its own where sessions get one (L5). */
+  wrap: (command: Command) => Command = (command) => command,
 ): Effect.Effect<Probe, HarnessProcessError> =>
   Effect.callback<Probe, HarnessProcessError>((resume) => {
     let child: ChildProcess;
     try {
-      child = spawn(
-        binary,
-        [
+      const command = wrap({
+        file: binary,
+        args: [
           "--mode",
           "rpc",
           "--no-session",
@@ -530,8 +541,12 @@ const probePi = (
           "--no-context-files",
           ...(on === undefined ? [] : ["--model", on.model]),
         ],
-        { cwd: on?.cwd ?? tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] },
-      );
+      });
+      child = spawn(command.file, command.args, {
+        cwd: on?.cwd ?? tmpdir(),
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
     } catch (cause) {
       resume(
         Effect.fail(
@@ -791,8 +806,33 @@ export const piHarness = (
         options.agentDir ?? piAgentDir(environment()),
       );
 
+      /**
+       * A short-lived Pi of this server's — the catalogue read, the "Pi's default" probe —
+       * in a scope of its own where sessions get one, under the instance's `memoryMax`
+       * (follow-ups A review, L5): it loads Pi as a session does, and nothing of Pi's runs
+       * outside a scope while scopes are available. `pi --version` is not: it prints and
+       * exits, and starts nothing.
+       */
+      const probeScope =
+        (purpose: string) =>
+        (command: Command): Command =>
+          scopes === undefined
+            ? command
+            : scopedCommand(scopeUnitFor(scopes, purpose), {
+                description: `bit Pi ${purpose}`,
+                memoryMax,
+                file: command.file,
+                args: command.args,
+              });
+
       const version = yield* piVersion(binary, environment());
-      const probe = yield* probePi(binary, environment(), "30 seconds");
+      const probe = yield* probePi(
+        binary,
+        environment(),
+        "30 seconds",
+        undefined,
+        probeScope("catalogue-probe"),
+      );
       const listed = new Map(probe.models.map((model) => [model.id, model]));
       const view = (
         id: string,
@@ -1747,10 +1787,13 @@ export const piHarness = (
         model: string,
         directory: string,
       ): Effect.Effect<PiThinkingLevel, HarnessTransportError> =>
-        probePi(binary, environment(), controlTimeout, {
-          model,
-          cwd: directory,
-        }).pipe(
+        probePi(
+          binary,
+          environment(),
+          controlTimeout,
+          { model, cwd: directory },
+          probeScope("thinking-probe"),
+        ).pipe(
           Effect.mapError((failure) =>
             transport("pi.thinking_default", failure.detail),
           ),

@@ -325,6 +325,128 @@ describe.skipIf(!hasPi || skipScopes)(
       }
     }, 30_000);
 
+    test("a server killed with SIGKILL leaves no background job and no scope: the scope ends when Pi does, before any reaper", async () => {
+      // A server of its own, in a child process: the only way to kill one without any
+      // finalizer of its running, which is the case the scope's watcher is for.
+      counter += 1;
+      const base = join(root, `killed${String(counter)}`);
+      const records = join(base, "records");
+      const work = join(base, "work");
+      mkdirSync(work, { recursive: true });
+      const server = join(base, "server.ts");
+      const here = import.meta.dir;
+      writeFileSync(
+        server,
+        [
+          'import { Context, Effect, Layer, Scope } from "effect";',
+          `import { AgentHarness } from ${JSON.stringify(join(here, "agentHarness.ts"))};`,
+          `import { InstanceId } from ${JSON.stringify(join(here, "identity.ts"))};`,
+          `import { piHarness } from ${JSON.stringify(join(here, "piClient.ts"))};`,
+          `import { probeUserScopes } from ${JSON.stringify(join(here, "userScopes.ts"))};`,
+          "const [agentDir, records, work, prefix, script] = process.argv.slice(2);",
+          "const containment = await Effect.runPromise(probeUserScopes(prefix));",
+          "const scope = await Effect.runPromise(Scope.make());",
+          "const context = await Effect.runPromise(Layer.buildWithScope(piHarness({",
+          '  instanceId: InstanceId.make("pi-killed-test"), displayName: "Pi killed test",',
+          "  agentDir, recordDirectory: records, containment,",
+          "}), scope));",
+          "const harness = Context.get(context, AgentHarness);",
+          "const ref = await Effect.runPromise(harness.createSession({",
+          '  title: "killed", model: "fake/fake-1", directory: work,',
+          "  sessionId: harness.newSessionId(), multiTurn: true,",
+          "}));",
+          "await Effect.runPromise(harness.prompt(ref.id, script));",
+          "await Effect.runPromise(harness.waitForIdle(ref.id));",
+          "console.log(JSON.stringify({ sessionId: ref.id }));",
+          "setInterval(() => undefined, 60_000);",
+        ].join("\n"),
+      );
+      const child = spawn(
+        "bun",
+        [
+          server,
+          agentDir,
+          records,
+          work,
+          PREFIX,
+          S([
+            { tool: "bash", args: { command: backgroundJobs(work) } },
+            { text: "jobs started" },
+          ]),
+        ],
+        { stdio: ["ignore", "pipe", "inherit"] },
+      );
+      try {
+        let out = "";
+        child.stdout?.setEncoding("utf8");
+        child.stdout?.on("data", (data: string) => {
+          out += data;
+        });
+        await until(() => out.includes("\n"), "the child server's session");
+        const { sessionId } = JSON.parse(out.trim()) as { sessionId: string };
+        const unit = unitOf(sessionId);
+        const pi = recordedPid(records);
+        const jobs = await jobsIn(work, unit);
+        child.kill("SIGKILL");
+        // Pi exits on its stdin's EOF; the watcher then ends everything else in the scope.
+        await until(() => !running(pi), "Pi to exit on its stdin's end");
+        await until(
+          () => jobs.every((pid) => !running(pid)),
+          "the background jobs to go",
+          10_000,
+        );
+        await until(() => gone(unit), "the scope to go", 10_000);
+        // Nothing left for the next boot's reaper.
+        expect(await Effect.runPromise(reapUserScopes(PREFIX))).toEqual([]);
+      } finally {
+        child.kill("SIGKILL");
+      }
+    }, 40_000);
+
+    test("a short-lived Pi of the server's — the default-level probe — runs in a scope too", async () => {
+      const f = await fixture();
+      try {
+        const sessionId = f.harness.newSessionId();
+        await Effect.runPromise(
+          f.harness.createSession({
+            title: "probe test",
+            model: "fake/fake-think",
+            directory: f.work,
+            sessionId,
+            multiTurn: true,
+            options: [{ id: "thinkingLevel", value: "low" }],
+          }),
+        );
+        await Effect.runPromise(
+          f.harness.prompt(sessionId, S([{ text: "one" }])),
+        );
+        await Effect.runPromise(f.harness.waitForIdle(sessionId));
+        // Watch for the probe's scope while the switch back to the default asks Pi.
+        const seen = new Set<string>();
+        let watching = true;
+        const watcher = (async () => {
+          while (watching) {
+            for (const entry of listed(`${PREFIX}thinking-probe-`))
+              seen.add(entry.unit);
+            await Bun.sleep(20);
+          }
+        })();
+        await Effect.runPromise(
+          f.harness.switchModel(sessionId, "fake/fake-think", [
+            { id: "thinkingLevel", value: "default" },
+          ]),
+        );
+        watching = false;
+        await watcher;
+        expect(seen.size).toBe(1);
+        const [probeUnit] = [...seen];
+        await until(() => gone(probeUnit ?? ""), "the probe's scope to go");
+        await Effect.runPromise(f.harness.endSession({ id: sessionId }));
+      } finally {
+        await close(f);
+      }
+    }, 30_000);
+
     test("closing the harness (server shutdown) stops every scope it started", async () => {
       const f = await fixture();
       const { unit, pi, jobs } = await withJobs(f);
