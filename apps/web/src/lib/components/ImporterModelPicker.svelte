@@ -51,7 +51,7 @@
   } from "@bit/contracts";
 
   import { withModelOptionPicked, type App } from "../app.svelte";
-  import { modelWithOptions } from "../modelNames";
+  import { modelNameIn, modelWithOptions } from "../modelNames";
   import ErrorDialog from "./ErrorDialog.svelte";
   import ModelChip from "./ModelChip.svelte";
   import ModelSelector from "./ModelSelector.svelte";
@@ -117,6 +117,18 @@
     pinned?.harness ?? app.importInstance?.displayName ?? "",
   );
   let model = $derived(pinned?.model ?? app.effectiveImportModel);
+  /** What the chip's accessible name calls {@link model}: its name, never an alias (L2). */
+  let modelName = $derived(
+    modelNameIn(
+      app.harnesses,
+      {
+        instanceId:
+          pinned === null ? app.importInstance?.instanceId : pinned.instanceId,
+        harness,
+      },
+      model,
+    ),
+  );
 
   /* ── A started session's picker: staged, then applied together ─────────────── */
 
@@ -301,7 +313,7 @@
     onPickModel={(modelId) => app.pickImportModel(modelId)}
     onPickOption={(descriptorId, value) =>
       app.pickImportModelOption(descriptorId, value)}
-    chipLabel="Harness and model: {harness}, {model}"
+    chipLabel="Harness and model: {harness}, {modelName}"
     onLeave={closesWithBranch}
     namesHarness
   >
@@ -331,7 +343,7 @@
     onPickModel={(modelId) => (stagedModel = modelId)}
     onPickOption={pickOption}
     switching={switching !== undefined}
-    chipLabel="Model: {harness}, {model}. Change this session's model"
+    chipLabel="Model: {harness}, {modelName}. Change this session's model"
     chipTitle="The model this session runs on. Models and reasoning can change at any time, including mid-run; the harness is fixed."
     footer={sessionFooter}
     namesHarness

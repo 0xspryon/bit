@@ -173,4 +173,90 @@ describe("two Claude Code instances (harness instances, slice 1)", () => {
     );
     expect(rail).toEqual(["Claude Code default", "Claude Code · z.ai"]);
   });
+
+  test("a model with nothing to choose is named by its label in the options column (follow-ups A review, L1)", async () => {
+    mountOn(zai, true);
+    const chip = document.querySelector<HTMLButtonElement>("button.chip");
+    if (chip === null) throw new Error("no chip");
+    click(chip);
+    await settle();
+    const column = document.querySelector(".options")?.textContent ?? "";
+    expect(column.replace(/\s+/g, " ")).toContain(
+      "GLM-5.3 Flash offers nothing to choose beyond itself.",
+    );
+    expect(column).not.toContain("sonnet");
+  });
+});
+
+describe("an instance's notice (follow-ups B, item 2)", () => {
+  const NOTICE =
+    "Pi sessions run without a cgroup of their own (systemd user manager not reachable), so a job an agent leaves running in the background can outlive its session, and memoryMax 2G is not applied.";
+  const pi = {
+    instanceId: "pi-zai",
+    driver: "pi",
+    displayName: "Pi · z.ai",
+    version: "1.5.2",
+    ready: true,
+    auth: "unknown" as const,
+    isDefault: false,
+    defaultModel: "zai/glm-5.3-flash",
+    models: [{ id: "zai/glm-5.3-flash", label: "GLM-5.3-Flash" }],
+    notice: NOTICE,
+  };
+  const stock = {
+    instanceId: "claude-code",
+    driver: "claude-code",
+    displayName: "Claude Code",
+    version: "2.1.310",
+    ready: true,
+    auth: "unknown" as const,
+    isDefault: true,
+    defaultModel: "claude-haiku-4-5",
+    models: [{ id: "claude-haiku-4-5" }],
+  };
+  const open = async (active: typeof stock | typeof pi) => {
+    mounted.push(
+      mountInto(ModelSelector, {
+        instances: [stock, pi],
+        active,
+        model: active.defaultModel,
+        modelView: active.models[0],
+        descriptors: [],
+        selections: [],
+        dropped: [],
+        harness: active.displayName,
+        namesHarness: true,
+        onPickInstance: () => undefined,
+        onPickModel: () => undefined,
+        onPickOption: () => undefined,
+      }),
+    );
+    const chip = document.querySelector<HTMLButtonElement>("button.chip");
+    if (chip === null) throw new Error("no chip");
+    click(chip);
+    await settle();
+  };
+
+  test("is marked on its row in the rail, and said in full over its models while it is picked", async () => {
+    await open(pi);
+    const rows = [...document.querySelectorAll<HTMLElement>(".rail-row")].map(
+      (row) => row.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(rows).toEqual([
+      "C Claude Code default 2.1.310",
+      "P Pi · z.ai 1.5.2 See its notice",
+    ]);
+    expect(
+      document
+        .querySelector(".models-notice")
+        ?.textContent?.replace(/\s+/g, " ")
+        .trim(),
+    ).toBe(`Pi · z.ai: ${NOTICE}`);
+  });
+
+  test("is not said over another instance's models", async () => {
+    await open(stock);
+    expect(document.querySelector(".models-notice")).toBeNull();
+    expect(document.querySelectorAll(".rail-note")).toHaveLength(1);
+  });
 });

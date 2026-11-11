@@ -91,6 +91,39 @@ describe("the run composer's picker", () => {
   });
 });
 
+describe("a model's name, never its alias (follow-ups A review, L2)", () => {
+  /** The app's catalogue with every model of every instance given a label. */
+  const labelled = (app: App) => {
+    app.harnesses = app.harnesses.map((instance) => ({
+      ...instance,
+      models: instance.models.map((model) => ({
+        ...model,
+        label: `Label of ${model.id}`,
+      })),
+    }));
+  };
+
+  test("on the run composer's trigger", async () => {
+    const app = await show("run-picker");
+    labelled(app);
+    await settle();
+    const trigger = document.querySelector(".picker .trigger-model");
+    expect(trigger?.textContent?.trim()).toBe(`Label of ${app.effectiveModel}`);
+  });
+
+  test("in the importer chip's accessible name", async () => {
+    const app = await show("importer-first");
+    labelled(app);
+    await settle();
+    const chip = document.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"][aria-label^="Harness and model"]',
+    );
+    expect(chip?.getAttribute("aria-label")).toContain(
+      `Label of ${app.effectiveImportModel}`,
+    );
+  });
+});
+
 describe("the importer's picker", () => {
   test("has the same shape: the rail, then the model list and the options column together", async () => {
     await show("importer-first");

@@ -19,6 +19,7 @@
    */
   import {
     displayedModelOption,
+    modelDisplayName,
     type HarnessInstanceView,
     type HarnessModelView,
     type ModelOptionDescriptor,
@@ -70,7 +71,8 @@
   </p>
 {:else if descriptors.length === 0}
   <p class="models-empty">
-    <span class="mono">{model}</span> offers nothing to choose beyond itself.
+    <!-- Its name, never an alias (follow-ups A review, L1). -->
+    {modelDisplayName(instance.models, model)} offers nothing to choose beyond itself.
   </p>
 {:else}
   {#each descriptors as descriptor (descriptor.id)}

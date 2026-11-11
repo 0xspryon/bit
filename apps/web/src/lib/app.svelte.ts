@@ -98,7 +98,7 @@ import {
   usableRemembered,
   type ModelMemory,
 } from "./modelMemory";
-import { modelNameIn } from "./modelNames";
+import { modelDescriptorsIn, modelNameIn } from "./modelNames";
 import { browserParkedStore, type ParkedStore } from "./conversationParked";
 import {
   ImporterSessions,
@@ -2885,6 +2885,8 @@ export class App {
             ?.driver,
         modelName: (instanceId, model) =>
           modelNameIn(this.harnesses, { instanceId }, model),
+        modelDescriptors: (instanceId, model) =>
+          modelDescriptorsIn(this.harnesses, { instanceId }, model),
       },
       this.#importerEndpoints(targetId),
     );

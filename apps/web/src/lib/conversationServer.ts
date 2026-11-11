@@ -27,6 +27,7 @@ import type {
   ConversationModelDraft,
   ConversationModelSwitched,
   ConversationStopped,
+  ModelOptionDescriptor,
   ModelOptionSelection,
   QuestionAnswers,
   QuestionSettled,
@@ -78,6 +79,11 @@ export interface ConversationAppHooks {
     instanceId: string | undefined,
     model: string,
   ) => string;
+  /** What a model of an instance offers, for its options' labels (`modelNames.ts`). */
+  readonly modelDescriptors?: (
+    instanceId: string | undefined,
+    model: string,
+  ) => readonly ModelOptionDescriptor[];
 }
 
 /**
@@ -420,6 +426,9 @@ export const conversationServer = <Turn>(
     harnessName: app.harnessName,
     harnessDriver: app.harnessDriver,
     ...(app.modelName === undefined ? {} : { modelName: app.modelName }),
+    ...(app.modelDescriptors === undefined
+      ? {}
+      : { modelDescriptors: app.modelDescriptors }),
     highWater: app.highWater,
     watchTurn,
     ...(context === undefined

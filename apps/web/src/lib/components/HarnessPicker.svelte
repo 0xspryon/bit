@@ -34,6 +34,7 @@
    * not need windowing, and running one prompt on several models at once is a different
    * feature with its own provenance questions.
    */
+  import { modelDisplayName } from "@bit/contracts";
   import Badge from "./Badge.svelte";
   import HarnessChoice from "./HarnessChoice.svelte";
   import ModelOptionsColumn from "./ModelOptionsColumn.svelte";
@@ -94,7 +95,10 @@
   >
     {#if active !== undefined}
       <Badge name={active.displayName} size={16} />
-      <span class="trigger-model mono">{app.effectiveModel}</span>
+      <!-- Its name, never an alias (follow-ups A review, L2). -->
+      <span class="trigger-model"
+        >{modelDisplayName(active.models, app.effectiveModel)}</span
+      >
     {:else}
       <span class="trigger-model">No harness</span>
     {/if}

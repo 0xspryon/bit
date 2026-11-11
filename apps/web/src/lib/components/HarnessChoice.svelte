@@ -239,6 +239,13 @@
           <span class="rail-meta mono">
             {instance.ready ? instance.version : "unusable"}
           </span>
+          {#if instance.ready && instance.notice !== undefined}
+            <!--
+              Something the server says of a usable instance (follow-ups B, item 2): marked
+              on its row, said in full under the model list while it is the one picked.
+            -->
+            <span class="rail-note">See its notice</span>
+          {/if}
         </span>
       </button>
       {#if !instance.ready}
@@ -279,6 +286,16 @@
 
       {#if active === undefined}
         <p class="models-empty">Nothing to choose from.</p>
+      {:else if active.ready && active.notice !== undefined}
+        <!--
+          The instance's notice (follow-ups B, item 2): what the server could not give it —
+          a Pi instance whose sessions run without a cgroup, a memory cap not applied. Said
+          here, where a model of it is chosen, not only in the server's log.
+        -->
+        <p class="models-notice" role="note">
+          <span class="notice-head">{active.displayName}:</span>
+          {active.notice}
+        </p>
       {:else if !active.ready}
         <!--
         The models of an unusable instance are still listed: it is the same catalogue, and
@@ -457,6 +474,25 @@
     color: var(--state-fg-warning);
     font-size: 11px;
     line-height: var(--lh-compact);
+  }
+  .rail-note {
+    color: var(--state-fg-warning);
+    font-size: 10px;
+    line-height: var(--lh-compact);
+  }
+  .models-notice {
+    flex: none;
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    border: 1px solid var(--state-border-warning);
+    border-radius: var(--radius-sm);
+    background: var(--state-bg-warning);
+    color: var(--state-fg-warning);
+    font-size: 11px;
+    line-height: var(--lh-compact);
+  }
+  .notice-head {
+    font-weight: 600;
   }
   .rail-setup {
     display: block;

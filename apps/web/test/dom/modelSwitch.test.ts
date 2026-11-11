@@ -246,7 +246,7 @@ describe("U3: switching a started session's model", () => {
       model: SOL,
       modelOptions: [{ id: "variant", value: "high" }],
     });
-    expect(page()).toContain(`Now on ${SOL} (variant: high).`);
+    expect(page()).toContain(`Now on ${SOL} (Reasoning: High).`);
   });
 
   test("mid-turn the confirmation says it applies from the next model call, and the step running finishes on the old model", async () => {

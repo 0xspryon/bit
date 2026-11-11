@@ -14,6 +14,7 @@ import {
   modelOptionDescriptors,
   modelOptionsSummary,
   type HarnessInstanceView,
+  type ModelOptionDescriptor,
   type ModelOptionSelection,
 } from "@bit/contracts";
 
@@ -59,6 +60,19 @@ export const modelNameIn = (
   });
   return modelDisplayName(named?.models, model);
 };
+
+/**
+ * What `model` offers in its own instance's catalogue: the descriptors a sentence names its
+ * options by ("Thinking: High"). Empty where the catalogue does not list it.
+ */
+export const modelDescriptorsIn = (
+  harnesses: readonly HarnessInstanceView[],
+  home: ModelHome | undefined,
+  model: string,
+): readonly ModelOptionDescriptor[] =>
+  modelOptionDescriptors(
+    catalogueEntryOf(instanceOf(harnesses, home)?.models, model),
+  );
 
 /**
  * A model as a session's chip and lists say it: its name, and what was chosen of it —

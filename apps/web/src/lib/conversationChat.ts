@@ -76,6 +76,7 @@ import {
   type ConversationQueuedMessage,
   type ConversationSource,
   type LiveItem,
+  type ModelOptionDescriptor,
   type ModelOptionSelection,
   type PendingQuestion,
 } from "@bit/contracts";
@@ -1680,14 +1681,27 @@ export const LOADING_HISTORY: ConversationHistory = {
   items: [],
 };
 
-/** A model and its options as one phrase: `claude-sonnet-4-5 (effort: high)`. */
+/**
+ * A model and its options as one phrase: `GLM-5.3 Flash (Thinking: High)`. Each option by
+ * its label and its choice's label where the model's descriptors name them (follow-ups A
+ * review, L4); an option or a value they do not name is said as itself, `effort: high`.
+ */
 const modelPhrase = (
   model: string,
   options: readonly ModelOptionSelection[],
+  descriptors: readonly ModelOptionDescriptor[],
 ): string =>
   options.length === 0
     ? model
-    : `${model} (${options.map((each) => `${each.id}: ${each.value}`).join(", ")})`;
+    : `${model} (${options
+        .map((each) => {
+          const descriptor = descriptors.find((one) => one.id === each.id);
+          const choice = descriptor?.options.find(
+            (one) => one.id === each.value,
+          );
+          return `${descriptor?.label ?? each.id}: ${choice?.label ?? each.value}`;
+        })
+        .join(", ")})`;
 
 const asGiven = (model: string): string => model;
 
@@ -1723,12 +1737,18 @@ export const switchedNotice = (input: {
   readonly agent?: string;
   /** What a model is called on screen (`modelNames.ts`); the id when absent. */
   readonly name?: (model: string) => string;
+  /** What a model offers (its catalogue entry's descriptors), for the options' labels. */
+  readonly descriptors?: (model: string) => readonly ModelOptionDescriptor[];
 }): string => {
   const { switched, working } = input;
   const name = input.name ?? asGiven;
   const model = name(switched.model);
   const previous = name(input.previous);
-  const now = modelPhrase(model, switched.modelOptions);
+  const now = modelPhrase(
+    model,
+    switched.modelOptions,
+    input.descriptors?.(switched.model) ?? [],
+  );
   const dropped = switched.droppedModelOptionIds;
   const droppedLine =
     dropped.length === 0

@@ -46,6 +46,7 @@ import type {
   LiveItem,
   LiveQuestion,
   LiveUsage,
+  ModelOptionDescriptor,
   ModelOptionSelection,
   PendingQuestion,
   QuestionAnswers,
@@ -397,6 +398,14 @@ export interface ConversationServer {
     instanceId: string | undefined,
     model: string,
   ) => string;
+  /**
+   * What a model of an instance offers (`modelNames.ts`), for a sentence that names its
+   * options by their labels. Absent: their ids.
+   */
+  readonly modelDescriptors?: (
+    instanceId: string | undefined,
+    model: string,
+  ) => readonly ModelOptionDescriptor[];
   /**
    * The highest activity publish order this tab has seen, or `0` for none. Read when a
    * message is sent, so the importer's answer sorts after it: see
@@ -2474,6 +2483,8 @@ export class ConversationSessions<
         previous: now.model,
         working: now.working,
         name,
+        descriptors: (model: string) =>
+          server.modelDescriptors?.(switched.harnessInstanceId, model) ?? [],
       };
       this.switchNotice = {
         sessionId: session.id,
