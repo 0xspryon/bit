@@ -226,6 +226,8 @@ import {
 } from "./piTranscript";
 import {
   findPiSessionFile,
+  isPiSessionFileOf,
+  locatePiSessionFile,
   piAgentDir,
   piSessionFolder,
   piSessionsRoot,
@@ -699,6 +701,12 @@ interface PiImage {
   readonly mimeType: string;
 }
 
+/** What reading one session's file found (`readSession`). */
+type SessionRead =
+  | { readonly _tag: "read"; readonly file: PiSessionFile }
+  | { readonly _tag: "missing" }
+  | { readonly _tag: "gone"; readonly detail: string };
+
 /** One `ask_user_question` dialog this driver holds for the operator. */
 interface HeldPiQuestion {
   readonly question: HarnessQuestion;
@@ -940,47 +948,71 @@ export const piHarness = (
       const goneSentence = (sessionId: string): string =>
         `Pi no longer has session ${sessionId}: its file is not in ${sessionsRoot}, so it was deleted in Pi (its session picker, Ctrl+D) or by hand, or never written`;
 
-      /** Reads and parses one session's file; `undefined` when it has none. */
+      /** The sentence for a session whose file was deleted while a Pi process ran it. */
+      const headerlessSentence = (sessionId: string, path: string): string =>
+        `Pi no longer has session ${sessionId}: its file was deleted while a Pi process was running it, and that process wrote what came after into a new file at ${path} without the session's header, which Pi cannot open as a session either`;
+
+      /**
+       * Reads and parses one session's file. `missing`: there is none. `gone`: there is a
+       * file under its name but no session in it (`PiSessionFileState`'s `headerless`), which
+       * is as gone as a deleted one and said so — never an unreadable session (follow-ups A
+       * review, L3), and never "not written yet" either.
+       */
       const readSession = (
         operation: string,
         sessionId: string,
-      ): Effect.Effect<PiSessionFile | undefined, HarnessFailure> =>
-        Effect.suspend(
-          (): Effect.Effect<PiSessionFile | undefined, HarnessFailure> => {
-            const record = sessions.get(sessionId);
-            // The remembered path only while it is still there: the operator may delete the
-            // file in Pi between two reads.
-            const remembered =
-              record?.file !== undefined && existsSync(record.file)
-                ? record.file
-                : undefined;
-            const path = remembered ?? findFile(sessionId);
-            if (record !== undefined) record.file = path;
-            if (path === undefined) return Effect.succeed(undefined);
-            let text: string;
-            try {
-              text = readFileSync(path, "utf8");
-            } catch (cause) {
-              return Effect.fail(
-                transport(
+      ): Effect.Effect<SessionRead, HarnessFailure> =>
+        Effect.suspend((): Effect.Effect<SessionRead, HarnessFailure> => {
+          const record = sessions.get(sessionId);
+          // The remembered path only while it is still there, and still the session's: the
+          // operator may delete the file in Pi between two reads, and a process still
+          // running the session then writes a headerless one in its place.
+          const remembered =
+            record?.file !== undefined && existsSync(record.file)
+              ? record.file
+              : undefined;
+          const state =
+            remembered === undefined
+              ? locatePiSessionFile(sessionsRoot, sessionId, record?.directory)
+              : isPiSessionFileOf(remembered, sessionId)
+                ? ({ _tag: "found", path: remembered } as const)
+                : ({ _tag: "headerless", path: remembered } as const);
+          if (record !== undefined) {
+            record.file = state?._tag === "found" ? state.path : undefined;
+          }
+          if (state === undefined) {
+            return Effect.succeed({ _tag: "missing" } satisfies SessionRead);
+          }
+          if (state._tag === "headerless") {
+            return Effect.succeed({
+              _tag: "gone",
+              detail: headerlessSentence(sessionId, state.path),
+            } satisfies SessionRead);
+          }
+          const path = state.path;
+          let text: string;
+          try {
+            text = readFileSync(path, "utf8");
+          } catch (cause) {
+            return Effect.fail(
+              transport(operation, `could not read ${path}: ${String(cause)}`),
+            );
+          }
+          const parsed = parsePiSession(text, path);
+          return parsed instanceof PiTranscriptError
+            ? Effect.fail(
+                new HarnessDecodeError({
                   operation,
-                  `could not read ${path}: ${String(cause)}`,
-                ),
-              );
-            }
-            const parsed = parsePiSession(text, path);
-            return parsed instanceof PiTranscriptError
-              ? Effect.fail(
-                  new HarnessDecodeError({
-                    operation,
-                    status: undefined,
-                    detail: parsed.detail,
-                    cause: parsed,
-                  }),
-                )
-              : Effect.succeed(parsed);
-          },
-        );
+                  status: undefined,
+                  detail: parsed.detail,
+                  cause: parsed,
+                }),
+              )
+            : Effect.succeed({
+                _tag: "read",
+                file: parsed,
+              } satisfies SessionRead);
+        });
 
       const offer = (
         record: SessionRecord,
@@ -2077,20 +2109,23 @@ export const piHarness = (
             breakdown,
           } satisfies HarnessContextUsage;
         }
-        if (file.success === undefined && !notWrittenYet(record)) {
-          // Gone (deleted in Pi), not "no call yet": nothing can be measured any more.
+        const stored = file.success;
+        if (
+          stored._tag === "gone" ||
+          (stored._tag === "missing" && !notWrittenYet(record))
+        ) {
+          // Gone (deleted in Pi), not "no call yet" and not "could not be asked": Pi was
+          // asked, and nothing is left to measure.
           return {
             used: null,
             usedModel: null,
             window,
-            reading: "unread",
+            reading: "gone",
             breakdown,
           } satisfies HarnessContextUsage;
         }
         const call =
-          file.success === undefined
-            ? undefined
-            : lastMeasuredCall(file.success);
+          stored._tag === "read" ? lastMeasuredCall(stored.file) : undefined;
         if (call === undefined) {
           return {
             used: null,
@@ -2121,13 +2156,14 @@ export const piHarness = (
 
       const sessionContinuation: AgentHarness["Service"]["sessionContinuation"] =
         Effect.fn("piHarness.sessionContinuation")(function* (sessionId) {
-          const file = yield* readSession("pi.session", sessionId);
-          if (file === undefined) {
+          const read = yield* readSession("pi.session", sessionId);
+          if (read._tag !== "read") {
             return {
               _tag: "unresumable",
-              detail: `${goneSentence(sessionId)}; there is no conversation to carry on`,
+              detail: `${read._tag === "gone" ? read.detail : goneSentence(sessionId)}; there is no conversation to carry on`,
             };
           }
+          const file = read.file;
           if (!hasUserMessage(file.entries)) {
             return {
               _tag: "unresumable",
@@ -2149,14 +2185,15 @@ export const piHarness = (
       const sessionTitle: AgentHarness["Service"]["sessionTitle"] = Effect.fn(
         "piHarness.sessionTitle",
       )(function* (sessionId) {
-        const file = yield* readSession("pi.session", sessionId);
-        if (file === undefined) {
+        const read = yield* readSession("pi.session", sessionId);
+        if (read._tag !== "read") {
           return {
             _tag: "forgotten",
-            detail: goneSentence(sessionId),
+            detail:
+              read._tag === "gone" ? read.detail : goneSentence(sessionId),
           } satisfies SessionTitle;
         }
-        const name = sessionName(file.entries);
+        const name = sessionName(read.file.entries);
         return name === undefined || name.trim() === ""
           ? ({ _tag: "untitled" } satisfies SessionTitle)
           : ({ _tag: "titled", title: name } satisfies SessionTitle);
@@ -2170,9 +2207,13 @@ export const piHarness = (
       const messages: AgentHarness["Service"]["messages"] = Effect.fn(
         "piHarness.messages",
       )(function* (sessionId, read) {
-        const file = yield* readSession("pi.messages", sessionId);
+        const stored = yield* readSession("pi.messages", sessionId);
         const record = sessions.get(sessionId);
-        if (file === undefined) {
+        if (stored._tag === "gone") {
+          // Deleted while a process of this session's ran: what it wrote since is no session.
+          return yield* notFound("pi.messages", stored.detail);
+        }
+        if (stored._tag === "missing") {
           // A new session of this process's: Pi writes the file once the first reply is
           // in, so nothing yet. Anything else — one never held here, a resume, an ended
           // one — had a file, and Pi no longer has it: a replay says the transcript is gone.
@@ -2180,7 +2221,7 @@ export const piHarness = (
           return yield* notFound("pi.messages", goneSentence(sessionId));
         }
         const joined = [...(record?.taken ?? [])];
-        const entries = piMessageEntries(file, {
+        const entries = piMessageEntries(stored.file, {
           reader: attachmentReader({ uploadsFolder: read?.uploadsFolder }),
           steerIds: (text) => {
             const at = joined.findIndex((each) => each.text === text);

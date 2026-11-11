@@ -17,8 +17,9 @@ import {
 import { turnFooterText, type ThreadTurn } from "../src/lib/chatShell";
 import type { ChatGroup } from "../src/lib/chat";
 import { switchedNotice } from "../src/lib/conversationChat";
-import { crumbMeter, crumbSource } from "../src/lib/crumbMeter";
+import { crumbLabel, crumbMeter, crumbSource } from "../src/lib/crumbMeter";
 import {
+  modelDescriptorsIn,
   modelNameIn,
   modelWithOptions,
   provenanceModelIn,
@@ -254,5 +255,66 @@ describe("the surfaces that word a model take the rule", () => {
       undefined,
     );
     expect(crumbSource(meter, name)).toBe("Recounted for GLM-5.3 Flash");
+  });
+
+  test("a switch's notice names an option by its label and its choice's, not their ids (follow-ups A review, L4)", () => {
+    const switched: ConversationModelSwitched = {
+      conversationId: "imp_1",
+      harnessInstanceId: "pi-zai",
+      model: "zai/glm-5.3-flash",
+      modelOptions: [
+        { id: "thinkingLevel", value: "high" },
+        { id: "mystery", value: "on" },
+      ],
+      droppedModelOptionIds: [],
+      applied: "recorded",
+      changed: true,
+    };
+    const said = switchedNotice({
+      switched,
+      previous: "zai/glm-5.3-flash",
+      working: false,
+      name: (model) => modelNameIn(HARNESSES, { instanceId: "pi-zai" }, model),
+      descriptors: (model) =>
+        modelDescriptorsIn(HARNESSES, { instanceId: "pi-zai" }, model),
+    });
+    expect(
+      said.startsWith("Now on GLM-5.3-Flash (Thinking: High, mystery: on)."),
+    ).toBe(true);
+    expect(said).not.toContain("thinkingLevel");
+    // The default choice is said by its label too.
+    expect(
+      switchedNotice({
+        switched: {
+          ...switched,
+          modelOptions: [{ id: "thinkingLevel", value: "default" }],
+        },
+        previous: "zai/glm-5.3-flash",
+        working: false,
+        descriptors: (model) =>
+          modelDescriptorsIn(HARNESSES, { instanceId: "pi-zai" }, model),
+      }),
+    ).toContain("(Thinking: Pi's default)");
+  });
+
+  test("a session the harness no longer has is said as gone, not as not asked (follow-ups A review, L4)", () => {
+    const meter = crumbMeter(
+      {
+        reading: {
+          conversationId: "imp_1",
+          model: "zai/glm-5.3-flash",
+          used: null,
+          usedModel: null,
+          window: 200_000,
+          reading: "gone",
+          breakdown: { _tag: "none", reason: "harness_gives_none" },
+          measuredAt: 1,
+        },
+        previous: null,
+        cause: "opened",
+      },
+      undefined,
+    );
+    expect(crumbLabel(meter)).toBe("Session context · session gone");
   });
 });

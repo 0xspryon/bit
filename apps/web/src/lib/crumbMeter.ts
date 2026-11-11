@@ -226,6 +226,8 @@ export const crumbLabel = (meter: CrumbMeter): string => {
         return `${what} · summarised, measured again on the next model call`;
       case "unread":
         return `${what} · not measured`;
+      case "gone":
+        return `${what} · session gone`;
       default:
         return `${what} · no tokens used yet`;
     }

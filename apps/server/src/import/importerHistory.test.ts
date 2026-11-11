@@ -24,6 +24,7 @@ import { describe, expect, test } from "bun:test";
 import { Effect, Schema } from "effect";
 
 import { HarnessTransportError } from "../harness/errors";
+import { PI_DRIVER } from "../harness/identity";
 import { HarnessResolver } from "../harness/resolver";
 import { STUB_INSTANCE, stubHarness } from "../harness/stubHarness";
 import { SESSION_NOT_FOUND_TAG } from "../harness/agentHarness";
@@ -195,6 +196,38 @@ describe("the five answers, each with its own sentence", () => {
     // And the composer is told the truth about what is left: a new session, not a resume.
     expect(view.continuation).toBe("fresh");
     expect(view.note).toContain("cannot be carried on");
+  });
+
+  test("a Pi session whose file was deleted says Pi's own sentence, not that harnesses delete transcripts after a while (follow-ups A review, L4)", async () => {
+    const gone =
+      "Pi no longer has session ses_1: its file is not in /home/op/.pi/agent/sessions, so it was deleted in Pi (its session picker, Ctrl+D) or by hand, or never written";
+    const view = await read({
+      resolver: HarnessResolver.fromEntries([
+        {
+          instance: { ...STUB_INSTANCE, driver: PI_DRIVER },
+          harness: stubHarness({
+            messages: () =>
+              Effect.fail(
+                new HarnessTransportError({
+                  operation: "pi.messages",
+                  status: undefined,
+                  tag: SESSION_NOT_FOUND_TAG,
+                  detail: gone,
+                  cause: undefined,
+                }),
+              ),
+            sessionContinuation: continuing({
+              _tag: "unresumable",
+              detail: gone,
+            }),
+          }),
+        },
+      ]),
+    });
+    expect(view.source).toBe("forgotten");
+    expect(view.note).toContain(`${gone}.`);
+    expect(view.note).not.toContain("delete them");
+    expect(view.note).toContain("Scope tab");
   });
 
   test("a harness that would not answer is forgotten too, and says it differently", async () => {

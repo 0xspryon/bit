@@ -88,37 +88,75 @@ const namesIn = (folder: string): readonly string[] => {
   }
 };
 
+/** Whether the file at `path` is still `sessionId`'s: its first line is that header. */
+export const isPiSessionFileOf = (path: string, sessionId: string): boolean =>
+  headerId(path) === sessionId;
+
+/**
+ * Where one session's file stands:
+ *
+ * - `found` — Pi's file for it, with its header;
+ * - `headerless` — a file under its name with **no header** (follow-ups A review, L3): the
+ *   operator deleted the file while a Pi process still ran the session, and that process
+ *   appended the next entries to the same path, which made a new file of entries alone. Pi
+ *   itself finds sessions by their header and cannot open it either: the conversation is
+ *   gone, exactly as for a deleted file;
+ * - `undefined` — no file at all: never written, or deleted.
+ */
+export type PiSessionFileState =
+  | { readonly _tag: "found"; readonly path: string }
+  | { readonly _tag: "headerless"; readonly path: string };
+
 /**
  * One session's file under `root`, found by id the way Pi finds it: a file whose header
  * names the id (`findById`). Pi names a file it creates `<timestamp>_<id>.jsonl`, so only
  * files so named are opened — every one of the operator's sessions would otherwise be read
  * per lookup. `cwd`, when known, is looked in first; without it every directory's folder is
  * searched, since a replay after a restart asks by id alone. The newest wins where several
- * match. `undefined`: Pi holds no such session — it was never written, or it was deleted.
+ * match. A file so named with no header is said as `headerless` only where no file with one
+ * is found ({@link PiSessionFileState}).
+ */
+export const locatePiSessionFile = (
+  root: string,
+  sessionId: string,
+  cwd?: string,
+): PiSessionFileState | undefined => {
+  const suffix = `_${sessionId}.jsonl`;
+  let headerless: string | undefined;
+  const inFolder = (folder: string): string | undefined => {
+    for (const path of namesIn(folder)
+      .filter((name) => name.endsWith(suffix))
+      .sort()
+      .reverse()
+      .map((name) => join(folder, name))) {
+      if (isPiSessionFileOf(path, sessionId)) return path;
+      headerless ??= path;
+    }
+    return undefined;
+  };
+  if (cwd !== undefined) {
+    const found = inFolder(piSessionFolder(root, cwd));
+    if (found !== undefined) return { _tag: "found", path: found };
+  }
+  for (const folder of [...namesIn(root)].sort()) {
+    if (!folder.startsWith("--")) continue;
+    const found = inFolder(join(root, folder));
+    if (found !== undefined) return { _tag: "found", path: found };
+  }
+  return headerless === undefined
+    ? undefined
+    : { _tag: "headerless", path: headerless };
+};
+
+/**
+ * One session's file with its header, or `undefined`: Pi holds no such session — it was
+ * never written, or it was deleted (a headerless leftover included).
  */
 export const findPiSessionFile = (
   root: string,
   sessionId: string,
   cwd?: string,
 ): string | undefined => {
-  const suffix = `_${sessionId}.jsonl`;
-  const inFolder = (folder: string): string | undefined => {
-    const found = namesIn(folder)
-      .filter((name) => name.endsWith(suffix))
-      .sort()
-      .reverse()
-      .map((name) => join(folder, name))
-      .find((path) => headerId(path) === sessionId);
-    return found;
-  };
-  if (cwd !== undefined) {
-    const found = inFolder(piSessionFolder(root, cwd));
-    if (found !== undefined) return found;
-  }
-  for (const folder of [...namesIn(root)].sort()) {
-    if (!folder.startsWith("--")) continue;
-    const found = inFolder(join(root, folder));
-    if (found !== undefined) return found;
-  }
-  return undefined;
+  const state = locatePiSessionFile(root, sessionId, cwd);
+  return state?._tag === "found" ? state.path : undefined;
 };

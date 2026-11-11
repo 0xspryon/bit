@@ -1130,7 +1130,7 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
             }),
           )
         ).reading,
-      ).toBe("unread");
+      ).toBe("gone");
       expect(
         (await Effect.runPromise(second.harness.sessionTitle(sessionId)))._tag,
       ).toBe("forgotten");
@@ -1159,6 +1159,81 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       expect(readdirSync(first.sessionDir)).toEqual([]);
       expect(readdirSync(first.records)).toEqual([]);
       expect(model.requests.length).toBe(requests);
+    } finally {
+      await close(second);
+    }
+  });
+
+  test("a session file deleted while its Pi still runs is gone, not unreadable, once Pi writes the next message to a file with no header", async () => {
+    const f = await fixture();
+    try {
+      const ref = await open(f.harness, f.work, "");
+      await Effect.runPromise(
+        f.harness.prompt(ref.id, S([{ text: "before the delete" }])),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      // Read once, so the harness remembers where the file is.
+      expect(
+        (await Effect.runPromise(f.harness.messages(ref.id))).length,
+      ).toBeGreaterThan(0);
+      const [name] = readdirSync(f.sessionDir);
+      const path = join(f.sessionDir, name ?? "");
+      rmSync(path);
+      // The same process takes the next message and appends it where the file was.
+      await Effect.runPromise(
+        f.harness.prompt(ref.id, S([{ text: "after the delete" }]), {
+          _tag: "steer",
+          urgency: "queued",
+          messageId: "m-after",
+        }),
+      );
+      await Effect.runPromise(f.harness.waitForIdle(ref.id));
+      const first = readFileSync(path, "utf8").split("\n")[0] ?? "";
+      expect((JSON.parse(first) as { type?: unknown }).type).not.toBe(
+        "session",
+      );
+
+      const replay = await Effect.runPromise(
+        Effect.flip(f.harness.messages(ref.id)),
+      );
+      expect(replay._tag === "HarnessTransportError" && replay.tag).toBe(
+        SESSION_NOT_FOUND_TAG,
+      );
+      expect(replay.message).toContain("deleted while a Pi process");
+      const continuation = await Effect.runPromise(
+        f.harness.sessionContinuation(ref.id),
+      );
+      expect(continuation._tag).toBe("unresumable");
+      expect(
+        (
+          await Effect.runPromise(
+            f.harness.contextUsage(ref.id, {
+              model: "fake/fake-1",
+              breakdown: false,
+            }),
+          )
+        ).reading,
+      ).toBe("gone");
+      expect(
+        (await Effect.runPromise(f.harness.sessionTitle(ref.id)))._tag,
+      ).toBe("forgotten");
+      await Effect.runPromise(f.harness.endSession(ref));
+    } finally {
+      await close(f);
+    }
+    // A server that never read the file finds the same: no session, not a broken one.
+    const second = await fixture({}, { records: f.records, work: f.work });
+    try {
+      const [name] = readdirSync(f.sessionDir);
+      const sessionId = (name ?? "")
+        .replace(/^.*_/, "")
+        .replace(/\.jsonl$/, "");
+      const replay = await Effect.runPromise(
+        Effect.flip(second.harness.messages(sessionId)),
+      );
+      expect(replay._tag === "HarnessTransportError" && replay.tag).toBe(
+        SESSION_NOT_FOUND_TAG,
+      );
     } finally {
       await close(second);
     }

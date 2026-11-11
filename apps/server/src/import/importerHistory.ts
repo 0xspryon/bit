@@ -91,6 +91,7 @@ import {
   transcriptQuestionId,
   unansweredQuestion,
 } from "../harness/questions";
+import { PI_DRIVER } from "../harness/identity";
 import type { HarnessResolver } from "../harness/resolver";
 import { roleDirectoryMatcher, sessionReopen } from "../harness/sessionReopen";
 import { isRoleDirectoryId } from "../persistence/fleet";
@@ -599,7 +600,15 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
       source: "forgotten",
       note:
         (deleted
-          ? `${displayName} no longer holds session ${sessionId}. Harnesses keep their own transcripts for a while and then delete them, so this is the normal answer for a session left for a while. What it wrote is not affected: its entries are on the Scope tab and its assets in the Estate.`
+          ? `${
+              // Pi deletes nothing by itself (follow-ups A review, L4): its file went in Pi's
+              // session picker or by hand, which the driver's own sentence says, with where
+              // it looked. Not "harnesses delete their transcripts after a while".
+              resolved.success.instance.driver === PI_DRIVER &&
+              failure._tag === "HarnessTransportError"
+                ? `${failure.detail}.`
+                : `${displayName} no longer holds session ${sessionId}. Harnesses keep their own transcripts for a while and then delete them, so this is the normal answer for a session left for a while.`
+            } What it wrote is not affected: its entries are on the Scope tab and its assets in the Estate.`
           : // A7-Q review 1: nor can it be asked what its agent waits on, and a question
             // offered from what this process last heard would be answered into a harness
             // that is not there (an OpenCode killed for good is not restarted). So none is

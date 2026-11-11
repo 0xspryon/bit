@@ -96,12 +96,16 @@ export type ContextBreakdown = typeof ContextBreakdown.Type;
  *   is `null`: the old figure would be a number known to be wrong.
  * - `unread` — the harness could not be asked (not reachable, or the session's record could
  *   not be read). `used` is `null`; nothing is claimed either way.
+ * - `gone` — the harness was asked and no longer holds the session: its record was deleted
+ *   (a Pi session file deleted in Pi or by hand). `used` is `null`: there is nothing left to
+ *   measure, which is not the same as not being able to ask (follow-ups A review, L4).
  */
 export const ContextReading = Schema.Literals([
   "measured",
   "no_call_yet",
   "compacted",
   "unread",
+  "gone",
 ]);
 export type ContextReading = typeof ContextReading.Type;
 

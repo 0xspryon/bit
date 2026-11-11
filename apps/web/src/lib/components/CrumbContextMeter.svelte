@@ -185,6 +185,9 @@
           Summarised. The next model call measures the window again.
         {:else if meter.reading === "unread"}
           The harness could not be asked how full the window is.
+        {:else if meter.reading === "gone"}
+          The harness no longer has this session, so there is nothing left to
+          measure.
         {:else}
           No model call yet, so nothing fills the window that anyone has
           measured.
@@ -239,6 +242,8 @@
         </p>
       {:else if counting}
         <p class="note" role="status">Counting what fills the window…</p>
+      {:else if meter.reading === "gone"}
+        <!-- A session that is gone has nothing to break down, nor a reason to say so. -->
       {:else if meter.missing === "harness_gives_none"}
         <p class="note">
           {harness} reports the tokens of each model call and the model's window,
