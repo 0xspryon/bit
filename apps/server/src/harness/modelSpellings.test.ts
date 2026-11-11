@@ -72,3 +72,19 @@ describe("the Anthropic instance", () => {
     );
   });
 });
+
+describe("the provider's name of a catalogue entry", () => {
+  test("is the declared spelling, then the newest a session reported, and nothing where the id is the name", () => {
+    const spellings = modelSpellings([
+      { id: "opus", reportedAs: "glm-5.3" },
+      { id: "sonnet" },
+      { id: "claude-haiku-4-5" },
+    ]);
+    expect(spellings.providerName("opus")).toBe("glm-5.3");
+    expect(spellings.providerName("sonnet")).toBeUndefined();
+    spellings.learn("glm-5.3-flash", "sonnet");
+    expect(spellings.providerName("sonnet")).toBe("glm-5.3-flash");
+    spellings.learn("claude-haiku-4-5-20251001", "claude-haiku-4-5");
+    expect(spellings.providerName("claude-haiku-4-5")).toBeUndefined();
+  });
+});

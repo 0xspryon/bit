@@ -3655,6 +3655,9 @@ export const claudeCodeHarness = (
                 ...(known ?? {}),
                 id: model.id,
                 ...(model.label === undefined ? {} : { label: model.label }),
+                ...(model.reportedAs === undefined
+                  ? {}
+                  : { reportedAs: model.reportedAs }),
               };
             });
       const defaultModel =
@@ -3705,6 +3708,12 @@ export const claudeCodeHarness = (
        */
       const version = yield* sdkClaudeCodeVersion;
 
+      const listed: readonly HarnessModelView[] = [
+        catalogue.find((model) => model.id === defaultModel) ?? {
+          id: defaultModel,
+        },
+        ...catalogue.filter((model) => model.id !== defaultModel),
+      ];
       const instance: HarnessInstance = {
         instanceId:
           options.instanceId ?? defaultInstanceIdForDriver(CLAUDE_CODE_DRIVER),
@@ -3718,12 +3727,18 @@ export const claudeCodeHarness = (
         defaultModel,
         // The default first and never twice, so a caller that configured its own default
         // gets a pickable list rather than one that omits the model it will actually use.
-        models: [
-          catalogue.find((model) => model.id === defaultModel) ?? {
-            id: defaultModel,
-          },
-          ...catalogue.filter((model) => model.id !== defaultModel),
-        ],
+        // A getter, so a provider's name a session has since reported is on each read: an
+        // aliasing instance that declared none still shows `glm-5.3-flash`, not `sonnet`,
+        // once a session has said it (follow-ups A).
+        get models(): readonly HarnessModelView[] {
+          return listed.map((model) => {
+            if (model.reportedAs !== undefined) return model;
+            const reported = spellings.providerName(model.id);
+            return reported === undefined
+              ? model
+              : { ...model, reportedAs: reported };
+          });
+        },
       };
 
       /**

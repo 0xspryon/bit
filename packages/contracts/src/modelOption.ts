@@ -62,6 +62,8 @@
  */
 import { Schema } from "effect";
 
+import { modelKey } from "./conversationContext";
+
 /**
  * The one choice id that is not a harness value: "whatever the model would do".
  *
@@ -140,6 +142,15 @@ export const HarnessModelView = Schema.Struct({
    * names {@link id}. Absent: the id is what is shown.
    */
   label: Schema.optional(Schema.NonEmptyString),
+  /**
+   * The provider's own name for the model, where it is not {@link id}: a z.ai Claude Code
+   * instance asks for `sonnet` and its frames say `glm-5.3-flash`. Declared in the
+   * instance's configuration, or learned from a session's own frames once one has said it.
+   * What a screen shows when there is no {@link label}, so an alias is never presented as
+   * the model; never an identity either. Absent: the id is the provider's name, as far as
+   * this server knows.
+   */
+  reportedAs: Schema.optional(Schema.NonEmptyString),
   /**
    * What this model can be asked for beyond itself.
    *
@@ -226,6 +237,66 @@ export const HarnessModelView = Schema.Struct({
   compactionAt: Schema.optional(Schema.Int),
 });
 export type HarnessModelView = typeof HarnessModelView.Type;
+
+/**
+ * The catalogue entry a model name stands for: by its id, or — for a name in a frame's
+ * spelling (a dated `claude-haiku-4-5-20251001`, a z.ai `glm-5.3-flash`) — by {@link
+ * modelKey} against each entry's id, then its {@link HarnessModelView.reportedAs}.
+ */
+export const catalogueEntryOf = (
+  models: readonly HarnessModelView[] | undefined,
+  model: string,
+): HarnessModelView | undefined => {
+  if (models === undefined || model.trim() === "") return undefined;
+  const exact = models.find((entry) => entry.id === model);
+  if (exact !== undefined) return exact;
+  const key = modelKey(model);
+  return (
+    models.find((entry) => modelKey(entry.id) === key) ??
+    models.find(
+      (entry) =>
+        entry.reportedAs !== undefined && modelKey(entry.reportedAs) === key,
+    )
+  );
+};
+
+/**
+ * What a screen calls a model (follow-ups A, 2026-11-11): its configured label, else the
+ * provider's own name, else the name as given.
+ *
+ * **Display only.** The catalogue id stays what a run, a row and a switch name; this is the
+ * one rule every screen that *names* a model goes through, so an aliasing instance's
+ * `sonnet` reads "GLM-5.3 Flash" in the footer, the meter and the session list alike. The
+ * name as given is the last resort, and the right answer where the id *is* the provider's
+ * name (the Anthropic instance's `claude-sonnet-5`), or where the catalogue does not list it.
+ */
+export const modelDisplayName = (
+  models: readonly HarnessModelView[] | undefined,
+  model: string,
+): string => {
+  const entry = catalogueEntryOf(models, model);
+  if (entry === undefined) return model;
+  return entry.label ?? entry.reportedAs ?? model;
+};
+
+/**
+ * The explicit choices of a selection, as a screen names them beside the model: "High".
+ *
+ * Only what the operator set (rule 3's "explicit"), each by its choice's label, in the
+ * descriptors' order; a value no choice carries is said as itself (rule 4). The default
+ * choice is not said: a model at its own default is just the model. `""` when nothing is.
+ */
+export const modelOptionsSummary = (
+  descriptors: readonly ModelOptionDescriptor[],
+  selections: readonly ModelOptionSelection[] | undefined,
+): string =>
+  descriptors
+    .flatMap((descriptor) => {
+      const raw = selectedModelOptionValue(selections ?? [], descriptor.id);
+      if (raw === undefined || raw === MODEL_OPTION_DEFAULT_CHOICE) return [];
+      return [choiceOf(descriptor, raw)?.label ?? raw];
+    })
+    .join(" · ");
 
 /** The descriptors of one model, with absence and emptiness collapsed. */
 export const modelOptionDescriptors = (

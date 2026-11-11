@@ -350,6 +350,44 @@ describe("an aliasing provider's model spellings", () => {
     expect(models(narrated)).toEqual(["reply:sonnet", "usage:sonnet"]);
   });
 
+  test("the provider's name of a model is on the catalogue, declared or once a session reported it (follow-ups A)", async () => {
+    const declared = await withHarness(
+      {
+        ...ZAI,
+        sdk: scriptedSdk().sdk,
+        models: [
+          { id: "opus", reportedAs: "glm-5.3" },
+          { id: "sonnet", label: "GLM-5.3 Flash" },
+        ],
+      },
+      (harness) => Effect.succeed(harness.instance.models),
+    );
+    expect(declared.map((entry) => entry.reportedAs)).toEqual([
+      undefined,
+      "glm-5.3",
+    ]);
+
+    const { sdk } = scriptedSdk({
+      messages: [init("glm-5.3-flash"), assistant("glm-5.3-flash"), success],
+    });
+    const learned = await withHarness(
+      { ...ZAI, sdk, models: [{ id: "sonnet" }, { id: "opus" }] },
+      (harness) =>
+        Effect.gen(function* () {
+          const before = harness.instance.models.map(
+            (entry) => entry.reportedAs,
+          );
+          yield* turn(harness, "sonnet");
+          return {
+            before,
+            after: harness.instance.models.map((entry) => entry.reportedAs),
+          };
+        }),
+    );
+    expect(learned.before).toEqual([undefined, undefined]);
+    expect(learned.after).toEqual(["glm-5.3-flash", undefined]);
+  });
+
   test("a declared spelling is read before any session said it: a replay after a restart", async () => {
     const { sdk } = scriptedSdk({
       transcript: [

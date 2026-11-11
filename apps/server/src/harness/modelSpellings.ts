@@ -59,14 +59,25 @@ export interface ModelSpellings {
     reported: string | undefined,
     current: string | undefined,
   ) => string | undefined;
+  /**
+   * The provider's own name for one catalogue entry, where it is another name than the
+   * entry's: declared, or the newest a session reported. What a screen falls back to when
+   * the entry has no label (follow-ups A), so an alias is not shown as the model.
+   */
+  readonly providerName: (catalogueId: string) => string | undefined;
 }
 
 export const modelSpellings = (
-  catalogue: readonly { readonly id: string; readonly reportedAs?: string }[],
+  catalogue: readonly {
+    readonly id: string;
+    readonly reportedAs?: string | undefined;
+  }[],
 ): ModelSpellings => {
   const catalogueKeys = new Set(catalogue.map((entry) => modelKey(entry.id)));
   /** Provider spelling (keyed) → catalogue ids, oldest first. */
   const learned = new Map<string, string[]>();
+  /** Catalogue id → the provider's spelling of it, as last reported. */
+  const named = new Map<string, string>();
 
   const learn: ModelSpellings["learn"] = (reported, asked) => {
     if (reported === undefined || asked === undefined) return;
@@ -78,6 +89,7 @@ export const modelSpellings = (
     if (at !== -1) ids.splice(at, 1);
     ids.push(asked);
     learned.set(key, ids);
+    named.set(asked, reported.trim());
   };
 
   for (const entry of catalogue) learn(entry.reportedAs, entry.id);
@@ -93,5 +105,6 @@ export const modelSpellings = (
       if (current !== undefined && ids.includes(current)) return current;
       return ids[ids.length - 1];
     },
+    providerName: (catalogueId) => named.get(catalogueId),
   };
 };
