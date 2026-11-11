@@ -393,7 +393,10 @@ export interface ConversationServer {
    * What a screen calls a model of an instance (`modelNames.ts`): its label, never an
    * alias. Absent: the id.
    */
-  readonly modelName?: (instanceId: string | undefined, model: string) => string;
+  readonly modelName?: (
+    instanceId: string | undefined,
+    model: string,
+  ) => string;
   /**
    * The highest activity publish order this tab has seen, or `0` for none. Read when a
    * message is sent, so the importer's answer sorts after it: see

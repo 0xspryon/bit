@@ -155,10 +155,7 @@ describe("two Claude Code instances (harness instances, slice 1)", () => {
     const rows = [
       ...document.querySelectorAll<HTMLElement>("button.model-row"),
     ].map((row) => row.textContent?.replace(/\s+/g, " ").trim());
-    expect(rows).toEqual([
-      "GLM-5.3 Flash glm-5.3-flash default",
-      "glm-5.3",
-    ]);
+    expect(rows).toEqual(["GLM-5.3 Flash glm-5.3-flash default", "glm-5.3"]);
   });
 
   test("the picker lists the instance's models by label, with the id a run names", async () => {

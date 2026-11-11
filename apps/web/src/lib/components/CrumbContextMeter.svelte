@@ -198,9 +198,8 @@
       {#if meter.used !== null && meter.usedModel !== null && meter.model !== null && meter.model !== "" && !sameModel(meter.usedModel, meter.model)}
         <p class="note other-model">
           Measured on <span class="mono">{modelName(meter.usedModel)}</span>'s
-          last call. The next call, on {modelName(meter.model)}, measures it again
-          with that model's
-          own count.
+          last call. The next call, on {modelName(meter.model)}, measures it
+          again with that model's own count.
         </p>
       {/if}
 

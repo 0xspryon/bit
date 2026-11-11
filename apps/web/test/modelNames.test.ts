@@ -172,7 +172,12 @@ describe("modelNameIn", () => {
       "GLM-5.3 Flash",
     );
     expect(
-      provenanceModelIn(HARNESSES, "claude-code", "anthropic", "claude-sonnet-5"),
+      provenanceModelIn(
+        HARNESSES,
+        "claude-code",
+        "anthropic",
+        "claude-sonnet-5",
+      ),
     ).toBe("anthropic/claude-sonnet-5");
   });
 });

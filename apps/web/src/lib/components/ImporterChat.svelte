@@ -570,7 +570,10 @@
         <span class="hint" role="status"
           >Switching to {modelNameIn(
             app.harnesses,
-            { instanceId: session?.harnessInstanceId, harness: session?.harness },
+            {
+              instanceId: session?.harnessInstanceId,
+              harness: session?.harness,
+            },
             switchingHere.model,
           )}…</span
         >

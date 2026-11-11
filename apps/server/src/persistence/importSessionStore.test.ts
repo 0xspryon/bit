@@ -545,7 +545,10 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
       }),
     );
     expect(
-      outcome.map((session) => [session.harnessSessionId, session.modelOptions]),
+      outcome.map((session) => [
+        session.harnessSessionId,
+        session.modelOptions,
+      ]),
     ).toEqual([
       ["ses_pi", [{ id: "thinkingLevel", value: "high" }]],
       ["ses_imp_plain", null],

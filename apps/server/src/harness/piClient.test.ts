@@ -278,8 +278,7 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
         PI_THINKING_OPTION,
       ]);
       const offered =
-        think?.optionDescriptors?.[0]?.options.map((choice) => choice.id) ??
-        [];
+        think?.optionDescriptors?.[0]?.options.map((choice) => choice.id) ?? [];
       expect(offered).toEqual(["default", "low", "high"]);
       // Pi's own answer for the model, from the process that runs it.
       const pi = askPi(
@@ -812,10 +811,7 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
       ).toBe(true);
       const files = readdirSync(first.sessionDir);
       expect(files.length).toBe(1);
-      const text = readFileSync(
-        join(first.sessionDir, files[0] ?? ""),
-        "utf8",
-      );
+      const text = readFileSync(join(first.sessionDir, files[0] ?? ""), "utf8");
       expect(
         text.split("\n").filter((line) => line.includes('"session_info"'))
           .length,
@@ -948,7 +944,10 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
     }
 
     // A restarted server resumes it at the level its row recorded, over the file's last.
-    const second = await fixture({}, { records: first.records, work: first.work });
+    const second = await fixture(
+      {},
+      { records: first.records, work: first.work },
+    );
     try {
       await Effect.runPromise(
         second.harness.createSession({
@@ -1005,10 +1004,17 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
 
   test("a session file deleted in Pi replays as gone, is refused as a resume, and a resume racing the delete starts nothing", async () => {
     const first = await fixture();
-    let sessionId = "";
+    const sessionId = first.harness.newSessionId();
     try {
-      const ref = await open(first.harness, first.work, "");
-      sessionId = ref.id;
+      const ref = await Effect.runPromise(
+        first.harness.createSession({
+          title: "bit test session",
+          model: "fake/fake-1",
+          directory: first.work,
+          sessionId,
+          multiTurn: true,
+        }),
+      );
       await Effect.runPromise(
         first.harness.prompt(ref.id, S([{ text: "soon gone" }])),
       );
@@ -1017,12 +1023,14 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
     } finally {
       await close(first);
     }
-    const second = await fixture({}, { records: first.records, work: first.work });
+    const second = await fixture(
+      {},
+      { records: first.records, work: first.work },
+    );
     try {
       expect(
-        (
-          await Effect.runPromise(second.harness.sessionContinuation(sessionId))
-        )._tag,
+        (await Effect.runPromise(second.harness.sessionContinuation(sessionId)))
+          ._tag,
       ).toBe("resumable");
       // Deleted, as Pi's session picker deletes one (Ctrl+D) or the operator by hand.
       for (const name of readdirSync(first.sessionDir)) {

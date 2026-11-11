@@ -307,7 +307,8 @@
                   where the provider's name is not known, the id a run names.
                 -->
                 <span class="model-name">{entry.label}</span>
-                <span class="model-id mono">{entry.reportedAs ?? entry.id}</span>
+                <span class="model-id mono">{entry.reportedAs ?? entry.id}</span
+                >
               {:else if entry.reportedAs !== undefined}
                 <!-- No label: the provider's name, never an alias (follow-ups A). -->
                 <span class="model-name mono">{entry.reportedAs}</span>

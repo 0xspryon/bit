@@ -59,7 +59,8 @@
     instanceId: string | null,
     providerId: string | null,
     modelId: string,
-  ): string => provenanceModelIn(app.harnesses, instanceId, providerId, modelId);
+  ): string =>
+    provenanceModelIn(app.harnesses, instanceId, providerId, modelId);
 
   /**
    * A ticking clock, so the elapsed time is live rather than frozen at render.

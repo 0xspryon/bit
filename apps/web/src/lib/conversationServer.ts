@@ -74,7 +74,10 @@ export interface ConversationAppHooks {
   readonly harnessName: (instanceId: string) => string;
   readonly harnessDriver: (instanceId: string) => string | undefined;
   /** What a screen calls a model of an instance; the id when absent (`modelNames.ts`). */
-  readonly modelName?: (instanceId: string | undefined, model: string) => string;
+  readonly modelName?: (
+    instanceId: string | undefined,
+    model: string,
+  ) => string;
 }
 
 /**
