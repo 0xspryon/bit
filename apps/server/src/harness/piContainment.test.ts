@@ -631,6 +631,11 @@ describe.skipIf(!hasPi || skipScopes)(
         const said = notice() ?? "";
         expect(said).toContain("ran out of its memory limit (300M)");
         expect(said).toContain("while a turn was in flight");
+        expect(
+          seen.flatMap((entry) =>
+            entry.detail._tag === "error" ? [entry.detail.processExit] : [],
+          ),
+        ).toEqual([{ duringTurn: true }]);
         // The scope, failed for memory, is cleared, and nothing it held is left.
         await until(() => gone(unit), "the failed scope to be cleared");
         const pids = ["nohup.pid", "setsid.pid"]
@@ -641,6 +646,51 @@ describe.skipIf(!hasPi || skipScopes)(
         // The replay says it too.
         const replay = await Effect.runPromise(f.harness.messages(ref.id));
         expect(replay.some((entry) => entry.error === said)).toBe(true);
+      } finally {
+        await close(f);
+      }
+    }, 60_000);
+
+    test("a memory stop between turns is said as an exit with no turn running, live and replayed", async () => {
+      const f = await fixture({ memoryMax: "300M" });
+      try {
+        const ref = await open(f.harness, f.work);
+        const seen = listen(f.harness, ref.id, f.scope);
+        // The turn leaves a job that eats memory a second after the turn has ended.
+        await Effect.runPromise(
+          f.harness.prompt(
+            ref.id,
+            S([
+              {
+                tool: "bash",
+                args: {
+                  command: `nohup bash -c 'sleep 1; head -c 2000M /dev/zero | python3 -c "import sys; d = sys.stdin.buffer.read()"' >/dev/null 2>&1 &\necho started`,
+                },
+              },
+              { text: "the job is running" },
+            ]),
+          ),
+        );
+        await Effect.runPromise(f.harness.waitForIdle(ref.id));
+        const exits = () =>
+          seen.flatMap((entry) =>
+            entry.detail._tag === "error" &&
+            entry.detail.processExit !== undefined
+              ? [entry.detail]
+              : [],
+          );
+        await until(() => exits().length > 0, "the exit's notice");
+        const [exit] = exits();
+        expect(exit?.processExit).toEqual({ duringTurn: false });
+        expect(exit?.message).toContain("ran out of its memory limit (300M)");
+        expect(exit?.message).not.toContain("while a turn was in flight");
+        const replay = await Effect.runPromise(f.harness.messages(ref.id));
+        const replayed = replay.filter(
+          (entry) => entry.processExit !== undefined,
+        );
+        expect(
+          replayed.map((entry) => [entry.error, entry.processExit]),
+        ).toEqual([[exit?.message, { duringTurn: false }]]);
       } finally {
         await close(f);
       }

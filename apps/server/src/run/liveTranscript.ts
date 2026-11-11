@@ -694,6 +694,31 @@ const markerItem = (
   outcome: null,
 });
 
+/**
+ * A harness's error as a `turn.other` item headed `error`, live and replayed alike. A
+ * process exit says so ({@link LiveItem.processExit}); one between turns failed no turn, so
+ * its outcome is `null` (follow-ups B, item 1).
+ */
+const errorItem = (
+  base: ItemBase,
+  message: string,
+  processExit: { readonly duringTurn: boolean } | undefined,
+): LiveItem => ({
+  ...base,
+  kind: "turn.other",
+  headline: "error",
+  body: truncateNarration(message),
+  tool: null,
+  toolName: null,
+  input: null,
+  output: null,
+  callId: null,
+  outcome: processExit?.duringTurn === false ? null : "failed",
+  ...(processExit === undefined
+    ? {}
+    : { processExit: { duringTurn: processExit.duringTurn } }),
+});
+
 /** A sub-agent's state as the contract's view: every field but the tag and the model. */
 const subagentView = (detail: SubagentState): SubagentView => ({
   callId: detail.callId,
@@ -1083,7 +1108,7 @@ export const projectReplay = (input: {
     } else if (entry.error !== undefined) {
       const said = entry.error.trim();
       if (!(entry.type === "idle" && turnErrors.has(said))) {
-        note(at, "error", entry.error, true);
+        items.push(errorItem(baseAt(at), entry.error, entry.processExit));
       }
       turnErrors.add(said);
     }
@@ -1194,18 +1219,7 @@ export const projectNarration = (item: RunNarration): LiveFrame | undefined => {
     case "error":
       // The item a replay draws for an entry's `error` (`projectReplay`), so a turn that
       // failed reads the same watched and reloaded: the harness's sentence, as its own.
-      return {
-        ...base,
-        kind: "turn.other",
-        headline: "error",
-        body: truncateNarration(detail.message),
-        tool: null,
-        toolName: null,
-        input: null,
-        output: null,
-        callId: null,
-        outcome: "failed",
-      };
+      return errorItem(base, detail.message, detail.processExit);
     case "usage":
       /*
        * One model call's measurement, as its own frame.

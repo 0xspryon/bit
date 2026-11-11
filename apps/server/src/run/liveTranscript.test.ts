@@ -65,6 +65,7 @@ import {
   type MessageEntry,
   type NarrationDetail,
 } from "../harness/agentHarness";
+import { exitNarration, withExits } from "../harness/processExit";
 import { FleetStore } from "../persistence/fleet";
 import { AWKWARD_TEXT, multiCaseInput } from "../persistence/fixtures";
 import { TargetStores } from "../persistence/targetStores";
@@ -945,6 +946,38 @@ describe("projecting live activity", () => {
       ),
     );
     expect(call?.toolName).toBe("add_scope_entry");
+  });
+
+  test("follow-ups B: a process exit is marked, live and replayed alike; one between turns failed no turn", () => {
+    const shape = (item: LiveItem | undefined) => [
+      item?.kind,
+      item?.headline,
+      item?.outcome,
+      JSON.stringify(item?.processExit ?? null),
+    ];
+    const during = { at: 1_000, message: "went mid-turn", duringTurn: true };
+    const between = { at: 2_000, message: "went between", duringTurn: false };
+    const live = [during, between].map((exit) =>
+      shape(projectedItem(narration(exitNarration(exit).detail))),
+    );
+    expect(live).toEqual([
+      ["turn.other", "error", "failed", '{"duringTurn":true}'],
+      ["turn.other", "error", null, '{"duringTurn":false}'],
+    ]);
+    const replayed = projectReplay({
+      entries: withExits([], [during, between]),
+      subject: { _tag: "import", importId: "imp_1" },
+      harnessSessionId: "ses_1",
+      users: "operator",
+      fallbackAt: 0,
+    }).items.map(shape);
+    expect(replayed).toEqual(live);
+    // A harness's own error is unmarked, as before.
+    expect(
+      shape(
+        projectedItem(narration({ _tag: "error", message: "rate limited" })),
+      ),
+    ).toEqual(["turn.other", "error", "failed", "null"]);
   });
 
   test("a reply reads as a turn, with no sequence", () => {

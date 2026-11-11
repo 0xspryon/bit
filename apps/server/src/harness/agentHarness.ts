@@ -432,6 +432,12 @@ export interface MessageEntry {
    */
   readonly endedAt?: number | null;
   /**
+   * Set on the entry a driver splices in for its **process exiting** (`withExits`), never on
+   * one the harness stored: {@link error} is then the exit's sentence, and `duringTurn` says
+   * whether a turn was running (follow-ups B, item 1). Absent on every other entry.
+   */
+  readonly processExit?: { readonly duringTurn: boolean };
+  /**
    * Set on a `user` entry the **harness wrote itself** rather than one anybody sent, by what
    * it marks; absent on everything else (A6 F10 review).
    *
@@ -728,6 +734,14 @@ export type NarrationDetail =
        */
       readonly _tag: "error";
       readonly message: string;
+      /**
+       * Set when the error is the harness **process exiting** without this server ending it
+       * (`processExit.ts`) rather than the harness reporting a turn's failure (follow-ups B,
+       * item 1): `duringTurn` says whether a turn was running when it went. A process that
+       * went between turns — Pi's scope stopped for memory with nothing running — stopped
+       * no turn, and a screen must not say it did. Absent on every other error.
+       */
+      readonly processExit?: { readonly duringTurn: boolean };
     }
   | {
       /**

@@ -1,6 +1,7 @@
 /**
- * A harness process that died mid-turn, said the same way on every driver (harness-instances
- * slice 3 fix 2, M1).
+ * A harness process that died, said the same way on every driver (harness-instances slice 3
+ * fix 2, M1), and marked as an exit — and whether a turn was running — on the narration
+ * seam and the replay, so a screen tells it from a turn the harness failed (follow-ups B).
  *
  * Neither harness stores a death. Pi's session file and Claude Code's transcript hold what
  * was finished and stop; a thread read again after a crash would show a turn with no reply
@@ -11,10 +12,16 @@
  */
 import type { HarnessNarration, MessageEntry } from "./agentHarness";
 
-/** One process exit seen mid-turn, as the thread says it. */
+/** One process exit, as the thread says it. */
 export interface ProcessExit {
   readonly at: number;
   readonly message: string;
+  /**
+   * Whether a turn was running when it went (follow-ups B, item 1). Claude Code's driver
+   * says only mid-turn exits, so always `true` there; Pi's also says a scope stopped for
+   * memory between turns, which stopped no turn.
+   */
+  readonly duringTurn: boolean;
 }
 
 /** The entry type of a process exit, live and replayed. */
@@ -39,18 +46,26 @@ export const withExits = (
       parts: [],
       model: undefined,
       at: exit.at,
+      processExit: { duringTurn: exit.duringTurn },
     });
   }
   return out;
 };
 
-/** A process exit as live narration: the harness's error, with no outcome of its own. */
+/**
+ * A process exit as live narration: the harness's error marked as an exit, with no outcome
+ * of its own.
+ */
 export const exitNarration = (exit: ProcessExit): HarnessNarration => ({
   type: PROCESS_EXIT_ENTRY,
   sequence: undefined,
   at: exit.at,
   outcome: undefined,
-  detail: { _tag: "error", message: exit.message },
+  detail: {
+    _tag: "error",
+    message: exit.message,
+    processExit: { duringTurn: exit.duringTurn },
+  },
 });
 
 /**

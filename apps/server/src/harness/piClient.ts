@@ -172,7 +172,7 @@ import {
   type MessageAttachment,
 } from "./attachments";
 import {
-  PROCESS_EXIT_ENTRY,
+  exitNarration,
   processExitMessage,
   withExits,
   type ProcessExit,
@@ -1261,6 +1261,7 @@ export const piHarness = (
               : `exited (${signal ?? `code ${String(code)}`})${when}.`;
             const exit: ProcessExit = {
               at: Date.now(),
+              duringTurn: running,
               // A plain death mid-turn is said in the words every harness uses
               // (`processExitMessage`); a memory stop has its own reason to give.
               message:
@@ -1281,15 +1282,7 @@ export const piHarness = (
               ...(exits.get(record.sessionId) ?? []),
               exit,
             ]);
-            offer(record, [
-              {
-                type: PROCESS_EXIT_ENTRY,
-                sequence: undefined,
-                at: exit.at,
-                outcome: undefined,
-                detail: { _tag: "error", message: exit.message },
-              },
-            ]);
+            offer(record, [exitNarration(exit)]);
           }
           withdrawQuestions(record);
           Deferred.doneUnsafe(

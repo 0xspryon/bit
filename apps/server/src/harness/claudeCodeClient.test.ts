@@ -10176,8 +10176,12 @@ describe("a CLI that dies mid-turn is said in the thread, live and replayed (sli
       "The Claude Code process running this session exited (SIGKILL) while a turn was in flight. What it finished is kept; how the turn would have ended is not known. A message sent while it ran had not been read yet, and went with it.",
     );
     const exits = exited(outcome.narration);
+    // Marked as the process exiting with a turn running (follow-ups B, item 1).
     expect(exits.map((entry) => [entry.detail, entry.outcome])).toEqual([
-      [{ _tag: "error", message: said }, undefined],
+      [
+        { _tag: "error", message: said, processExit: { duringTurn: true } },
+        undefined,
+      ],
     ]);
     // The last thing said before the narration ended.
     expect(outcome.narration.at(-1)?.type).toBe(PROCESS_EXIT_ENTRY);
@@ -10213,6 +10217,14 @@ describe("a CLI that dies mid-turn is said in the thread, live and replayed (sli
     expect(
       replayed.filter((item) => item.kind !== "turn.operator").map(shape),
     ).toEqual(live.map(shape));
+    // A turn's error the web captions as one, and an exit it can tell from a provider's.
+    expect(
+      live.map((item) => [
+        item.headline,
+        item.outcome,
+        JSON.stringify(item.processExit),
+      ]),
+    ).toEqual([["error", "failed", '{"duringTurn":true}']]);
   });
 
   test("between turns, after an End, and on a clean exit, nothing is said", async () => {
@@ -10344,6 +10356,7 @@ describe("a CLI that dies mid-turn is said in the thread, live and replayed (sli
           how: "SIGKILL",
           untaken: 0,
         }),
+        processExit: { duringTurn: true },
       },
     ]);
   }, 10_000);

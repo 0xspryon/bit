@@ -290,7 +290,8 @@ export const LIVE_ITEM_KINDS = [
    * Something the harness holds for a session that is neither the agent's reply, thinking
    * or tool use nor the operator's words (A6 F10), named in {@link LiveItem.headline} by the
    * harness's own word: an OpenCode `shell` or `synthetic` entry, a steer a planner round
-   * was sent (`user`), or an `error` the harness recorded on a turn (`outcome` `failed`).
+   * was sent (`user`), or an `error` the harness recorded on a turn (`outcome` `failed`) —
+   * or its process exiting, which {@link LiveItem.processExit} marks.
    * Replay only, except `error`, which is live too (A6 U4): a turn the harness ended with
    * an error of its own — a provider refusing the call — says so as it happens, with the
    * harness's sentence in `body`. Labelled with that word so it never reads as the agent
@@ -643,6 +644,19 @@ export const LiveItem = Schema.Struct({
    * other kind, and an optional key so older frames still decode.
    */
   subagent: Schema.optionalKey(SubagentView),
+  /**
+   * On a `turn.other` item headed `error`: the error is the harness **process exiting**
+   * without the server ending it — a crash, a kill, a memory stop — rather than the harness
+   * failing a turn (follow-ups B, item 1). `duringTurn` says whether a turn was running when
+   * it went: `true`, the turn it was on stopped with it (`outcome` `failed`, as a turn's
+   * error); `false`, it went between turns and stopped none (`outcome` `null`), so a screen
+   * says it neutrally and does not count it as the last turn's. Live and replayed alike,
+   * on every driver. Absent on every other item, and an optional key so older frames still
+   * decode.
+   */
+  processExit: Schema.optionalKey(
+    Schema.Struct({ duringTurn: Schema.Boolean }),
+  ),
 });
 export type LiveItem = typeof LiveItem.Type;
 

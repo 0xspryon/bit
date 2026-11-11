@@ -4139,6 +4139,7 @@ export const claudeCodeHarness = (
           (said?.[2] === undefined ? undefined : `code ${said[2]}`);
         const exit: ProcessExit = {
           at: Date.now(),
+          duringTurn: true,
           message: processExitMessage({
             process: "The Claude Code process",
             how,

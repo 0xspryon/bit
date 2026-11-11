@@ -1081,6 +1081,54 @@ describe("U4: a harness's own error", () => {
     ).toHaveLength(0);
   });
 
+  test("follow-ups B: a process that ended between turns is said neutrally, not as a turn stopped with an error, live and replayed", async () => {
+    const SENTENCE =
+      "The Pi process running this session was stopped: the session ran out of its memory limit (300M), and everything it had started was stopped with it.";
+    await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 3, {
+        kind: "turn.reply",
+        body: "Loaded.",
+        model: "m-one",
+      }),
+      at("replay", 2, 9, {
+        kind: "turn.other",
+        headline: "error",
+        body: SENTENCE,
+        outcome: null,
+        processExit: { duringTurn: false },
+      }),
+    ]);
+    const thread = document.querySelector(".importer");
+    expect(said(thread?.querySelector("li.harness-exit"))).toBe(
+      `activity Between turns, the harness process ended: ${SENTENCE}`,
+    );
+    expect(thread?.querySelector("li.harness-error")).toBeNull();
+    expect(said(thread)).not.toContain("stopped this turn");
+    // The turn above still ends at its reply (3 s), not at the exit (9 s).
+    expect(footers()).toEqual(["Importer · m-one · 3s"]);
+  });
+
+  test("follow-ups B: a process that ended mid-turn is still the turn's error", async () => {
+    const SENTENCE =
+      "The Pi process running this session exited (SIGKILL) while a turn was in flight.";
+    await openWith([
+      OPERATOR("replay", 0, "Load the scope"),
+      at("replay", 1, 4, {
+        kind: "turn.other",
+        headline: "error",
+        body: SENTENCE,
+        outcome: "failed",
+        processExit: { duringTurn: true },
+      }),
+    ]);
+    const thread = document.querySelector(".importer");
+    expect(said(thread?.querySelector("li.harness-error"))).toBe(
+      `activity The harness stopped this turn with an error: ${SENTENCE}`,
+    );
+    expect(thread?.querySelector("li.harness-exit")).toBeNull();
+  });
+
   test("a turn stopped after a tool call, before it answered, gets its footer too", async () => {
     await openWith([
       OPERATOR("replay", 0, "Load the scope"),

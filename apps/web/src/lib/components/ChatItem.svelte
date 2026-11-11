@@ -167,6 +167,18 @@
   );
 
   /**
+   * The harness's process ended **between turns** (follow-ups B, item 1): a Pi session's
+   * scope stopped for memory with nothing running, say. No turn was cut, so it is said
+   * neutrally, not as the turn above having stopped with an error. One that went mid-turn
+   * is {@link harnessError}, captioned as a turn's error, as before.
+   */
+  let exitBetweenTurns = $derived(
+    item.kind === "turn.other" &&
+      item.headline === "error" &&
+      item.processExit?.duringTurn === false,
+  );
+
+  /**
    * A thought's collapsed line: its first line with words in it, the markdown that would
    * only be noise in one line (a heading's hashes, emphasis, code ticks) taken off. The
    * whole thought, as markdown, is what opens under it.
@@ -267,6 +279,16 @@
           reload shows it only while the harness still has it.
         </p>
       </details>
+    </li>
+  {:else if exitBetweenTurns}
+    <!--
+      The process ended with no turn running: the harness's sentence, under a caption that
+      claims no stopped turn. The next message carries the conversation on.
+    -->
+    <li class="prose harness-exit" data-origin={item.origin}>
+      <span class="visually-hidden">{item.origin}</span>
+      <p class="error-head">Between turns, the harness process ended:</p>
+      <p class="error-text"><MarkedText text={item.body} /></p>
     </li>
   {:else if harnessError}
     <!--
@@ -911,6 +933,19 @@
   }
   .harness-error .error-text {
     color: var(--state-fg-danger);
+  }
+  /* Not a turn's failure: said in the quiet colours of a note, not the danger ones. */
+  .harness-exit {
+    padding-left: 12px;
+    border-left: 2px solid var(--border-strong);
+  }
+  .harness-exit .error-head {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 18px;
+  }
+  .harness-exit .error-text {
+    color: var(--text-base);
   }
   .prose .aside {
     margin-top: 4px;
