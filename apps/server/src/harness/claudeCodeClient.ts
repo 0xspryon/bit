@@ -212,6 +212,10 @@ import {
   type InstanceId,
   type ModelProvenance,
 } from "./identity";
+import {
+  readLearnedModelNames,
+  writeLearnedModelNames,
+} from "./learnedModelNames";
 import { modelSpellings, type ModelSpellings } from "./modelSpellings";
 import {
   exitNarration,
@@ -1114,6 +1118,12 @@ export interface ClaudeCodeHarnessOptions {
    * provider).
    */
   readonly maxRetries?: number;
+  /**
+   * Where the provider names this instance's sessions reported are kept across restarts
+   * (`learnedModelNames.ts`, follow-ups A review M2). Absent: they are known to this
+   * process only.
+   */
+  readonly learnedModelNamesFile?: string;
   /** The model a run gets when it names none. */
   readonly defaultModel?: string;
   /** Swapped out by tests. Defaults to {@link liveClaudeCodeSdk}. */
@@ -3665,8 +3675,29 @@ export const claudeCodeHarness = (
         (options.models === undefined
           ? CLAUDE_CODE_DEFAULT_MODEL
           : (catalogue[0]?.id ?? CLAUDE_CODE_DEFAULT_MODEL));
-      /** Frame spellings back to catalogue ids; see `modelSpellings.ts`. */
-      const spellings = modelSpellings(options.models ?? catalogue);
+      /**
+       * Frame spellings back to catalogue ids; see `modelSpellings.ts`. What earlier runs
+       * learned live is read back first, and what this one learns is kept for the next
+       * (`learnedModelNames.ts`).
+       */
+      const keptNames = options.learnedModelNamesFile;
+      const spellings = modelSpellings(
+        options.models ?? catalogue,
+        keptNames === undefined
+          ? undefined
+          : {
+              names: readLearnedModelNames(keptNames),
+              learned: (names) => {
+                if (writeLearnedModelNames(keptNames, names)) return;
+                void Effect.runPromise(
+                  Effect.logWarning(
+                    "could not keep the model names a Claude Code session reported; a restart shows the catalogue's aliases until a session reports them again",
+                    { file: keptNames },
+                  ),
+                ).catch(() => undefined);
+              },
+            },
+      );
       /**
        * What every CLI of this instance is given beyond the server's environment (which
        * `spawnOwnedCli` scrubs of bit's own settings). `undefined` when nothing is, so the

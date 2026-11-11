@@ -36,6 +36,11 @@
  *    session is on, in the provider's spelling, at a moment the harness knows which
  *    catalogue entry it asked for.
  *
+ * 3. **Kept**: what earlier runs of this server learned live, read back at startup
+ *    (`learnedModelNames.ts`, follow-ups A review M2), so a restart does not put the alias
+ *    back until a session speaks again. Read first: a declared name, then a live answer,
+ *    each take its place.
+ *
  * Two catalogue entries can resolve to one provider model (z.ai maps `sonnet` and `haiku`
  * both to `glm-5.3-flash`). The session's own model wins where it is one of them; otherwise
  * the entry learned most recently.
@@ -72,27 +77,52 @@ export const modelSpellings = (
     readonly id: string;
     readonly reportedAs?: string | undefined;
   }[],
+  kept?: {
+    /** Catalogue id → provider name, as earlier runs learned them live. */
+    readonly names: ReadonlyMap<string, string>;
+    /**
+     * Told every name learned live, whenever one is new or changed: what to keep for the
+     * next run. Never told the declared ones, which the configuration already keeps.
+     */
+    readonly learned: (names: ReadonlyMap<string, string>) => void;
+  },
 ): ModelSpellings => {
   const catalogueKeys = new Set(catalogue.map((entry) => modelKey(entry.id)));
   /** Provider spelling (keyed) → catalogue ids, oldest first. */
   const learned = new Map<string, string[]>();
   /** Catalogue id → the provider's spelling of it, as last reported. */
   const named = new Map<string, string>();
+  /** The names learned live, this run's and kept ones: what {@link kept} is told. */
+  const live = new Map<string, string>(kept?.names ?? []);
 
-  const learn: ModelSpellings["learn"] = (reported, asked) => {
-    if (reported === undefined || asked === undefined) return;
-    if (reported.trim() === "" || asked.trim() === "") return;
+  /** Records one pairing; whether it was taken (an alias for another name). */
+  const take = (
+    reported: string | undefined,
+    asked: string | undefined,
+  ): boolean => {
+    if (reported === undefined || asked === undefined) return false;
+    if (reported.trim() === "" || asked.trim() === "") return false;
     const key = modelKey(reported);
-    if (key === modelKey(asked) || catalogueKeys.has(key)) return;
+    if (key === modelKey(asked) || catalogueKeys.has(key)) return false;
     const ids = learned.get(key) ?? [];
     const at = ids.indexOf(asked);
     if (at !== -1) ids.splice(at, 1);
     ids.push(asked);
     learned.set(key, ids);
     named.set(asked, reported.trim());
+    return true;
   };
 
-  for (const entry of catalogue) learn(entry.reportedAs, entry.id);
+  const learn: ModelSpellings["learn"] = (reported, asked) => {
+    if (!take(reported, asked) || asked === undefined) return;
+    const name = named.get(asked);
+    if (name === undefined || live.get(asked) === name) return;
+    live.set(asked, name);
+    kept?.learned(new Map(live));
+  };
+
+  for (const [id, name] of kept?.names ?? []) take(name, id);
+  for (const entry of catalogue) take(entry.reportedAs, entry.id);
 
   return {
     learn,

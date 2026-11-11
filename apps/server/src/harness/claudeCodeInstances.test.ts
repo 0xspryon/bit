@@ -7,6 +7,9 @@
  * does with what the SDK says, and what it asks the SDK for.
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type {
   Options,
@@ -26,6 +29,7 @@ import {
   type HarnessQuery,
 } from "./claudeCodeClient";
 import { InstanceId } from "./identity";
+import { readLearnedModelNames } from "./learnedModelNames";
 
 interface Script {
   readonly messages?: readonly SDKMessage[];
@@ -386,6 +390,80 @@ describe("an aliasing provider's model spellings", () => {
     );
     expect(learned.before).toEqual([undefined, undefined]);
     expect(learned.after).toEqual(["glm-5.3-flash", undefined]);
+  });
+
+  test("a provider's name a session reported is kept for the next run: the picker, a replay and the meter say the model, not the alias (follow-ups A review, M2)", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "bit-model-names-"));
+    const file = join(folder, "cc-zai.json");
+    try {
+      const { sdk } = scriptedSdk({
+        messages: [init("glm-5.3"), assistant("glm-5.3"), success],
+      });
+      await withHarness(
+        {
+          ...ZAI,
+          sdk,
+          models: [{ id: "sonnet" }, { id: "opus" }],
+          learnedModelNamesFile: file,
+        },
+        (harness) => turn(harness, "opus"),
+      );
+      expect(readLearnedModelNames(file)).toEqual(
+        new Map([["opus", "glm-5.3"]]),
+      );
+
+      // The next run: no session has said anything yet.
+      const restarted = scriptedSdk({
+        transcript: [
+          {
+            type: "assistant",
+            uuid: "u1",
+            session_id: "s",
+            message: {
+              id: "msg_1",
+              model: "glm-5.3",
+              content: [{ type: "text", text: "stored" }],
+              usage: { input_tokens: 5, output_tokens: 1 },
+            },
+            parent_tool_use_id: null,
+            parent_agent_id: null,
+          },
+        ],
+      });
+      const after = await withHarness(
+        {
+          ...ZAI,
+          sdk: restarted.sdk,
+          models: [{ id: "sonnet" }, { id: "opus" }],
+          learnedModelNamesFile: file,
+        },
+        (harness) =>
+          Effect.gen(function* () {
+            const sessionId = newClaudeCodeSessionId();
+            return {
+              names: harness.instance.models.map((entry) => [
+                entry.id,
+                entry.reportedAs,
+              ]),
+              replayed: (yield* harness.messages(sessionId)).map(
+                (entry) => entry.model,
+              ),
+              measured: (yield* harness.contextUsage(sessionId, {
+                model: "opus",
+                breakdown: false,
+              })).usedModel,
+            };
+          }),
+      );
+      expect(after.names).toEqual([
+        ["sonnet", undefined],
+        ["opus", "glm-5.3"],
+      ]);
+      expect(after.replayed).toEqual(["opus"]);
+      expect(after.measured).toBe("opus");
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
   });
 
   test("a declared spelling is read before any session said it: a replay after a restart", async () => {

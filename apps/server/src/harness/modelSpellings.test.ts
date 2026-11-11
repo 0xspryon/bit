@@ -3,7 +3,14 @@
  * on z.ai and on the operator's Anthropic login (CLI 2.1.310).
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import {
+  readLearnedModelNames,
+  writeLearnedModelNames,
+} from "./learnedModelNames";
 import { modelSpellings } from "./modelSpellings";
 
 describe("an aliasing instance", () => {
@@ -86,5 +93,59 @@ describe("the provider's name of a catalogue entry", () => {
     expect(spellings.providerName("sonnet")).toBe("glm-5.3-flash");
     spellings.learn("claude-haiku-4-5-20251001", "claude-haiku-4-5");
     expect(spellings.providerName("claude-haiku-4-5")).toBeUndefined();
+  });
+});
+
+describe("names kept from an earlier run (follow-ups A review, M2)", () => {
+  test("are read first: a declared name, then a live answer, take their place, and only live answers are kept", () => {
+    const kept: ReadonlyMap<string, string>[] = [];
+    const spellings = modelSpellings(
+      [
+        { id: "opus", reportedAs: "glm-5.3" },
+        { id: "sonnet" },
+        { id: "haiku" },
+      ],
+      {
+        names: new Map([
+          ["opus", "glm-old"],
+          ["sonnet", "glm-5.3-flash"],
+        ]),
+        learned: (names) => kept.push(names),
+      },
+    );
+    // Declared beats kept; kept is there before any session spoke.
+    expect(spellings.providerName("opus")).toBe("glm-5.3");
+    expect(spellings.providerName("sonnet")).toBe("glm-5.3-flash");
+    expect(spellings.toCatalogue("glm-5.3-flash", undefined)).toBe("sonnet");
+    expect(kept).toEqual([]);
+    // The same answer again keeps nothing new; a new one is kept with the rest.
+    spellings.learn("glm-5.3-flash", "sonnet");
+    expect(kept).toEqual([]);
+    spellings.learn("glm-5.3-air", "haiku");
+    expect(kept.map((names) => [...names])).toEqual([
+      [
+        ["opus", "glm-old"],
+        ["sonnet", "glm-5.3-flash"],
+        ["haiku", "glm-5.3-air"],
+      ],
+    ]);
+  });
+
+  test("a missing, broken or wrongly shaped file is no names, and a written one reads back", () => {
+    const folder = mkdtempSync(join(tmpdir(), "bit-kept-names-"));
+    try {
+      const file = join(folder, "nested", "cc.json");
+      expect(readLearnedModelNames(file).size).toBe(0);
+      expect(writeLearnedModelNames(file, new Map([["opus", "glm-5.3"]]))).toBe(
+        true,
+      );
+      expect([...readLearnedModelNames(file)]).toEqual([["opus", "glm-5.3"]]);
+      writeFileSync(file, "{ not json");
+      expect(readLearnedModelNames(file).size).toBe(0);
+      writeFileSync(file, JSON.stringify({ names: { opus: 3 } }));
+      expect(readLearnedModelNames(file).size).toBe(0);
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
   });
 });

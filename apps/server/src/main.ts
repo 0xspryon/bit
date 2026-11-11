@@ -140,6 +140,7 @@ import {
   openCodeHarness,
 } from "./harness/openCodeClient";
 import { OpenCodeServer } from "./harness/openCodeServer";
+import { learnedModelNamesFile } from "./harness/learnedModelNames";
 import { piHarness } from "./harness/piClient";
 import {
   ownedProcessDirectory,
@@ -733,6 +734,10 @@ const claudeCodeCandidate = (
         ...(config.maxRetries === undefined
           ? {}
           : { maxRetries: config.maxRetries }),
+        learnedModelNamesFile: learnedModelNamesFile(
+          HUNT_ROOT,
+          config.instanceId,
+        ),
       }),
     ),
     setup:
