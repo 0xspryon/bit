@@ -49,6 +49,7 @@ import {
   conversationTurnAcceptedFields,
   conversationViewFields,
 } from "./conversation";
+import { ModelOptionSelection } from "./modelOption";
 
 /**
  * The three tools the importer has, and the only three values this can ever hold.
@@ -294,6 +295,13 @@ export const ImporterSessionView = Schema.Struct({
    * closed and opened again would carry more than one — and a message goes to the latest.
    */
   importId: Schema.String,
+  /**
+   * What the session's model is set to now — its reasoning or thinking level — as the
+   * latest run recorded it (`0028`): the options its first message or its last switch
+   * resolved. Absent: nothing chosen, so the harness's own default. What a picker reopened
+   * after a reload starts from, and what the chip says beside the model.
+   */
+  modelOptions: Schema.optional(Schema.Array(ModelOptionSelection)),
   tally: ImporterSessionTally,
 });
 export type ImporterSessionView = typeof ImporterSessionView.Type;

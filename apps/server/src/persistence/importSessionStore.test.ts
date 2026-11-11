@@ -508,6 +508,50 @@ describe("what an import's session was opened with, and may cite (0028, 0029)", 
     expect(outcome.plain?.pages).toBeNull();
   });
 
+  test("the session index carries its latest run's model options, a switch's included, and nothing as null (follow-ups A)", async () => {
+    const path = newDatabasePath();
+    const outcome = await withStore(path, (store) =>
+      Effect.gen(function* () {
+        yield* open(store, "imp_plain");
+        yield* Effect.sleep("2 millis");
+        yield* store.recordImportSession({
+          importId: "imp_pi",
+          targetId: TARGET,
+          harnessSessionId: "ses_pi",
+          harnessInstanceId: "pi-zai",
+          model: "zai/glm-5.3-flash",
+          agentId: "importer",
+          modelOptions: [{ id: "thinkingLevel", value: "low" }],
+        });
+        yield* store.confirmImportSession("imp_pi");
+        // Reopened under a successor run, then switched there: the latest run's is read.
+        yield* Effect.sleep("2 millis");
+        yield* store.recordImportSession({
+          importId: "imp_pi_2",
+          targetId: TARGET,
+          harnessSessionId: "ses_pi",
+          harnessInstanceId: "pi-zai",
+          model: "zai/glm-5.3-flash",
+          agentId: "importer",
+          modelOptions: [{ id: "thinkingLevel", value: "low" }],
+        });
+        yield* store.confirmImportSession("imp_pi_2");
+        yield* store.recordImportSessionModel({
+          importId: "imp_pi_2",
+          model: "zai/glm-5.3-flash",
+          modelOptions: [{ id: "thinkingLevel", value: "high" }],
+        });
+        return yield* store.importSessions(TARGET);
+      }),
+    );
+    expect(
+      outcome.map((session) => [session.harnessSessionId, session.modelOptions]),
+    ).toEqual([
+      ["ses_pi", [{ id: "thinkingLevel", value: "high" }]],
+      ["ses_imp_plain", null],
+    ]);
+  });
+
   test("a widened page list is rewritten whole; an unknown import changes nothing", async () => {
     const path = newDatabasePath();
     const later = "https://hackerone.test/acme/scope-update";

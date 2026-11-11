@@ -409,12 +409,9 @@ export interface ConversationSession<
   readonly harnessInstanceId?: string;
   /**
    * What the session's model is set to, when this tab knows: the options its opening
-   * message sent, or what the server answered a switch with. Absent when unknown.
-   *
-   * V2(chat): the index row does not carry a session's model options, so after a reload the
-   * picker's Reasoning column starts on the model's default rather than the session's own
-   * setting — which is still what a switch from there sends, since the server sets exactly
-   * the options a switch names. V2 puts `modelOptions` on `ImporterSessionView`.
+   * message sent, what the server answered a switch with, or — after a reload — what the
+   * importer's index row recorded (`ImporterSessionView.modelOptions`). Absent when unknown
+   * or nothing was chosen.
    */
   readonly modelOptions?: readonly ModelOptionSelection[];
   /**
@@ -1692,6 +1689,8 @@ const modelPhrase = (
     ? model
     : `${model} (${options.map((each) => `${each.id}: ${each.value}`).join(", ")})`;
 
+const asGiven = (model: string): string => model;
+
 /**
  * What the composer says once a model switch was accepted (A6 F4, U3), honest about when
  * it applies.
@@ -1722,14 +1721,19 @@ export const switchedNotice = (input: {
   readonly turnEnded?: boolean;
   /** The agent, by role, as a sentence names it: `importer`. */
   readonly agent?: string;
+  /** What a model is called on screen (`modelNames.ts`); the id when absent. */
+  readonly name?: (model: string) => string;
 }): string => {
-  const { switched, previous, working } = input;
-  const now = modelPhrase(switched.model, switched.modelOptions);
+  const { switched, working } = input;
+  const name = input.name ?? asGiven;
+  const model = name(switched.model);
+  const previous = name(input.previous);
+  const now = modelPhrase(model, switched.modelOptions);
   const dropped = switched.droppedModelOptionIds;
   const droppedLine =
     dropped.length === 0
       ? ""
-      : ` ${switched.model} does not offer ${dropped.join(", ")}, so ${
+      : ` ${model} does not offer ${dropped.join(", ")}, so ${
           dropped.length === 1 ? "that setting was" : "those settings were"
         } not sent.`;
   if (!switched.changed) {
@@ -1737,11 +1741,11 @@ export const switchedNotice = (input: {
   }
   const head = `Now on ${now}.`;
   if (switched.applied === "recorded") {
-    return `${head} This session is not running on this server, so the change is recorded and your next message reopens it on ${switched.model}.${droppedLine}`;
+    return `${head} This session is not running on this server, so the change is recorded and your next message reopens it on ${model}.${droppedLine}`;
   }
   if (working) {
     const before =
-      previous === switched.model ? "its earlier settings" : previous;
+      input.previous === switched.model ? "its earlier settings" : previous;
     if (input.turnEnded === true) {
       return `${head} The turn that was running finished its step on ${before} and used the new model for any model call after it. Your next message runs on it.${droppedLine}`;
     }

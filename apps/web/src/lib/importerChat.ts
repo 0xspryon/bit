@@ -228,6 +228,9 @@ export const indexedSession = (
   ...(view.harnessInstanceId === null
     ? {}
     : { harnessInstanceId: view.harnessInstanceId }),
+  ...(view.modelOptions === undefined
+    ? {}
+    : { modelOptions: view.modelOptions }),
   ...(view.endedReason === "operator" ? { ended: true } : {}),
   ...(strandedOn === undefined ? {} : { strandedOn }),
 });

@@ -1621,6 +1621,10 @@ const fleetHandlers = HttpApiBuilder.group(
                 sessionId: session.harnessSessionId,
                 harnessInstanceId: session.harnessInstanceId,
                 model: session.model,
+                ...(session.modelOptions === null ||
+                session.modelOptions.length === 0
+                  ? {}
+                  : { modelOptions: session.modelOptions }),
                 openedAt: session.openedAt,
                 title: titles.get(session.harnessSessionId) ?? null,
                 running: views.some((view) => view?.status === "running"),

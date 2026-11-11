@@ -6796,6 +6796,7 @@ const makeStore = Effect.fnUntraced(function* () {
     harness_session_id: Schema.String,
     harness_instance_id: Schema.NullOr(Schema.String),
     model: Schema.String,
+    model_options: Schema.NullOr(jsonModelOptions),
     opened_at: Schema.Finite,
     import_ids: Schema.String,
     entries_in: Schema.Finite,
@@ -6864,7 +6865,8 @@ const makeStore = Effect.fnUntraced(function* () {
    * says what the conversation is on now and will reopen on. The other columns read from the
    * opening row cannot differ along a session: `opened_at` is meant to be the opening's,
    * `agent_id` is pinned once the first message is sent, and a switch stays within the
-   * pinned `harness_instance_id`.
+   * pinned `harness_instance_id`. **`model_options` is the latest run's** for the same reason:
+   * a switch writes the options with the model.
    */
   const selectImportSessions = SqlSchema.findAll({
     Request: Schema.String,
@@ -6879,6 +6881,12 @@ const makeStore = Effect.fnUntraced(function* () {
                 AND r.session_created_at IS NOT NULL
               ORDER BY r.opened_at DESC, r.import_id DESC
               LIMIT 1) AS model,
+            (SELECT r.model_options FROM import_sessions r
+              WHERE r.target_id = s.target_id
+                AND r.harness_session_id = s.harness_session_id
+                AND r.session_created_at IS NOT NULL
+              ORDER BY r.opened_at DESC, r.import_id DESC
+              LIMIT 1) AS model_options,
             s.opened_at AS opened_at,
             s.agent_id AS agent_id,
             (SELECT group_concat(r.import_id) FROM import_sessions r
@@ -6960,6 +6968,7 @@ const makeStore = Effect.fnUntraced(function* () {
         harnessSessionId: row.harness_session_id,
         harnessInstanceId: row.harness_instance_id,
         model: row.model,
+        modelOptions: row.model_options,
         openedAt: row.opened_at,
         importIds: row.import_ids.split(","),
         entriesIn: row.entries_in,
@@ -9568,6 +9577,8 @@ export class ObservationStore extends Context.Service<
         readonly harnessInstanceId: string | null;
         /** The model of its latest run, which a switch may have changed (A6 F4). */
         readonly model: string;
+        /** What that model is set to (`0028`), from the same run; `null` for nothing. */
+        readonly modelOptions: readonly ModelOptionSelection[] | null;
         readonly openedAt: number;
         /** Every import run on this session, so a caller can ask which are still live. */
         readonly importIds: readonly string[];
