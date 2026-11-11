@@ -32,8 +32,9 @@
  * chosen level is `--thinking` at the process's start, a resume included (Pi honours it
  * there, measured), and `set_thinking_level` on a live switch, after any `set_model` (which
  * keeps the old level, clamped, unless Pi's settings name one for the new model). Nothing
- * chosen is nothing sent: Pi's default at a start, and on a live switch back from a chosen
- * level, the level Pi says it would start that model at.
+ * chosen is nothing sent at a new session's start, where Pi starts at its default. A resume
+ * and a live switch back from a chosen level are told the level Pi says it would start the
+ * model at (a short probe), since Pi otherwise keeps the level it was last at.
  *
  * **One process per session, started at the session's first prompt**, not at
  * `createSession`, for the reason the Claude Code driver holds its query until then: the
@@ -1310,6 +1311,33 @@ export const piHarness = (
         }
       };
 
+      /**
+       * The level a **resume** at "Pi's default" starts at (follow-ups A review, M1): what Pi
+       * starts the model at here when told nothing, asked of Pi (`defaultLevel`). Pi takes
+       * no `--thinking` on a resume as "keep the file's last level", so a session left at
+       * `low` and switched to the default while no process held it — the switch only
+       * recorded — would resume at `low` under a chip saying "Pi's default". A new session
+       * needs nothing: Pi starts it at its default. `undefined` for a model with no levels,
+       * and where Pi would not say (logged): the resume then keeps the file's level, as
+       * before, rather than failing over a setting.
+       */
+      const resumedAtDefault = (
+        record: SessionRecord,
+      ): Effect.Effect<PiThinkingLevel | undefined> =>
+        !record.resumed || levelsOf(record.model).length === 0
+          ? Effect.succeed(undefined)
+          : defaultLevel(record.model, record.directory).pipe(
+              Effect.catch((failure) =>
+                Effect.as(
+                  Effect.logWarning(
+                    "Pi would not say which thinking level is its default; the session resumes at the level its file last recorded",
+                    { sessionId: record.sessionId, detail: failure.detail },
+                  ),
+                  undefined,
+                ),
+              ),
+            );
+
       /** Starts the session's process and gives it its opening prompt. */
       const launch = (
         record: SessionRecord,
@@ -1341,6 +1369,7 @@ export const piHarness = (
               ),
             );
           }
+          const thinking = record.thinking ?? (yield* resumedAtDefault(record));
           const args = [
             "--mode",
             "rpc",
@@ -1351,9 +1380,7 @@ export const piHarness = (
             "--model",
             record.model,
             // A resume too: Pi applies the flag over the level the file recorded (measured).
-            ...(record.thinking === undefined
-              ? []
-              : ["--thinking", record.thinking]),
+            ...(thinking === undefined ? [] : ["--thinking", thinking]),
             // A resume keeps the name it was given; naming it again appends another
             // `session_info` entry (measured).
             ...(record.resumed ? [] : ["--name", record.title]),

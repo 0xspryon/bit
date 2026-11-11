@@ -23,8 +23,9 @@
  *
  * "Pi's default" is what Pi starts a session at when told nothing: its settings'
  * per-model level, else its default level, else `medium`, clamped to what the model offers.
- * bit never reads Pi's settings, so it cannot name that level; at a start it simply passes
- * no `--thinking`. A live switch back to it asks Pi itself (`piClient.ts`, `defaultLevel`).
+ * bit never reads Pi's settings, so it cannot name that level; a new session's start simply
+ * passes no `--thinking`. A resume and a live switch back to it ask Pi itself
+ * (`piClient.ts`, `defaultLevel`): Pi keeps a resumed file's last level when told nothing.
  */
 import {
   MODEL_OPTION_DEFAULT_CHOICE,

@@ -969,6 +969,71 @@ describe.skipIf(!hasPi)("piHarness against a real pi --mode rpc", () => {
     }
   });
 
+  test("a resume at Pi's default runs at Pi's default, not at the level the file was left at — chosen at the resume or by a switch recorded before it", async () => {
+    const folders = await fixture();
+    await close(folders);
+    const work = folders.work;
+    const sessionId = crypto.randomUUID();
+    /** One server's life: a session resumed (or created) and given one message. */
+    const life = async (input: {
+      readonly resume: boolean;
+      readonly level: string;
+      readonly recordedSwitchTo?: string;
+      readonly text: string;
+    }) => {
+      const f = await fixture(
+        {},
+        { records: join(work, "..", "records"), work },
+      );
+      try {
+        await Effect.runPromise(
+          f.harness.createSession({
+            title: "bit test session",
+            model: "fake/fake-think",
+            directory: work,
+            ...(input.resume ? { resume: sessionId } : { sessionId }),
+            multiTurn: true,
+            options: [{ id: PI_THINKING_OPTION, value: input.level }],
+          }),
+        );
+        if (input.recordedSwitchTo !== undefined) {
+          // No process holds the session yet: the switch is only recorded.
+          await Effect.runPromise(
+            f.harness.switchModel(sessionId, "fake/fake-think", [
+              { id: PI_THINKING_OPTION, value: input.recordedSwitchTo },
+            ]),
+          );
+        }
+        await Effect.runPromise(
+          f.harness.prompt(sessionId, S([{ text: input.text }])),
+        );
+        await Effect.runPromise(f.harness.waitForIdle(sessionId));
+        await Effect.runPromise(f.harness.endSession({ id: sessionId }));
+        return model.requests.at(-1)?.reasoningEffort;
+      } finally {
+        await close(f);
+      }
+    };
+    // Left at `low`; Pi's default for this model here is its `medium`, clamped up to `high`.
+    expect(await life({ resume: false, level: "low", text: "one" })).toBe(
+      "low",
+    );
+    expect(await life({ resume: true, level: "default", text: "two" })).toBe(
+      "high",
+    );
+    expect(await life({ resume: true, level: "low", text: "three" })).toBe(
+      "low",
+    );
+    expect(
+      await life({
+        resume: true,
+        level: "low",
+        recordedSwitchTo: "default",
+        text: "four",
+      }),
+    ).toBe("high");
+  }, 60_000);
+
   test("a session is stored where Pi keeps it, so Pi itself opens it by id from its own folder", async () => {
     const f = await fixture();
     try {
