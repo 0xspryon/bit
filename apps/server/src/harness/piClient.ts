@@ -353,8 +353,12 @@ const command = (
 ): Effect.Effect<Response, HarnessTransportError> => {
   const operation = `pi.${String(body.type)}`;
   return Effect.callback<Response, HarnessTransportError>((resume) => {
+    // Not-found, as every other path that finds the process gone says it: a message that
+    // arrives between the exit and `died` (which first asks the scope about memory, a few
+    // ms) then reopens the session instead of closing its period as refused (pi-cgroup
+    // review, L3).
     if (rpc.exited) {
-      resume(Effect.fail(transport(operation, "the Pi process has exited")));
+      resume(Effect.fail(notFound(operation, "the Pi process has exited")));
       return;
     }
     rpc.next += 1;

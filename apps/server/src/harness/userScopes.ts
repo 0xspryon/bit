@@ -54,8 +54,12 @@
  * itself; one that ended `failed` (an OOM kill) is cleared with `reset-failed`.
  *
  * **Not a sandbox.** The user owns the cgroup tree the user manager delegates, so a process
- * that means to can move itself out (`echo $$ > …/app.slice/cgroup.procs`). This contains
- * what an agent leaves running by accident, as the tree tracker did, without its gaps.
+ * that means to can move itself out (`echo $$ > …/app.slice/cgroup.procs`), and an agent's
+ * shell can ask the user manager for a unit of its own (`systemd-run --user …`, which finds
+ * the user bus at `/run/user/$UID/bus` even without `DBUS_SESSION_BUS_ADDRESS`): that unit
+ * is outside this scope and survives End and the reaper (verified, pi-cgroup review). This
+ * contains what an agent leaves running by accident, as the tree tracker did, without its
+ * gaps; containing a deliberate escape needs a sandbox without the user bus (e.g. bwrap).
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
