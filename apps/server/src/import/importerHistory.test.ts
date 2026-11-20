@@ -216,9 +216,10 @@ describe("the five answers, each with its own sentence", () => {
                   cause: undefined,
                 }),
               ),
+            // As the driver words it (`piClient.ts`'s sessionContinuation).
             sessionContinuation: continuing({
               _tag: "unresumable",
-              detail: gone,
+              detail: `${gone}; there is no conversation to carry on`,
             }),
           }),
         },
@@ -228,6 +229,9 @@ describe("the five answers, each with its own sentence", () => {
     expect(view.note).toContain(`${gone}.`);
     expect(view.note).not.toContain("delete them");
     expect(view.note).toContain("Scope tab");
+    // Said once: the continuation sentence does not repeat why (follow-ups B review, 1).
+    expect(view.note.split(gone).length - 1).toBe(1);
+    expect(view.note).toContain("it cannot be carried on. Your next message");
   });
 
   test("a harness that would not answer is forgotten too, and says it differently", async () => {

@@ -38,7 +38,14 @@
   import ChatItem from "./ChatItem.svelte";
   import ScenarioBar from "./ScenarioBar.svelte";
   import { IconAngleDown, IconAngleUp, IconBlocked } from "../icons";
-  import { blockKeys, foldSubagents, kindLabel, streamStates } from "../chat";
+  import {
+    BETWEEN_TURNS_EXIT_HEADLINE,
+    blockKeys,
+    foldSubagents,
+    isExitBetweenTurns,
+    kindLabel,
+    streamStates,
+  } from "../chat";
   import MarkedText from "./MarkedText.svelte";
   import type { App } from "../app.svelte";
   import { atBottom } from "../scroll";
@@ -228,9 +235,13 @@
             zero-width and tag characters) and it is an isolate of its own: a control in it
             cannot reorder it or move the bar around it.
           -->
-          <span class="headline"
-            ><MarkedText text={newest.headline} code /></span
-          >
+          {#if isExitBetweenTurns(newest)}
+            <span class="headline">{BETWEEN_TURNS_EXIT_HEADLINE}</span>
+          {:else}
+            <span class="headline"
+              ><MarkedText text={newest.headline} code /></span
+            >
+          {/if}
         {:else if about && app.liveWatching}
           Nothing yet — a run's turns, tool calls and results appear here.
         {/if}

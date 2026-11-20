@@ -198,6 +198,23 @@ export const REPLY_KIND = "turn.reply";
 export const kindLabel = (kind: string): string => KIND_LABELS[kind] ?? kind;
 
 /**
+ * Whether an item is the harness's process ending **between turns** (follow-ups B, item 1):
+ * no turn was cut, so it is said neutrally rather than as a turn's error. One that went
+ * mid-turn keeps the harness's own `error` headline.
+ */
+export const isExitBetweenTurns = (item: LiveItem): boolean =>
+  item.kind === "turn.other" &&
+  item.headline === "error" &&
+  item.processExit?.duringTurn === false;
+
+/**
+ * What the Live bar's collapsed line says after the item's kind: the item's headline, except
+ * for a process that ended between turns, whose headline would be the harness's `error`
+ * (follow-ups B review, finding 3).
+ */
+export const BETWEEN_TURNS_EXIT_HEADLINE = "process ended between turns";
+
+/**
  * Which tint an outcome gets.
  *
  * The vocabularies are deliberately not normalised in the contract — an observation's

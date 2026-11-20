@@ -283,6 +283,29 @@ describe("modelsWithoutSpelling", () => {
       throw new Error(`not configured: ${result._tag}`);
     expect(modelsWithoutSpelling(result.instances)).toEqual([]);
   });
+
+  test("a model a session already reported a name for is not named again", () => {
+    const result = decode({
+      instances: [
+        {
+          id: "cc-zai",
+          driver: "claude-code",
+          configDir: ZAI,
+          models: [{ id: "opus" }, { id: "sonnet" }],
+        },
+        { id: "cc-stock", driver: "claude-code", configDir: ZAI },
+      ],
+    });
+    if (result._tag !== "configured")
+      throw new Error(`not configured: ${result._tag}`);
+    const learned = (instanceId: string): ReadonlyMap<string, string> =>
+      instanceId === "cc-zai"
+        ? new Map([["opus", "glm-5.3"]])
+        : new Map([["sonnet", "glm-5.3-flash"]]);
+    expect(modelsWithoutSpelling(result.instances, learned)).toEqual([
+      { id: "cc-zai", models: ["sonnet"] },
+    ]);
+  });
 });
 
 describe("a Pi instance", () => {

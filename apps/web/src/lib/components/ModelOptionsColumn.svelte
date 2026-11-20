@@ -133,8 +133,10 @@
   {/if}
 
   <p class="models-note">
-    Only what you set here is sent. A model left on its default is sent nothing,
-    so the harness applies its own.
+    Only what you set here is sent. A model left on its default runs at the
+    harness's own default. When a Pi session resumes, bit asks Pi for that
+    default and passes it on, so the session does not keep a level chosen
+    earlier.
   </p>
 {/if}
 

@@ -277,10 +277,22 @@ export const importerReopenFor = Effect.fnUntraced(function* (input: {
  * next action differs: a `resume` continues the conversation the words above belong to, and
  * a `fresh` one starts a conversation the agent in it will not have read.
  */
-const continuationNote = (reopen: ImporterReopen): string =>
+const continuationNote = (
+  reopen: ImporterReopen,
+  /**
+   * What the note already said before this sentence. A `fresh` detail that begins with it
+   * (a deleted Pi session: the gone sentence opens the note and is also why it cannot be
+   * carried on) is not said a second time (follow-ups B review, finding 1).
+   */
+  alreadySaid?: string,
+): string =>
   reopen._tag === "resume"
     ? ` This conversation was opened by a server process that is no longer running, so the authority behind it is gone — but the conversation itself is not: ${reopen.detail}. Your next message takes it back over, under a new import, and the importer in it keeps everything above.`
-    : ` This conversation was opened by a server process that is no longer running, and it cannot be carried on: ${reopen.detail}. Your next message starts a new session, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate.`;
+    : ` This conversation was opened by a server process that is no longer running, and it cannot be carried on${
+        alreadySaid !== undefined && reopen.detail.startsWith(alreadySaid)
+          ? ""
+          : `: ${reopen.detail}`
+      }. Your next message starts a new session, and the importer in it will not have read any of this — what this session wrote is on the Scope tab and in the Estate.`;
 
 const empty = (input: {
   readonly targetId: string;
@@ -591,6 +603,12 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
     const deleted =
       failure._tag === "HarnessTransportError" &&
       (failure.tag === SESSION_NOT_FOUND_TAG || failure.status === 404);
+    const piGoneDetail =
+      deleted &&
+      resolved.success.instance.driver === PI_DRIVER &&
+      failure._tag === "HarnessTransportError"
+        ? failure.detail
+        : undefined;
     return empty({
       ...base,
       harnessSessionId: sessionId,
@@ -604,9 +622,8 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
               // Pi deletes nothing by itself (follow-ups A review, L4): its file went in Pi's
               // session picker or by hand, which the driver's own sentence says, with where
               // it looked. Not "harnesses delete their transcripts after a while".
-              resolved.success.instance.driver === PI_DRIVER &&
-              failure._tag === "HarnessTransportError"
-                ? `${failure.detail}.`
+              piGoneDetail !== undefined
+                ? `${piGoneDetail}.`
                 : `${displayName} no longer holds session ${sessionId}. Harnesses keep their own transcripts for a while and then delete them, so this is the normal answer for a session left for a while.`
             } What it wrote is not affected: its entries are on the Scope tab and its assets in the Estate.`
           : // A7-Q review 1: nor can it be asked what its agent waits on, and a question
@@ -614,7 +631,11 @@ export const importerConversation = Effect.fnUntraced(function* (input: {
             // that is not there (an OpenCode killed for good is not restarted). So none is
             // offered, and the note says why rather than leaving the dock silently gone.
             `${displayName} could not be asked about session ${sessionId} — ${failure.message} This is about reaching the harness, not about the conversation. Nor could it be asked whether the importer is waiting on a question, so none is offered here; one still waiting is offered again once the harness answers.`) +
-        standingNote,
+        (piGoneDetail !== undefined &&
+        refusal === undefined &&
+        reopen !== undefined
+          ? continuationNote(reopen, piGoneDetail)
+          : standingNote),
     });
   }
 

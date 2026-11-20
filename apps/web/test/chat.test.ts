@@ -37,6 +37,7 @@ import {
   goalUsageScope,
   groupDigits,
   kindLabel,
+  isExitBetweenTurns,
   outcomeTint,
   roundUsageScope,
   rowsFor,
@@ -252,6 +253,19 @@ describe("labels", () => {
     // The whole reason `LiveItem.kind` is a string on the wire: a tab one deploy behind
     // must render an item it has never seen rather than hiding it.
     expect(kindLabel("plan.round.invented")).toBe("plan.round.invented");
+  });
+
+  test("a process exit between turns is told apart from a turn's error (follow-ups B review, 3)", () => {
+    const exit = (duringTurn?: boolean) =>
+      replayItem(1, "turn.other", "the harness process ended", {
+        headline: "error",
+        outcome: duringTurn === false ? null : "failed",
+        ...(duringTurn === undefined ? {} : { processExit: { duringTurn } }),
+      });
+    expect(isExitBetweenTurns(exit(false))).toBe(true);
+    expect(isExitBetweenTurns(exit(true))).toBe(false);
+    // A provider's error on a turn carries no processExit at all.
+    expect(isExitBetweenTurns(exit())).toBe(false);
   });
 
   test("an outcome vocabulary that is not ours is left plain rather than guessed at", () => {

@@ -48,6 +48,7 @@
     REPLY_PAST_CAP_LABEL,
     THINKING_KIND,
     callSignature,
+    isExitBetweenTurns,
     kindLabel,
     outcomeTint,
     pastPartialCap,
@@ -172,11 +173,7 @@
    * neutrally, not as the turn above having stopped with an error. One that went mid-turn
    * is {@link harnessError}, captioned as a turn's error, as before.
    */
-  let exitBetweenTurns = $derived(
-    item.kind === "turn.other" &&
-      item.headline === "error" &&
-      item.processExit?.duringTurn === false,
-  );
+  let exitBetweenTurns = $derived(isExitBetweenTurns(item));
 
   /**
    * A thought's collapsed line: its first line with words in it, the markdown that would

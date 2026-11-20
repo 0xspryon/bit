@@ -205,15 +205,24 @@ export type InstanceConfig =
  */
 export const modelsWithoutSpelling = (
   config: readonly InstanceConfig[],
+  /**
+   * The provider names a session has already reported for an instance's models, kept across
+   * restarts (`learnedModelNames.ts`). A model named there is not listed: its name is known
+   * (follow-ups B review, finding 2). Absent: nothing has been learned.
+   */
+  learned: (instanceId: string) => ReadonlyMap<string, string> = () =>
+    new Map(),
 ): readonly { readonly id: string; readonly models: readonly string[] }[] =>
   config.flatMap((entry) => {
     if (entry.driver !== "claude-code" || entry.configDir === undefined)
       return [];
+    const names = learned(entry.id);
     // No `models` at all: the stock catalogue, which declares no spellings either. Said as
-    // an empty list, for the caller to word.
-    if (entry.models === undefined) return [{ id: entry.id, models: [] }];
+    // an empty list, for the caller to word — unless a session has already reported names.
+    if (entry.models === undefined)
+      return names.size > 0 ? [] : [{ id: entry.id, models: [] }];
     const missing = entry.models
-      .filter((model) => model.reportedAs === undefined)
+      .filter((model) => model.reportedAs === undefined && !names.has(model.id))
       .map((model) => model.id);
     return missing.length === 0 ? [] : [{ id: entry.id, models: missing }];
   });

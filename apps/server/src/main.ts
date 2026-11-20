@@ -140,7 +140,10 @@ import {
   openCodeHarness,
 } from "./harness/openCodeClient";
 import { OpenCodeServer } from "./harness/openCodeServer";
-import { learnedModelNamesFile } from "./harness/learnedModelNames";
+import {
+  learnedModelNamesFile,
+  readLearnedModelNames,
+} from "./harness/learnedModelNames";
 import { piHarness } from "./harness/piClient";
 import {
   ownedProcessDirectory,
@@ -1594,14 +1597,21 @@ const program = Effect.gen(function* () {
             : ` — HARNESS='${process.env["HARNESS"]}' is ignored while ${HARNESS_INSTANCES_SETTING} is set`
         }`,
   );
-  for (const { id, models } of modelsWithoutSpelling(INSTANCE_CONFIG ?? [])) {
+  // A model with no `reportedAs` is named by what its sessions report, which is kept in
+  // the instance's learned-names file across restarts (follow-ups A review, M2), so only a
+  // model no session has reported yet is warned about (follow-ups B review, finding 2).
+  for (const { id, models } of modelsWithoutSpelling(
+    INSTANCE_CONFIG ?? [],
+    (instanceId) =>
+      readLearnedModelNames(learnedModelNamesFile(HUNT_ROOT, instanceId)),
+  )) {
     const which =
       models.length === 0
         ? "lists no models, so it runs the stock catalogue with no reportedAs"
         : `has no reportedAs for ${models.join(", ")}`;
     const them = models.length === 1 ? "it" : "them";
     console.log(
-      `    ${id} ${which}; if its settings map ${them} to other names, replayed turns show those names after a restart until the session runs again`,
+      `    ${id} ${which}; if its settings map ${them} to other names, the web shows the catalogue name until a session reports the provider's name, which is then kept`,
     );
   }
   // What an operator actually gets, which is not the same list: a configured instance that
