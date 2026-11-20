@@ -80,6 +80,12 @@
   under `/run/media/hbt/work`, `/tmp` and `~/.claude/projects`, never this repo. Do not
   reword a delete to get past the check. Stopping your own processes by recorded PID, port
   or scope unit needs no approval; never kill by name or with `pkill -f`/`pgrep -f`.
+- Keep evidence — logs, screenshots, CDP dumps and the scripts that made them for a live check
+  or review — in one dedicated folder per piece of work under
+  `/run/media/hbt/work/bit_evidence/<name>/` (e.g. `bit_evidence/followups-c-review/`), never
+  directly in `/run/media/hbt/work/` and never in this repo. Strip login tokens and keys from
+  what you keep. Throwaway runtime state (data folders, browser profiles) is not evidence:
+  `bit-trash` it when done.
 - When in doubt about how to implement a functionality or how EffectV4 works, look
   the EffectV4, OpenCode/ T3Code better-agent repositories and gain inspiration
   from that about how how such a functionality should be implemented.
